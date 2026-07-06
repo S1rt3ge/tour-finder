@@ -49,21 +49,31 @@ def run_fetch(conn: sqlite3.Connection, client: joinup.JoinUpClient,
                 if not stays:
                     log.info("%s: no stays available, skip", dest_id)
                     continue
-                stays_param = ",".join(str(s) for s in stays)
 
-                for tour in client.search_pages(origin, dest_id, dates,
-                                                stays_param, adults,
-                                                max_pages=max_pages):
-                    offers_seen += _store_tour(conn, tour, run_id, adults,
-                                               client.lang, is_hot=False)
-                conn.commit()
+                # The API silently returns zero tours when more than 4 stay
+                # values are passed in one query — split into chunks of 4.
+                for chunk in _chunks(stays, 4):
+                    stays_param = ",".join(str(s) for s in chunk)
 
-                for tour in client.search_pages(origin, dest_id, dates,
-                                                stays_param, adults,
-                                                tour_types=joinup.HOT_TOUR_TYPE,
-                                                max_pages=max_pages):
-                    _store_tour(conn, tour, run_id, adults, client.lang, is_hot=True)
-                conn.commit()
+                    found = 0
+                    for tour in client.search_pages(origin, dest_id, dates,
+                                                    stays_param, adults,
+                                                    max_pages=max_pages):
+                        offers_seen += _store_tour(conn, tour, run_id, adults,
+                                                   client.lang, is_hot=False)
+                        found += 1
+                    conn.commit()
+                    if not found:
+                        log.warning("%s stays=%s: zero tours — possible API "
+                                    "quirk, check query shape", dest_id, stays_param)
+                        continue
+
+                    for tour in client.search_pages(origin, dest_id, dates,
+                                                    stays_param, adults,
+                                                    tour_types=joinup.HOT_TOUR_TYPE,
+                                                    max_pages=max_pages):
+                        _store_tour(conn, tour, run_id, adults, client.lang, is_hot=True)
+                    conn.commit()
                 log.info("%s done, offers so far: %s, requests: %s",
                          dest_id, offers_seen, client.requests_made)
             except joinup.JoinUpBlockedError:
@@ -83,6 +93,11 @@ def run_fetch(conn: sqlite3.Connection, client: joinup.JoinUpClient,
     conn.commit()
     return {"run_id": run_id, "offers_seen": offers_seen,
             "requests_made": client.requests_made, "errors": errors}
+
+
+def _chunks(items: list, size: int):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
 
 
 def _store_tour(conn: sqlite3.Connection, tour: dict, run_id: int,
