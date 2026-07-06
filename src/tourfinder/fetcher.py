@@ -50,10 +50,11 @@ def run_fetch(conn: sqlite3.Connection, client: joinup.JoinUpClient,
                     log.info("%s: no stays available, skip", dest_id)
                     continue
 
-                # The API silently returns zero tours when more than 4 stay
-                # values are passed in one query — split into chunks of 4.
-                for chunk in _chunks(stays, 4):
-                    stays_param = ",".join(str(s) for s in chunk)
+                # Comma lists of stays are unreliable: >4 values or a single
+                # value with zero results silently empties the whole response.
+                # One query per stay value is the only safe shape.
+                for stay in stays:
+                    stays_param = str(stay)
 
                     found = 0
                     for tour in client.search_pages(origin, dest_id, dates,
@@ -64,8 +65,7 @@ def run_fetch(conn: sqlite3.Connection, client: joinup.JoinUpClient,
                         found += 1
                     conn.commit()
                     if not found:
-                        log.warning("%s stays=%s: zero tours — possible API "
-                                    "quirk, check query shape", dest_id, stays_param)
+                        log.info("%s stays=%s: no tours", dest_id, stays_param)
                         continue
 
                     for tour in client.search_pages(origin, dest_id, dates,
@@ -93,11 +93,6 @@ def run_fetch(conn: sqlite3.Connection, client: joinup.JoinUpClient,
     conn.commit()
     return {"run_id": run_id, "offers_seen": offers_seen,
             "requests_made": client.requests_made, "errors": errors}
-
-
-def _chunks(items: list, size: int):
-    for i in range(0, len(items), size):
-        yield items[i:i + size]
 
 
 def _store_tour(conn: sqlite3.Connection, tour: dict, run_id: int,
