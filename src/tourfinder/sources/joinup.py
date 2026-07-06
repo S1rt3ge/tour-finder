@@ -50,7 +50,14 @@ class JoinUpClient:
         url = f"{BASE_URL}/{path}"
         for attempt in range(4):
             time.sleep(self.delay + random.uniform(0, 0.6))
-            resp = self.session.get(url, params=params, timeout=30)
+            try:
+                resp = self.session.get(url, params=params, timeout=60)
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                self.requests_made += 1
+                wait = 5 * (attempt + 1)
+                log.warning("%s -> %s, retry in %ss", path, type(exc).__name__, wait)
+                time.sleep(wait)
+                continue
             self.requests_made += 1
             if resp.status_code == 403:
                 raise JoinUpBlockedError(f"{path}: 403 from source")
