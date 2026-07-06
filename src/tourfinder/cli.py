@@ -1,13 +1,25 @@
 """CLI: python -m tourfinder.cli <command>
 
-  fetch  — pull tours from Join Up and store price snapshots
-  serve  — run the local web UI
-  stats  — quick DB numbers
+  fetch   — one-off pull from Join Up, store price snapshots
+  collect — scheduler entry point: run whichever fetch tiers are due
+  serve   — run the local web UI
+  stats   — quick DB numbers
 """
 import argparse
 import logging
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from . import db
+
+# Snapshot cadence by departure proximity (SPEC: price movement lives in
+# the last week — poll near departures often, far ones daily).
+# (name, days_from, days_till, period_hours)
+TIERS = [
+    ("near", 1, 7, 4),
+    ("mid", 8, 14, 12),
+    ("far", 15, 45, 24),
+]
 
 
 def cmd_fetch(args):
@@ -18,12 +30,53 @@ def cmd_fetch(args):
     client = JoinUpClient(delay=args.delay)
     result = run_fetch(
         conn, client,
-        days=args.days, adults=args.adults,
+        days_from=args.days_from, days_till=args.days, adults=args.adults,
         only_destinations=args.destinations.split(",") if args.destinations else None,
         max_pages=args.max_pages,
     )
     print(f"run #{result['run_id']}: offers stored {result['offers_seen']}, "
           f"requests {result['requests_made']}, errors: {result['errors'] or 'none'}")
+
+
+def cmd_collect(args):
+    from .fetcher import run_fetch
+    from .sources.joinup import JoinUpClient
+
+    log = logging.getLogger("tourfinder.collect")
+    conn = db.connect(args.db)
+    now = datetime.now(timezone.utc)
+
+    running = conn.execute(
+        """SELECT id, started_at FROM fetch_runs
+           WHERE finished_at IS NULL
+             AND replace(replace(started_at, 'T', ' '), 'Z', '')
+                 > datetime('now', '-3 hours')"""
+    ).fetchone()
+    if running:
+        log.info("run #%s still in progress (since %s), exit",
+                 running["id"], running["started_at"])
+        return
+
+    for name, days_from, days_till, period_h in TIERS:
+        last = conn.execute(
+            """SELECT started_at FROM fetch_runs
+               WHERE json_extract(params, '$.tier') = ? AND finished_at IS NOT NULL
+               ORDER BY id DESC LIMIT 1""",
+            (name,),
+        ).fetchone()
+        if last:
+            last_at = datetime.fromisoformat(last["started_at"].replace("Z", "+00:00"))
+            # 10 min grace so an hourly task doesn't miss its own boundary
+            if now - last_at < timedelta(hours=period_h, minutes=-10):
+                log.info("tier %s: fresh (last run %s), skip", name, last["started_at"])
+                continue
+        log.info("tier %s: due, fetching days %s..%s", name, days_from, days_till)
+        result = run_fetch(conn, JoinUpClient(delay=args.delay),
+                           days_from=days_from, days_till=days_till,
+                           adults=args.adults, tier=name)
+        log.info("tier %s: run #%s, offers %s, requests %s, errors: %s",
+                 name, result["run_id"], result["offers_seen"],
+                 result["requests_made"], result["errors"] or "none")
 
 
 def cmd_serve(args):
@@ -56,12 +109,18 @@ def main():
     sub = p.add_subparsers(dest="command", required=True)
 
     f = sub.add_parser("fetch", help="pull tours and store snapshots")
-    f.add_argument("--days", type=int, default=30, help="departure window from tomorrow")
+    f.add_argument("--days", type=int, default=30, help="window end, days from today")
+    f.add_argument("--days-from", type=int, default=1, help="window start, days from today")
     f.add_argument("--adults", type=int, default=2)
     f.add_argument("--destinations", help="comma list of ids, e.g. c_8,c_4 (default: all)")
     f.add_argument("--max-pages", type=int, help="page cap per search (for testing)")
     f.add_argument("--delay", type=float, default=1.2, help="seconds between requests")
     f.set_defaults(func=cmd_fetch)
+
+    c = sub.add_parser("collect", help="run due fetch tiers (scheduler entry point)")
+    c.add_argument("--adults", type=int, default=2)
+    c.add_argument("--delay", type=float, default=1.2)
+    c.set_defaults(func=cmd_collect)
 
     s = sub.add_parser("serve", help="run local web UI")
     s.add_argument("--port", type=int, default=8000)
@@ -72,6 +131,14 @@ def main():
     st.set_defaults(func=cmd_stats)
 
     args = p.parse_args()
+    if args.command == "collect":
+        # runs headless under pythonw from Task Scheduler — log to a file
+        log_path = Path(args.db).parent / "collect.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        logging.getLogger().addHandler(fh)
     args.func(args)
 
 

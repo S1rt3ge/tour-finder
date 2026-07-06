@@ -37,6 +37,10 @@
   .badge-overavg { background: #fef3c7; color: #92400e; font-size: 12px; padding: 2px 8px;
                    border-radius: 999px; }
   .range { font-size: 12px; color: var(--muted); }
+  button.history-toggle { background: none; border: 0; padding: 0; text-align: left;
+                          cursor: pointer; font-size: 12px; color: var(--muted); }
+  button.history-toggle:hover { color: var(--accent); filter: none; }
+  .history:not(:empty) { padding: 4px 0; }
   a.book { text-decoration: none; color: var(--accent); font-size: 14px; font-weight: 600; }
 </style>
 </head>
@@ -102,7 +106,12 @@ f.addEventListener('submit', async e => {
     : 'Ничего не найдено. Проверь фильтры или запусти сбор данных.';
 
   for (const t of data.results) {
-    const overAvg = t.is_hot && t.operator_avg_price_cents && t.price_cents > t.operator_avg_price_cents;
+    // "hot but pricier than its own average": our observed average when we
+    // have enough history, otherwise the operator's own average if present
+    const ourAvgReady = t.snapshots_count >= 3 && t.avg_seen_cents;
+    const overAvg = t.is_hot && (
+      (ourAvgReady && t.price_cents > t.avg_seen_cents * 1.02) ||
+      (!ourAvgReady && t.operator_avg_price_cents && t.price_cents > t.operator_avg_price_cents));
     const stars = t.category ? '★'.repeat(parseInt(t.category)) : '';
     const card = document.createElement('div');
     card.className = 'card';
@@ -116,15 +125,49 @@ f.addEventListener('submit', async e => {
           <span class="price">${euro(t.price_cents)}</span>
           ${t.is_hot ? '<span class="badge-hot">горящий</span>' : ''}
           ${overAvg ? '<span class="badge-overavg">дороже среднего</span>' : ''}
+          ${t.availability ? `<span class="meta">мест: ${t.availability}</span>` : ''}
         </div>
-        <div class="range">${t.snapshots_count > 1
-          ? `наблюдений: ${t.snapshots_count}, видели ${euro(t.min_seen_cents)}–${euro(t.max_seen_cents)}`
-          : 'первое наблюдение'}</div>
+        <button type="button" class="range history-toggle">${t.snapshots_count > 1
+          ? `история цены: ${t.snapshots_count} наблюдений, ${euro(t.min_seen_cents)}–${euro(t.max_seen_cents)} ▾`
+          : 'первое наблюдение'}</button>
+        <div class="history"></div>
         <a class="book" href="${t.link}" target="_blank" rel="noopener">Открыть у оператора →</a>
       </div>`;
+    card.querySelector('.history-toggle')
+        .addEventListener('click', () => toggleHistory(card, t.offer_id));
     results.appendChild(card);
   }
 });
+
+async function toggleHistory(card, offerId) {
+  const panel = card.querySelector('.history');
+  if (panel.innerHTML) { panel.innerHTML = ''; return; }
+  panel.innerHTML = '<span class="meta">грузим…</span>';
+  const r = await fetch(`/api/offers/${offerId}/history`);
+  const { history } = await r.json();
+  panel.innerHTML = history.length < 2
+    ? '<span class="meta">Пока одно наблюдение — график появится после следующих сборов.</span>'
+    : priceChart(history);
+}
+
+function priceChart(hist) {
+  const w = 300, h = 70, pad = 6;
+  const ts = hist.map(p => new Date(p.fetched_at).getTime());
+  const ps = hist.map(p => p.price_cents);
+  const tmin = Math.min(...ts), tmax = Math.max(...ts);
+  const pmin = Math.min(...ps), pmax = Math.max(...ps);
+  const x = t => tmax === tmin ? w / 2 : pad + (t - tmin) / (tmax - tmin) * (w - 2 * pad);
+  const y = p => pmax === pmin ? h / 2 : h - pad - (p - pmin) / (pmax - pmin) * (h - 2 * pad);
+  const pts = hist.map((p, i) => `${x(ts[i]).toFixed(1)},${y(ps[i]).toFixed(1)}`).join(' ');
+  const dots = hist.map((p, i) =>
+    `<circle cx="${x(ts[i]).toFixed(1)}" cy="${y(ps[i]).toFixed(1)}" r="2.5"
+             fill="${p.is_hot ? '#c2410c' : 'var(--accent)'}"/>`).join('');
+  const d0 = new Date(tmin).toLocaleDateString('ru-RU'), d1 = new Date(tmax).toLocaleDateString('ru-RU');
+  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" preserveAspectRatio="none">
+      <polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="2"/>${dots}
+    </svg>
+    <div class="meta">${d0} — ${d1} · ${euro(pmin)}–${euro(pmax)} · точка красная = был горящим</div>`;
+}
 </script>
 </body>
 </html>

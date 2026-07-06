@@ -19,15 +19,16 @@ def utcnow() -> str:
 
 
 def run_fetch(conn: sqlite3.Connection, client: joinup.JoinUpClient,
-              origin: str = joinup.RIGA_ORIGIN_ID, days: int = 30,
+              origin: str = joinup.RIGA_ORIGIN_ID,
+              days_from: int = 1, days_till: int = 30,
               adults: int = 2, only_destinations: list[str] | None = None,
-              max_pages: int | None = None) -> dict:
-    date_from = date.today() + timedelta(days=1)
-    date_till = date.today() + timedelta(days=days)
+              max_pages: int | None = None, tier: str | None = None) -> dict:
+    date_from = date.today() + timedelta(days=days_from)
+    date_till = date.today() + timedelta(days=days_till)
     dates = f"{date_from.isoformat()}:{date_till.isoformat()}"
 
     params = dict(origin=origin, dates=dates, adults=adults,
-                  destinations=only_destinations, max_pages=max_pages)
+                  destinations=only_destinations, max_pages=max_pages, tier=tier)
     run_id = conn.execute(
         "INSERT INTO fetch_runs(started_at, params) VALUES (?, ?)",
         (utcnow(), json.dumps(params)),

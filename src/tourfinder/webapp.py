@@ -84,9 +84,11 @@ def search(
                h.name AS hotel_name, h.category, h.country_name, h.city_name,
                h.photo_url,
                l.price_cents, l.currency, l.is_hot, l.fetched_at,
-               l.operator_avg_price_cents,
+               l.availability, l.operator_avg_price_cents,
                (SELECT count(*) FROM price_snapshots ps2
                 WHERE ps2.offer_id = o.id) AS snapshots_count,
+               (SELECT avg(price_cents) FROM price_snapshots ps5
+                WHERE ps5.offer_id = o.id) AS avg_seen_cents,
                (SELECT min(price_cents) FROM price_snapshots ps3
                 WHERE ps3.offer_id = o.id) AS min_seen_cents,
                (SELECT max(price_cents) FROM price_snapshots ps4
