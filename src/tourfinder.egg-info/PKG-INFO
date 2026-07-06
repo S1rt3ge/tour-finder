@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: tourfinder
+Version: 0.1.0
+Summary: Last-minute tour aggregator (Riga departures)
+Requires-Python: >=3.12
+Requires-Dist: requests>=2.32
+Requires-Dist: fastapi>=0.115
+Requires-Dist: uvicorn[standard]>=0.30
+Requires-Dist: jinja2>=3.1

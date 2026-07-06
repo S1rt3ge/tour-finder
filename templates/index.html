@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tour-finder — горящие туры из Риги</title>
+<style>
+  :root { --accent: #e35d2b; --bg: #faf8f5; --card: #fff; --text: #2b2926; --muted: #8a857d; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+         background: var(--bg); color: var(--text); }
+  header { padding: 24px 32px 8px; }
+  header h1 { margin: 0; font-size: 22px; }
+  header p { margin: 4px 0 0; color: var(--muted); font-size: 14px; }
+  form { display: flex; flex-wrap: wrap; gap: 12px; padding: 16px 32px; align-items: end; }
+  label { display: flex; flex-direction: column; font-size: 12px; color: var(--muted); gap: 4px; }
+  input, select { padding: 8px 10px; border: 1px solid #ddd6cc; border-radius: 8px;
+                  font-size: 14px; background: var(--card); min-width: 110px; }
+  select[multiple] { min-height: 70px; }
+  button { padding: 10px 22px; border: 0; border-radius: 8px; background: var(--accent);
+           color: #fff; font-size: 15px; cursor: pointer; }
+  button:hover { filter: brightness(1.08); }
+  .hotcheck { flex-direction: row; align-items: center; font-size: 14px; color: var(--text); }
+  #status { padding: 0 32px 8px; color: var(--muted); font-size: 14px; }
+  #results { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+             gap: 16px; padding: 8px 32px 40px; }
+  .card { background: var(--card); border-radius: 12px; overflow: hidden;
+          box-shadow: 0 1px 4px rgba(0,0,0,.07); display: flex; flex-direction: column; }
+  .card img { width: 100%; height: 170px; object-fit: cover; background: #eee; }
+  .card .body { padding: 12px 14px 14px; display: flex; flex-direction: column; gap: 6px; flex: 1; }
+  .card h3 { margin: 0; font-size: 16px; }
+  .meta { color: var(--muted); font-size: 13px; }
+  .price-row { display: flex; align-items: baseline; gap: 8px; margin-top: auto; }
+  .price { font-size: 20px; font-weight: 700; }
+  .badge-hot { background: #ffe6d9; color: #c2410c; font-size: 12px; padding: 2px 8px;
+               border-radius: 999px; font-weight: 600; }
+  .badge-overavg { background: #fef3c7; color: #92400e; font-size: 12px; padding: 2px 8px;
+                   border-radius: 999px; }
+  .range { font-size: 12px; color: var(--muted); }
+  a.book { text-decoration: none; color: var(--accent); font-size: 14px; font-weight: 600; }
+</style>
+</head>
+<body>
+<header>
+  <h1>tour-finder</h1>
+  <p>Туры из Риги в последнюю минуту. Направление не обязательно — сортируем по цене.</p>
+</header>
+
+<form id="f">
+  <label>Вылет с <input type="date" name="date_from" required></label>
+  <label>Вылет по <input type="date" name="date_till" required></label>
+  <label>Взрослых <input type="number" name="adults" value="2" min="1" max="6"></label>
+  <label>Ночей от <input type="number" name="nights_min" value="1" min="1" max="30"></label>
+  <label>Ночей до <input type="number" name="nights_max" value="14" min="1" max="30"></label>
+  <label>Бюджет до, € <input type="number" name="budget_max" placeholder="без лимита" min="0" step="50"></label>
+  <label>Питание
+    <select name="boards" multiple>
+      {% for b in boards %}<option value="{{ b.board_code }}">{{ b.board_name or b.board_code }}</option>{% endfor %}
+    </select>
+  </label>
+  <label>Страна (не обязательно)
+    <select name="countries" multiple>
+      {% for c in countries %}<option value="{{ c.country_id }}">{{ c.country_name }}</option>{% endfor %}
+    </select>
+  </label>
+  <label class="hotcheck"><input type="checkbox" name="only_hot"> только горящие</label>
+  <button type="submit">Искать</button>
+</form>
+
+<div id="status">База пуста? Сначала запусти сбор: <code>python -m tourfinder.cli fetch</code></div>
+<div id="results"></div>
+
+<script>
+const f = document.getElementById('f');
+const results = document.getElementById('results');
+const status = document.getElementById('status');
+
+const today = new Date(), plus3w = new Date(Date.now() + 21 * 864e5);
+f.date_from.value = today.toISOString().slice(0, 10);
+f.date_till.value = plus3w.toISOString().slice(0, 10);
+
+const euro = c => (c / 100).toLocaleString('ru-RU', { maximumFractionDigits: 0 }) + ' €';
+const multi = sel => [...sel.selectedOptions].map(o => o.value).join(',');
+
+f.addEventListener('submit', async e => {
+  e.preventDefault();
+  const p = new URLSearchParams({
+    date_from: f.date_from.value, date_till: f.date_till.value,
+    adults: f.adults.value, nights_min: f.nights_min.value, nights_max: f.nights_max.value,
+  });
+  if (f.budget_max.value) p.set('budget_max', f.budget_max.value);
+  const b = multi(f.boards); if (b) p.set('boards', b);
+  const c = multi(f.countries); if (c) p.set('countries', c);
+  if (f.only_hot.checked) p.set('only_hot', 'true');
+
+  status.textContent = 'Ищем…';
+  results.innerHTML = '';
+  const r = await fetch('/api/search?' + p);
+  const data = await r.json();
+  status.textContent = data.count
+    ? `Найдено: ${data.count}`
+    : 'Ничего не найдено. Проверь фильтры или запусти сбор данных.';
+
+  for (const t of data.results) {
+    const overAvg = t.is_hot && t.operator_avg_price_cents && t.price_cents > t.operator_avg_price_cents;
+    const stars = t.category ? '★'.repeat(parseInt(t.category)) : '';
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = `
+      ${t.photo_url ? `<img src="${t.photo_url}" loading="lazy" alt="">` : '<img alt="">'}
+      <div class="body">
+        <h3>${t.hotel_name} <span class="meta">${stars}</span></h3>
+        <div class="meta">${t.country_name || ''}${t.city_name ? ', ' + t.city_name : ''}</div>
+        <div class="meta">${t.date_start} → ${t.date_end || ''} · ${t.nights} н. · ${t.board_name || t.board_code}${t.room_name ? ' · ' + t.room_name : ''}</div>
+        <div class="price-row">
+          <span class="price">${euro(t.price_cents)}</span>
+          ${t.is_hot ? '<span class="badge-hot">горящий</span>' : ''}
+          ${overAvg ? '<span class="badge-overavg">дороже среднего</span>' : ''}
+        </div>
+        <div class="range">${t.snapshots_count > 1
+          ? `наблюдений: ${t.snapshots_count}, видели ${euro(t.min_seen_cents)}–${euro(t.max_seen_cents)}`
+          : 'первое наблюдение'}</div>
+        <a class="book" href="${t.link}" target="_blank" rel="noopener">Открыть у оператора →</a>
+      </div>`;
+    results.appendChild(card);
+  }
+});
+</script>
+</body>
+</html>
