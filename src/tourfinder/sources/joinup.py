@@ -48,13 +48,15 @@ class JoinUpClient:
         params.setdefault("lang", self.lang)
         params.setdefault("currency", self.currency)
         url = f"{BASE_URL}/{path}"
-        for attempt in range(4):
+        for attempt in range(5):
             time.sleep(self.delay + random.uniform(0, 0.6))
             try:
                 resp = self.session.get(url, params=params, timeout=60)
             except (requests.Timeout, requests.ConnectionError) as exc:
                 self.requests_made += 1
-                wait = 5 * (attempt + 1)
+                # Heavy queries can take 15s+ server-side; when the API starts
+                # dropping connections it needs a real pause, not seconds.
+                wait = 20 * (attempt + 1)
                 log.warning("%s -> %s, retry in %ss", path, type(exc).__name__, wait)
                 time.sleep(wait)
                 continue
