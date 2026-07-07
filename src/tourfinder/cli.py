@@ -42,9 +42,26 @@ def cmd_collect(args):
     from .fetcher import run_fetch
     from .sources.joinup import JoinUpClient
 
+    from .fetcher import utcnow
+
     log = logging.getLogger("tourfinder.collect")
     conn = db.connect(args.db)
     now = datetime.now(timezone.utc)
+
+    # Reap runs abandoned by a killed process: no finished_at and started
+    # over 3h ago. Their partial data stays (committed per destination);
+    # only the run record is closed out so it stops looking "in progress".
+    reaped = conn.execute(
+        """UPDATE fetch_runs
+           SET finished_at = ?, errors = json_array('abandoned: no completion record')
+           WHERE finished_at IS NULL
+             AND replace(replace(started_at, 'T', ' '), 'Z', '')
+                 <= datetime('now', '-3 hours')""",
+        (utcnow(),),
+    ).rowcount
+    conn.commit()
+    if reaped:
+        log.warning("reaped %s abandoned run(s)", reaped)
 
     running = conn.execute(
         """SELECT id, started_at FROM fetch_runs
