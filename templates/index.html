@@ -42,6 +42,28 @@
   button.history-toggle:hover { color: var(--accent); filter: none; }
   .history:not(:empty) { padding: 4px 0; }
   a.book { text-decoration: none; color: var(--accent); font-size: 14px; font-weight: 600; }
+  button.ghost { background: none; color: var(--accent); border: 1px solid var(--accent); }
+  button.ghost:hover { background: #fff2ec; filter: none; }
+  #subs-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+              padding: 0 32px 8px; }
+  #subs { padding: 0 32px 8px; }
+  .sub { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+         background: var(--card); border-radius: 8px; padding: 8px 12px;
+         box-shadow: 0 1px 3px rgba(0,0,0,.06); margin-bottom: 6px; font-size: 14px; }
+  .sub .sub-name { font-weight: 600; }
+  .sub .sub-desc { color: var(--muted); font-size: 12px; }
+  .sub.off { opacity: .5; }
+  .sub-badge { background: var(--accent); color: #fff; border-radius: 999px;
+               font-size: 12px; padding: 1px 8px; }
+  .sub button { padding: 4px 10px; font-size: 13px; }
+  #alerts { position: fixed; right: 16px; bottom: 16px; width: min(360px, 90vw);
+            display: flex; flex-direction: column; gap: 8px; z-index: 50; }
+  .toast { background: var(--card); border-left: 4px solid var(--accent);
+           border-radius: 8px; padding: 10px 12px; box-shadow: 0 4px 16px rgba(0,0,0,.18);
+           font-size: 13px; }
+  .toast b { display: block; margin-bottom: 2px; }
+  .toast a { color: var(--accent); font-weight: 600; text-decoration: none; }
+  .drop { color: #16a34a; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -69,10 +91,18 @@
   </label>
   <label class="hotcheck"><input type="checkbox" name="only_hot"> только горящие</label>
   <button type="submit">Искать</button>
+  <button type="button" id="save-sub" class="ghost">Сохранить как подписку</button>
 </form>
+
+<div id="subs-bar">
+  <button type="button" id="sound-toggle" class="ghost">🔔 включить звук</button>
+  <span class="meta" id="poll-status"></span>
+</div>
+<div id="subs"></div>
 
 <div id="status">База пуста? Сначала запусти сбор: <code>python -m tourfinder.cli fetch</code></div>
 <div id="results"></div>
+<div id="alerts"></div>
 
 <script>
 const f = document.getElementById('f');
@@ -86,16 +116,26 @@ f.date_till.value = plus3w.toISOString().slice(0, 10);
 const euro = c => (c / 100).toLocaleString('ru-RU', { maximumFractionDigits: 0 }) + ' €';
 const multi = sel => [...sel.selectedOptions].map(o => o.value).join(',');
 
+// One place that reads the form into a filter object — shared by search and
+// by "save as subscription", so a saved search matches what you just ran.
+function currentFilters() {
+  const flt = {
+    date_from: f.date_from.value, date_till: f.date_till.value,
+    adults: +f.adults.value, nights_min: +f.nights_min.value,
+    nights_max: +f.nights_max.value,
+  };
+  if (f.budget_max.value) flt.budget_max = +f.budget_max.value;
+  const b = multi(f.boards); if (b) flt.boards = b;
+  const c = multi(f.countries); if (c) flt.countries = c;
+  if (f.only_hot.checked) flt.only_hot = true;
+  return flt;
+}
+
 f.addEventListener('submit', async e => {
   e.preventDefault();
-  const p = new URLSearchParams({
-    date_from: f.date_from.value, date_till: f.date_till.value,
-    adults: f.adults.value, nights_min: f.nights_min.value, nights_max: f.nights_max.value,
-  });
-  if (f.budget_max.value) p.set('budget_max', f.budget_max.value);
-  const b = multi(f.boards); if (b) p.set('boards', b);
-  const c = multi(f.countries); if (c) p.set('countries', c);
-  if (f.only_hot.checked) p.set('only_hot', 'true');
+  const flt = currentFilters();
+  const p = new URLSearchParams();
+  for (const [k, v] of Object.entries(flt)) p.set(k, v);
 
   status.textContent = 'Ищем…';
   results.innerHTML = '';
@@ -168,6 +208,138 @@ function priceChart(hist) {
     </svg>
     <div class="meta">${d0} — ${d1} · ${euro(pmin)}–${euro(pmax)} · точка красная = был горящим</div>`;
 }
+
+// --- subscriptions --------------------------------------------------------
+
+const subsBox = document.getElementById('subs');
+
+function filtersDesc(flt) {
+  const parts = [`${flt.date_from}…${flt.date_till}`, `${flt.adults} взр.`,
+                 `${flt.nights_min}–${flt.nights_max} н.`];
+  if (flt.budget_max) parts.push(`до ${flt.budget_max} €`);
+  if (flt.only_hot) parts.push('горящие');
+  if (flt.countries) parts.push(`страны: ${flt.countries}`);
+  return parts.join(' · ');
+}
+
+async function loadSubs() {
+  const { subscriptions } = await (await fetch('/api/subscriptions')).json();
+  subsBox.innerHTML = '';
+  for (const s of subscriptions) {
+    const el = document.createElement('div');
+    el.className = 'sub' + (s.enabled ? '' : ' off');
+    el.innerHTML = `
+      <span class="sub-name">${s.name}</span>
+      ${s.unseen ? `<span class="sub-badge">${s.unseen} новых</span>` : ''}
+      <span class="sub-desc">${filtersDesc(s.filters)}</span>
+      <button type="button" class="ghost" data-act="toggle">${s.enabled ? 'выкл' : 'вкл'}</button>
+      <button type="button" class="ghost" data-act="del">удалить</button>`;
+    el.querySelector('[data-act=toggle]').onclick = async () => {
+      await fetch(`/api/subscriptions/${s.id}`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: !s.enabled }) });
+      loadSubs();
+    };
+    el.querySelector('[data-act=del]').onclick = async () => {
+      if (!confirm(`Удалить подписку «${s.name}»?`)) return;
+      await fetch(`/api/subscriptions/${s.id}`, { method: 'DELETE' });
+      loadSubs();
+    };
+    subsBox.appendChild(el);
+  }
+}
+
+document.getElementById('save-sub').onclick = async () => {
+  const flt = currentFilters();
+  if (!flt.date_from || !flt.date_till) { alert('Задай даты вылета'); return; }
+  const name = prompt('Название подписки:', `Туры ${flt.date_from}`);
+  if (name === null) return;
+  const r = await fetch('/api/subscriptions', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, filters: flt }) });
+  if (!r.ok) { alert('Не вышло сохранить: нужны даты вылета'); return; }
+  await loadSubs();
+  ensurePolling();
+};
+
+// --- alerts: poll + sound -------------------------------------------------
+
+const pollStatus = document.getElementById('poll-status');
+const alertsBox = document.getElementById('alerts');
+let audioCtx = null, soundOn = false, pollTimer = null;
+const seenAlertIds = new Set();
+
+document.getElementById('sound-toggle').onclick = function () {
+  soundOn = !soundOn;
+  this.textContent = soundOn ? '🔔 звук включён' : '🔔 включить звук';
+  if (soundOn) {
+    // AudioContext must be created/resumed from a user gesture
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    audioCtx.resume();
+    beep();
+    ensurePolling();
+  }
+};
+
+function beep() {
+  if (!audioCtx) return;
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  o.type = 'sine'; o.frequency.value = 880;
+  g.gain.setValueAtTime(0.001, audioCtx.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.25, audioCtx.currentTime + 0.02);
+  g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.5);
+  o.connect(g); g.connect(audioCtx.destination);
+  o.start(); o.stop(audioCtx.currentTime + 0.5);
+}
+
+function ensurePolling() {
+  if (pollTimer) return;
+  poll();
+  pollTimer = setInterval(poll, 60000);
+}
+
+async function poll() {
+  let data;
+  try {
+    data = await (await fetch('/api/poll', { method: 'POST' })).json();
+  } catch { pollStatus.textContent = 'опрос: ошибка сети'; return; }
+
+  const fresh = data.alerts.filter(a => !seenAlertIds.has(a.id));
+  for (const a of data.alerts) seenAlertIds.add(a.id);
+
+  pollStatus.textContent = `следим · непрочитанных совпадений: ${data.unseen} · ${new Date().toLocaleTimeString('ru-RU')}`;
+  loadSubs();
+
+  if (fresh.length) {
+    if (soundOn) beep();
+    for (const a of fresh.slice(0, 5)) showToast(a);
+  }
+}
+
+function showToast(a) {
+  const drop = a.reason === 'price_drop';
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.innerHTML = `
+    <b>${drop ? '<span class="drop">Цена упала</span>' : 'Новое совпадение'} · ${a.sub_name}</b>
+    ${a.hotel_name} — ${a.country_name || ''}${a.city_name ? ', ' + a.city_name : ''}<br>
+    ${a.date_start} · ${a.nights} н. · ${a.board_code} · <b>${euro(a.price_cents)}</b>
+    <br><a href="${a.link}" target="_blank" rel="noopener">Открыть →</a>
+    · <a href="#" data-dismiss>скрыть</a>`;
+  el.querySelector('[data-dismiss]').onclick = async (e) => {
+    e.preventDefault();
+    await fetch('/api/alerts/seen', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: [a.id] }) });
+    el.remove(); loadSubs();
+  };
+  alertsBox.appendChild(el);
+}
+
+// start: show existing subscriptions; poll if any exist
+loadSubs().then(() => fetch('/api/subscriptions').then(r => r.json()).then(d => {
+  if (d.subscriptions.length) ensurePolling();
+}));
 </script>
 </body>
 </html>

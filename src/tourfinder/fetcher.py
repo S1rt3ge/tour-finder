@@ -57,14 +57,18 @@ def run_fetch(conn: sqlite3.Connection, client: joinup.JoinUpClient,
                 for stay in stays:
                     stays_param = str(stay)
 
+                    # Commit per tour so the write lock is held for
+                    # milliseconds, not across the paginated HTTP fetches —
+                    # otherwise a concurrent writer (web UI) is locked out for
+                    # the whole destination.
                     found = 0
                     for tour in client.search_pages(origin, dest_id, dates,
                                                     stays_param, adults,
                                                     max_pages=max_pages):
                         offers_seen += _store_tour(conn, tour, run_id, adults,
                                                    client.lang, is_hot=False)
+                        conn.commit()
                         found += 1
-                    conn.commit()
                     if not found:
                         log.info("%s stays=%s: no tours", dest_id, stays_param)
                         continue
@@ -74,7 +78,7 @@ def run_fetch(conn: sqlite3.Connection, client: joinup.JoinUpClient,
                                                     tour_types=joinup.HOT_TOUR_TYPE,
                                                     max_pages=max_pages):
                         _store_tour(conn, tour, run_id, adults, client.lang, is_hot=True)
-                    conn.commit()
+                        conn.commit()
                 log.info("%s done, offers so far: %s, requests: %s",
                          dest_id, offers_seen, client.requests_made)
             except joinup.JoinUpBlockedError:

@@ -72,6 +72,29 @@ CREATE TABLE IF NOT EXISTS fetch_runs(
     offers_seen   INTEGER NOT NULL DEFAULT 0,
     errors        TEXT
 );
+
+-- Saved search (watchlist). filters is the JSON search payload; its
+-- budget_max doubles as the price threshold.
+CREATE TABLE IF NOT EXISTS subscriptions(
+    id         INTEGER PRIMARY KEY,
+    name       TEXT NOT NULL,
+    filters    TEXT NOT NULL,
+    enabled    INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+);
+
+-- One firing: this offer matched this subscription for this reason.
+CREATE TABLE IF NOT EXISTS alerts(
+    id              INTEGER PRIMARY KEY,
+    subscription_id INTEGER NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+    offer_id        INTEGER NOT NULL REFERENCES offers(id),
+    reason          TEXT NOT NULL,          -- new_match | price_drop
+    price_cents     INTEGER NOT NULL,
+    created_at      TEXT NOT NULL,
+    seen            INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_alerts_sub ON alerts(subscription_id, offer_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_alerts_unseen ON alerts(seen, created_at);
 """
 
 
@@ -81,5 +104,7 @@ def connect(path: str | Path = DEFAULT_DB) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=10000")  # wait out concurrent writer locks
     conn.executescript(SCHEMA)
     return conn

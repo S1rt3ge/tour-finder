@@ -1,11 +1,14 @@
 """Local web UI: search over collected offers, no direction required."""
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, Query, Request
+from fastapi import Body, FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.templating import Jinja2Templates
 
-from . import db
+from . import db, subscriptions
+from .queries import search_offers
 
 TEMPLATES_DIR = Path(__file__).resolve().parent.parent.parent / "templates"
 
@@ -15,6 +18,10 @@ templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
 def get_conn():
     return db.connect()
+
+
+def _utcnow() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 @app.get("/")
@@ -50,59 +57,12 @@ def search(
     only_hot: bool = False,
     limit: int = 100,
 ):
-    where = ["o.date_start BETWEEN :date_from AND :date_till",
-             "o.nights BETWEEN :nights_min AND :nights_max",
-             "o.pax_adl = :adults"]
-    params = {"date_from": date_from, "date_till": date_till,
-              "nights_min": nights_min, "nights_max": nights_max,
-              "adults": adults, "limit": min(limit, 500)}
-    if budget_max:
-        where.append("l.price_cents <= :budget_cents")
-        params["budget_cents"] = budget_max * 100
-    if boards:
-        codes = [b.strip() for b in boards.split(",") if b.strip()]
-        marks = ",".join(f":b{i}" for i in range(len(codes)))
-        params.update({f"b{i}": c for i, c in enumerate(codes)})
-        where.append(f"o.board_code IN ({marks})")
-    if countries:
-        ids = [c.strip() for c in countries.split(",") if c.strip()]
-        marks = ",".join(f":c{i}" for i in range(len(ids)))
-        params.update({f"c{i}": c for i, c in enumerate(ids)})
-        where.append(f"h.country_id IN ({marks})")
-    if only_hot:
-        where.append("l.is_hot = 1")
-
-    sql = f"""
-        WITH latest AS (
-            SELECT ps.*, ROW_NUMBER() OVER (
-                PARTITION BY offer_id ORDER BY fetched_at DESC) AS rn
-            FROM price_snapshots ps
-        )
-        SELECT o.id AS offer_id, o.date_start, o.date_end, o.nights,
-               o.board_code, o.board_name, o.room_name, o.link,
-               o.origin_name, o.pax_adl,
-               h.name AS hotel_name, h.category, h.country_name, h.city_name,
-               h.photo_url,
-               l.price_cents, l.currency, l.is_hot, l.fetched_at,
-               l.availability, l.operator_avg_price_cents,
-               (SELECT count(*) FROM price_snapshots ps2
-                WHERE ps2.offer_id = o.id) AS snapshots_count,
-               (SELECT avg(price_cents) FROM price_snapshots ps5
-                WHERE ps5.offer_id = o.id) AS avg_seen_cents,
-               (SELECT min(price_cents) FROM price_snapshots ps3
-                WHERE ps3.offer_id = o.id) AS min_seen_cents,
-               (SELECT max(price_cents) FROM price_snapshots ps4
-                WHERE ps4.offer_id = o.id) AS max_seen_cents
-        FROM offers o
-        JOIN hotels h ON h.source = o.source AND h.source_hotel_id = o.source_hotel_id
-        JOIN latest l ON l.offer_id = o.id AND l.rn = 1
-        WHERE {' AND '.join(where)}
-        ORDER BY l.price_cents ASC
-        LIMIT :limit
-    """
     conn = get_conn()
     try:
-        rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+        rows = search_offers(
+            conn, date_from=date_from, date_till=date_till, adults=adults,
+            nights_min=nights_min, nights_max=nights_max, budget_max=budget_max,
+            boards=boards, countries=countries, only_hot=only_hot, limit=limit)
     finally:
         conn.close()
     return JSONResponse({"count": len(rows), "results": rows})
@@ -121,3 +81,123 @@ def offer_history(offer_id: int):
         conn.close()
     return JSONResponse({"offer_id": offer_id,
                          "history": [dict(r) for r in rows]})
+
+
+# --- subscriptions (saved searches / watchlist) ---------------------------
+
+def _sub_dict(conn, row) -> dict:
+    unseen = conn.execute(
+        "SELECT count(*) FROM alerts WHERE subscription_id=? AND seen=0",
+        (row["id"],),
+    ).fetchone()[0]
+    return {"id": row["id"], "name": row["name"],
+            "filters": json.loads(row["filters"]), "enabled": bool(row["enabled"]),
+            "created_at": row["created_at"], "unseen": unseen}
+
+
+@app.get("/api/subscriptions")
+def list_subscriptions():
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM subscriptions ORDER BY id DESC").fetchall()
+        return JSONResponse({"subscriptions": [_sub_dict(conn, r) for r in rows]})
+    finally:
+        conn.close()
+
+
+@app.post("/api/subscriptions")
+def create_subscription(payload: dict = Body(...)):
+    name = (payload.get("name") or "").strip() or "Без названия"
+    filters = payload.get("filters") or {}
+    if not filters.get("date_from") or not filters.get("date_till"):
+        return JSONResponse({"error": "filters need date_from and date_till"},
+                            status_code=400)
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            "INSERT INTO subscriptions(name, filters, enabled, created_at) "
+            "VALUES (?, ?, 1, ?)",
+            (name, json.dumps(filters), _utcnow()),
+        )
+        sub_id = cur.lastrowid
+        conn.commit()
+        # Evaluate immediately so the new subscription surfaces current matches.
+        sub = conn.execute("SELECT * FROM subscriptions WHERE id=?", (sub_id,)).fetchone()
+        new_alerts = subscriptions.evaluate(conn, sub)
+        return JSONResponse({"id": sub_id, "new_alerts": new_alerts})
+    finally:
+        conn.close()
+
+
+@app.patch("/api/subscriptions/{sub_id}")
+def update_subscription(sub_id: int, payload: dict = Body(...)):
+    conn = get_conn()
+    try:
+        if "enabled" in payload:
+            conn.execute("UPDATE subscriptions SET enabled=? WHERE id=?",
+                         (1 if payload["enabled"] else 0, sub_id))
+        if "name" in payload:
+            conn.execute("UPDATE subscriptions SET name=? WHERE id=?",
+                         (str(payload["name"]).strip() or "Без названия", sub_id))
+        conn.commit()
+        return JSONResponse({"ok": True})
+    finally:
+        conn.close()
+
+
+@app.delete("/api/subscriptions/{sub_id}")
+def delete_subscription(sub_id: int):
+    conn = get_conn()
+    try:
+        conn.execute("DELETE FROM subscriptions WHERE id=?", (sub_id,))
+        conn.commit()
+        return JSONResponse({"ok": True})
+    finally:
+        conn.close()
+
+
+# --- alerts ----------------------------------------------------------------
+
+@app.post("/api/poll")
+def poll():
+    """Evaluate enabled subscriptions and return unseen alerts with offer
+    detail. The browser tab calls this on an interval and beeps on anything
+    new. Only touches the local DB — no calls to the source."""
+    conn = get_conn()
+    try:
+        subscriptions.evaluate_all(conn)
+        rows = conn.execute(
+            """SELECT a.id, a.subscription_id, a.offer_id, a.reason,
+                      a.price_cents, a.created_at, a.seen,
+                      s.name AS sub_name,
+                      h.name AS hotel_name, h.category, h.country_name,
+                      h.city_name, o.date_start, o.nights, o.board_code,
+                      o.board_name, o.link
+               FROM alerts a
+               JOIN subscriptions s ON s.id = a.subscription_id
+               JOIN offers o ON o.id = a.offer_id
+               JOIN hotels h ON h.source=o.source AND h.source_hotel_id=o.source_hotel_id
+               WHERE a.seen = 0
+               ORDER BY a.created_at DESC, a.id DESC
+               LIMIT 200""").fetchall()
+        return JSONResponse({"unseen": len(rows),
+                             "alerts": [dict(r) for r in rows]})
+    finally:
+        conn.close()
+
+
+@app.post("/api/alerts/seen")
+def mark_alerts_seen(payload: dict = Body(default={})):
+    ids = payload.get("ids")
+    conn = get_conn()
+    try:
+        if ids:
+            marks = ",".join("?" * len(ids))
+            conn.execute(f"UPDATE alerts SET seen=1 WHERE id IN ({marks})", ids)
+        else:
+            conn.execute("UPDATE alerts SET seen=1 WHERE seen=0")
+        conn.commit()
+        return JSONResponse({"ok": True})
+    finally:
+        conn.close()

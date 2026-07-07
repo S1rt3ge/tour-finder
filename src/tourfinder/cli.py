@@ -95,6 +95,11 @@ def cmd_collect(args):
                  name, result["run_id"], result["offers_seen"],
                  result["requests_made"], result["errors"] or "none")
 
+    from . import subscriptions
+    new_alerts = subscriptions.evaluate_all(conn)
+    if new_alerts:
+        log.info("subscriptions: %s new alert(s)", new_alerts)
+
 
 def cmd_serve(args):
     import uvicorn
