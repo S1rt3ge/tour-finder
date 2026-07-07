@@ -15,8 +15,8 @@ from datetime import datetime, timezone
 
 from .queries import search_offers
 
-_ALLOWED = {"date_from", "date_till", "adults", "nights_min", "nights_max",
-            "budget_max", "boards", "countries", "only_hot"}
+_ALLOWED = {"date_from", "date_till", "adults", "children_ages", "nights_min",
+            "nights_max", "budget_max", "boards", "countries", "only_hot"}
 
 
 def _utcnow() -> str:

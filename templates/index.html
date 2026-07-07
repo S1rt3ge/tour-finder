@@ -21,6 +21,13 @@
            color: #fff; font-size: 15px; cursor: pointer; }
   button:hover { filter: brightness(1.08); }
   .hotcheck { flex-direction: row; align-items: center; font-size: 14px; color: var(--text); }
+  fieldset.chips { border: 1px solid #ddd6cc; border-radius: 8px; padding: 6px 10px 8px;
+                   margin: 0; display: flex; flex-wrap: wrap; gap: 4px 12px; max-width: 340px; }
+  fieldset.chips legend { font-size: 12px; color: var(--muted); padding: 0 4px; }
+  label.chip { flex-direction: row; align-items: center; gap: 5px; font-size: 13px;
+               color: var(--text); white-space: nowrap; }
+  #child-ages { display: flex; gap: 6px; }
+  #child-ages input { width: 56px; min-width: 0; }
   #status { padding: 0 32px 8px; color: var(--muted); font-size: 14px; }
   #results { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
              gap: 16px; padding: 8px 32px 40px; }
@@ -82,19 +89,21 @@
   <label>Вылет с <input type="date" name="date_from" required></label>
   <label>Вылет по <input type="date" name="date_till" required></label>
   <label>Взрослых <input type="number" name="adults" value="2" min="1" max="6"></label>
+  <label>Детей <input type="number" name="children" value="0" min="0" max="4"></label>
+  <label id="child-ages-wrap" style="display:none">Возраст детей
+    <span id="child-ages"></span>
+  </label>
   <label>Ночей от <input type="number" name="nights_min" value="1" min="1" max="30"></label>
   <label>Ночей до <input type="number" name="nights_max" value="14" min="1" max="30"></label>
   <label>Бюджет до, € <input type="number" name="budget_max" placeholder="без лимита" min="0" step="50"></label>
-  <label>Питание
-    <select name="boards" multiple>
-      {% for b in boards %}<option value="{{ b.board_code }}">{{ b.board_name or b.board_code }}</option>{% endfor %}
-    </select>
-  </label>
-  <label>Страна (не обязательно)
-    <select name="countries" multiple>
-      {% for c in countries %}<option value="{{ c.country_id }}">{{ c.country_name }}</option>{% endfor %}
-    </select>
-  </label>
+  <fieldset class="chips">
+    <legend>Питание</legend>
+    {% for b in boards %}<label class="chip"><input type="checkbox" name="board" value="{{ b.board_code }}"> {{ b.board_name or b.board_code }}</label>{% endfor %}
+  </fieldset>
+  <fieldset class="chips">
+    <legend>Страна (не обязательно)</legend>
+    {% for c in countries %}<label class="chip"><input type="checkbox" name="country" value="{{ c.country_id }}"> {{ c.country_name }}</label>{% endfor %}
+  </fieldset>
   <label class="hotcheck"><input type="checkbox" name="only_hot"> только горящие</label>
   <button type="submit">Искать</button>
   <button type="button" id="save-sub" class="ghost">Сохранить как подписку</button>
@@ -120,7 +129,31 @@ f.date_from.value = today.toISOString().slice(0, 10);
 f.date_till.value = plus3w.toISOString().slice(0, 10);
 
 const euro = c => (c / 100).toLocaleString('ru-RU', { maximumFractionDigits: 0 }) + ' €';
-const multi = sel => [...sel.selectedOptions].map(o => o.value).join(',');
+const checked = name => [...f.querySelectorAll(`input[name="${name}"]:checked`)].map(i => i.value);
+
+// Child-age inputs appear/disappear with the "Детей" count.
+const childAgesWrap = document.getElementById('child-ages-wrap');
+const childAges = document.getElementById('child-ages');
+function syncChildAges() {
+  const n = Math.max(0, Math.min(4, +f.children.value || 0));
+  childAgesWrap.style.display = n ? '' : 'none';
+  const cur = childAges.querySelectorAll('input').length;
+  if (cur === n) return;
+  childAges.innerHTML = '';
+  for (let i = 0; i < n; i++) {
+    const inp = document.createElement('input');
+    inp.type = 'number'; inp.min = 0; inp.max = 17; inp.value = 7;
+    inp.title = `возраст ребёнка ${i + 1}`;
+    childAges.appendChild(inp);
+  }
+}
+f.children.addEventListener('input', syncChildAges);
+
+function childAgesValue() {
+  return [...childAges.querySelectorAll('input')]
+    .map(i => +i.value).filter(v => !Number.isNaN(v))
+    .sort((a, b) => a - b).join(',');
+}
 
 // One place that reads the form into a filter object — shared by search and
 // by "save as subscription", so a saved search matches what you just ran.
@@ -130,11 +163,22 @@ function currentFilters() {
     adults: +f.adults.value, nights_min: +f.nights_min.value,
     nights_max: +f.nights_max.value,
   };
+  const ages = childAgesValue(); if (ages) flt.children_ages = ages;
   if (f.budget_max.value) flt.budget_max = +f.budget_max.value;
-  const b = multi(f.boards); if (b) flt.boards = b;
-  const c = multi(f.countries); if (c) flt.countries = c;
+  const b = checked('board').join(','); if (b) flt.boards = b;
+  const c = checked('country').join(','); if (c) flt.countries = c;
   if (f.only_hot.checked) flt.only_hot = true;
   return flt;
+}
+
+function compositionsHint(comps) {
+  if (!comps || !comps.length) return 'Ничего не найдено. Сначала запусти сбор данных.';
+  const human = comps.map(c => {
+    const kids = c.children_ages ? ` + дети ${c.children_ages}` : '';
+    return `${c.pax_adl} взр.${kids} (${c.offers})`;
+  }).join(', ');
+  return `Ничего не найдено по этому составу. Собрано только: ${human}. `
+       + `Другой состав нужно сперва собрать: python -m tourfinder.cli fetch --pax "2+1:7"`;
 }
 
 f.addEventListener('submit', async e => {
@@ -149,7 +193,7 @@ f.addEventListener('submit', async e => {
   const data = await r.json();
   status.textContent = data.count
     ? `Найдено: ${data.count}`
-    : 'Ничего не найдено. Проверь фильтры или запусти сбор данных.';
+    : compositionsHint(data.available_compositions);
 
   for (const t of data.results) {
     // "hot but pricier than its own average": our observed average when we
@@ -240,7 +284,8 @@ function priceChart(hist) {
 const subsBox = document.getElementById('subs');
 
 function filtersDesc(flt) {
-  const parts = [`${flt.date_from}…${flt.date_till}`, `${flt.adults} взр.`,
+  const pax = `${flt.adults} взр.` + (flt.children_ages ? ` + дети ${flt.children_ages}` : '');
+  const parts = [`${flt.date_from}…${flt.date_till}`, pax,
                  `${flt.nights_min}–${flt.nights_max} н.`];
   if (flt.budget_max) parts.push(`до ${flt.budget_max} €`);
   if (flt.only_hot) parts.push('горящие');

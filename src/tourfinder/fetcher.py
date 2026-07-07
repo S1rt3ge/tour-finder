@@ -21,13 +21,15 @@ def utcnow() -> str:
 def run_fetch(conn: sqlite3.Connection, client: joinup.JoinUpClient,
               origin: str = joinup.RIGA_ORIGIN_ID,
               days_from: int = 1, days_till: int = 30,
-              adults: int = 2, only_destinations: list[str] | None = None,
+              adults: int = 2, children_ages: list[int] | None = None,
+              only_destinations: list[str] | None = None,
               max_pages: int | None = None, tier: str | None = None) -> dict:
     date_from = date.today() + timedelta(days=days_from)
     date_till = date.today() + timedelta(days=days_till)
     dates = f"{date_from.isoformat()}:{date_till.isoformat()}"
 
     params = dict(origin=origin, dates=dates, adults=adults,
+                  children_ages=children_ages,
                   destinations=only_destinations, max_pages=max_pages, tier=tier)
     run_id = conn.execute(
         "INSERT INTO fetch_runs(started_at, params) VALUES (?, ?)",
@@ -64,9 +66,11 @@ def run_fetch(conn: sqlite3.Connection, client: joinup.JoinUpClient,
                     found = 0
                     for tour in client.search_pages(origin, dest_id, dates,
                                                     stays_param, adults,
+                                                    children_ages=children_ages,
                                                     max_pages=max_pages):
                         offers_seen += _store_tour(conn, tour, run_id, adults,
-                                                   client.lang, is_hot=False)
+                                                   children_ages, client.lang,
+                                                   is_hot=False)
                         conn.commit()
                         found += 1
                     if not found:
@@ -75,9 +79,11 @@ def run_fetch(conn: sqlite3.Connection, client: joinup.JoinUpClient,
 
                     for tour in client.search_pages(origin, dest_id, dates,
                                                     stays_param, adults,
+                                                    children_ages=children_ages,
                                                     tour_types=joinup.HOT_TOUR_TYPE,
                                                     max_pages=max_pages):
-                        _store_tour(conn, tour, run_id, adults, client.lang, is_hot=True)
+                        _store_tour(conn, tour, run_id, adults, children_ages,
+                                    client.lang, is_hot=True)
                         conn.commit()
                 log.info("%s done, offers so far: %s, requests: %s",
                          dest_id, offers_seen, client.requests_made)
@@ -101,8 +107,10 @@ def run_fetch(conn: sqlite3.Connection, client: joinup.JoinUpClient,
 
 
 def _store_tour(conn: sqlite3.Connection, tour: dict, run_id: int,
-                adults: int, lang: str, is_hot: bool) -> int:
-    hotel, offers = joinup.normalize(tour, pax_adl=adults, lang=lang)
+                adults: int, children_ages: list[int] | None,
+                lang: str, is_hot: bool) -> int:
+    hotel, offers = joinup.normalize(tour, pax_adl=adults,
+                                     children_ages=children_ages, lang=lang)
     now = utcnow()
 
     conn.execute(

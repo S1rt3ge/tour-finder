@@ -7,7 +7,7 @@ from fastapi import Body, FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.templating import Jinja2Templates
 
-from . import db, reviews, subscriptions
+from . import db, queries, reviews, subscriptions
 from .queries import search_offers
 
 TEMPLATES_DIR = Path(__file__).resolve().parent.parent.parent / "templates"
@@ -49,6 +49,7 @@ def search(
     date_from: str = Query(...),
     date_till: str = Query(...),
     adults: int = 2,
+    children_ages: str | None = None,
     nights_min: int = 1,
     nights_max: int = 30,
     budget_max: int | None = None,
@@ -61,14 +62,26 @@ def search(
     try:
         rows = search_offers(
             conn, date_from=date_from, date_till=date_till, adults=adults,
-            nights_min=nights_min, nights_max=nights_max, budget_max=budget_max,
-            boards=boards, countries=countries, only_hot=only_hot, limit=limit)
+            children_ages=children_ages, nights_min=nights_min,
+            nights_max=nights_max, budget_max=budget_max, boards=boards,
+            countries=countries, only_hot=only_hot, limit=limit)
+        compositions = queries.available_compositions(conn) if not rows else None
     finally:
         conn.close()
     for r in rows:
         r["star_gap"] = reviews.star_gap(
             r.get("category"), r.get("review_rating"), r.get("review_scale"))
-    return JSONResponse({"count": len(rows), "results": rows})
+    return JSONResponse({"count": len(rows), "results": rows,
+                         "available_compositions": compositions})
+
+
+@app.get("/api/compositions")
+def compositions():
+    conn = get_conn()
+    try:
+        return JSONResponse({"compositions": queries.available_compositions(conn)})
+    finally:
+        conn.close()
 
 
 @app.get("/api/offers/{offer_id}/history")

@@ -3,22 +3,48 @@ subscription evaluation."""
 import sqlite3
 
 
+def _norm_ages(children_ages: str | None) -> str:
+    """Canonical children-ages string: sorted ints, comma joined. Accepts a
+    raw '8,6' or '' and returns '6,8' / ''. Matches storage form."""
+    if not children_ages:
+        return ""
+    ages = [int(a) for a in str(children_ages).split(",") if a.strip() != ""]
+    return ",".join(str(a) for a in sorted(ages))
+
+
+def available_compositions(conn: sqlite3.Connection) -> list[dict]:
+    """Party compositions we actually hold offers for — drives the form and
+    the empty-state hint."""
+    rows = conn.execute(
+        """SELECT pax_adl, pax_chd, children_ages, count(*) AS offers
+           FROM offers GROUP BY pax_adl, pax_chd, children_ages
+           ORDER BY pax_adl, pax_chd"""
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def search_offers(conn: sqlite3.Connection, *, date_from: str, date_till: str,
-                  adults: int = 2, nights_min: int = 1, nights_max: int = 30,
+                  adults: int = 2, children_ages: str | None = None,
+                  nights_min: int = 1, nights_max: int = 30,
                   budget_max: int | None = None, boards: str | None = None,
                   countries: str | None = None, only_hot: bool = False,
                   limit: int = 100) -> list[dict]:
     """Offers whose latest snapshot matches the filters, cheapest first.
 
+    Party composition (adults + children_ages) must match exactly — price
+    depends on it, so we only return offers collected for that exact party.
+    children_ages is a canonical sorted comma string, '' for no children.
     budget_max is a price ceiling in whole currency units (also the price
     threshold for subscriptions).
     """
+    ages = _norm_ages(children_ages)
     where = ["o.date_start BETWEEN :date_from AND :date_till",
              "o.nights BETWEEN :nights_min AND :nights_max",
-             "o.pax_adl = :adults"]
+             "o.pax_adl = :adults",
+             "o.children_ages = :ages"]
     params = {"date_from": date_from, "date_till": date_till,
               "nights_min": nights_min, "nights_max": nights_max,
-              "adults": adults, "limit": min(limit, 500)}
+              "adults": adults, "ages": ages, "limit": min(limit, 500)}
     if budget_max:
         where.append("l.price_cents <= :budget_cents")
         params["budget_cents"] = budget_max * 100

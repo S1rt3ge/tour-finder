@@ -83,13 +83,16 @@ class JoinUpClient:
         return [s["stay"] for s in data.get("stays", [])]
 
     def search_pages(self, origin: str, destinations: str, dates: str, stays: str,
-                     pax_adl: int, tour_types: str | None = None,
-                     max_pages: int | None = None):
+                     pax_adl: int, children_ages: list[int] | None = None,
+                     tour_types: str | None = None, max_pages: int | None = None):
         """Yield raw tour dicts across all result pages of one search."""
         page = 1
         while True:
             params = dict(origins=origin, destinations=destinations, dates=dates,
                           stays=stays, pax_adl=pax_adl, page=page)
+            if children_ages:
+                params["pax_chd"] = len(children_ages)
+                params["children_ages"] = ",".join(str(a) for a in children_ages)
             if tour_types:
                 params["tour_types"] = tour_types
             data = self._get("tour/tours", **params)
@@ -110,12 +113,22 @@ def to_cents(value) -> int | None:
         return None
 
 
-def normalize(tour: dict, pax_adl: int, lang: str = "lv") -> tuple[dict, list[dict]]:
+def ages_str(children_ages: list[int] | None) -> str:
+    """Canonical children-ages string for storage and matching: sorted, comma
+    joined, e.g. [8,6] -> '6,8'. Empty for no children."""
+    if not children_ages:
+        return ""
+    return ",".join(str(a) for a in sorted(children_ages))
+
+
+def normalize(tour: dict, pax_adl: int, children_ages: list[int] | None = None,
+              lang: str = "lv") -> tuple[dict, list[dict]]:
     """Raw API tour -> (hotel row, offer rows with embedded snapshot fields).
 
     pax composition comes from the search query, not the response:
-    the API echoes pax_adl back as an empty list.
+    the API echoes pax back as an empty list.
     """
+    ages = ages_str(children_ages)
     h = tour["hotel"]
     loc = h.get("location") or {}
     region = (loc.get("region") or [{}])[0]
@@ -162,8 +175,8 @@ def normalize(tour: dict, pax_adl: int, lang: str = "lv") -> tuple[dict, list[di
             "room_name": room.get("name"),
             "room_placement": room.get("placement") or "",
             "pax_adl": pax_adl,
-            "pax_chd": 0,
-            "children_ages": "",
+            "pax_chd": len(children_ages) if children_ages else 0,
+            "children_ages": ages,
             "link": PUBLIC_HOTEL_URL.format(lang=lang, hotel_id=h["id"]),
             # snapshot fields
             "price_cents": price_cents,
