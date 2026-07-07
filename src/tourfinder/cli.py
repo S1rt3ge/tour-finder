@@ -2,6 +2,7 @@
 
   fetch   — one-off pull from Join Up, store price snapshots
   collect — scheduler entry point: run whichever fetch tiers are due
+  reviews — enrich hotels with guest reviews from an external platform
   serve   — run the local web UI
   stats   — quick DB numbers
 """
@@ -101,6 +102,23 @@ def cmd_collect(args):
         log.info("subscriptions: %s new alert(s)", new_alerts)
 
 
+def cmd_reviews(args):
+    from . import reviews as reviews_mod
+    from .sources.reviews import get_provider
+
+    conn = db.connect(args.db)
+    provider = get_provider(args.provider)
+    if not provider.available():
+        print(f"provider '{args.provider}' has no credentials — set the API key "
+              f"(GOOGLE_PLACES_API_KEY for google) and retry. Nothing fetched.")
+        return
+    result = reviews_mod.enrich(conn, provider, max_age_days=args.max_age_days,
+                                limit=args.limit)
+    print(f"reviews[{args.provider}]: candidates {result['candidates']}, "
+          f"checked {result['checked']}, stored {result['stored']}, "
+          f"errors {result.get('errors', 0)}")
+
+
 def cmd_serve(args):
     import uvicorn
     uvicorn.run("tourfinder.webapp:app", host="127.0.0.1", port=args.port,
@@ -143,6 +161,13 @@ def main():
     c.add_argument("--adults", type=int, default=2)
     c.add_argument("--delay", type=float, default=1.2)
     c.set_defaults(func=cmd_collect)
+
+    rv = sub.add_parser("reviews", help="enrich hotels with guest reviews")
+    rv.add_argument("--provider", default="google", help="review platform (default: google)")
+    rv.add_argument("--limit", type=int, help="max hotels this run (spares API quota)")
+    rv.add_argument("--max-age-days", type=int, default=30,
+                    help="refetch reviews older than this")
+    rv.set_defaults(func=cmd_reviews)
 
     s = sub.add_parser("serve", help="run local web UI")
     s.add_argument("--port", type=int, default=8000)

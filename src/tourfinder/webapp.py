@@ -7,7 +7,7 @@ from fastapi import Body, FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.templating import Jinja2Templates
 
-from . import db, subscriptions
+from . import db, reviews, subscriptions
 from .queries import search_offers
 
 TEMPLATES_DIR = Path(__file__).resolve().parent.parent.parent / "templates"
@@ -65,6 +65,9 @@ def search(
             boards=boards, countries=countries, only_hot=only_hot, limit=limit)
     finally:
         conn.close()
+    for r in rows:
+        r["star_gap"] = reviews.star_gap(
+            r.get("category"), r.get("review_rating"), r.get("review_scale"))
     return JSONResponse({"count": len(rows), "results": rows})
 
 

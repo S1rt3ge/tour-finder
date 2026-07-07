@@ -36,6 +36,12 @@
                border-radius: 999px; font-weight: 600; }
   .badge-overavg { background: #fef3c7; color: #92400e; font-size: 12px; padding: 2px 8px;
                    border-radius: 999px; }
+  .rating-row { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  .rating { font-weight: 600; }
+  .badge-overrated { background: #fee2e2; color: #b91c1c; font-size: 12px; padding: 2px 8px;
+                     border-radius: 999px; }
+  .badge-underrated { background: #dcfce7; color: #15803d; font-size: 12px; padding: 2px 8px;
+                      border-radius: 999px; }
   .range { font-size: 12px; color: var(--muted); }
   button.history-toggle { background: none; border: 0; padding: 0; text-align: left;
                           cursor: pointer; font-size: 12px; color: var(--muted); }
@@ -160,6 +166,7 @@ f.addEventListener('submit', async e => {
       <div class="body">
         <h3>${t.hotel_name} <span class="meta">${stars}</span></h3>
         <div class="meta">${t.country_name || ''}${t.city_name ? ', ' + t.city_name : ''}</div>
+        ${ratingRow(t)}
         <div class="meta">${t.date_start} → ${t.date_end || ''} · ${t.nights} н. · ${t.board_name || t.board_code}${t.room_name ? ' · ' + t.room_name : ''}</div>
         <div class="price-row">
           <span class="price">${euro(t.price_cents)}</span>
@@ -178,6 +185,25 @@ f.addEventListener('submit', async e => {
     results.appendChild(card);
   }
 });
+
+// Guest rating + the gap vs official stars. star_gap < 0 → guests rate below
+// the star class (overrated); > 0 → underrated. Small gaps are noise.
+function ratingRow(t) {
+  if (t.review_rating == null) return '';
+  const scale = t.review_scale || 5;
+  const cnt = t.review_count ? ` · ${t.review_count.toLocaleString('ru-RU')} отзывов` : '';
+  const src = t.review_platform === 'google' ? 'Google' : t.review_platform;
+  let badge = '';
+  if (t.star_gap != null && t.star_gap <= -0.75)
+    badge = '<span class="badge-overrated">хуже звёзд</span>';
+  else if (t.star_gap != null && t.star_gap >= 0.75)
+    badge = '<span class="badge-underrated">лучше звёзд</span>';
+  const rating = `${(+t.review_rating).toFixed(1)}${scale != 5 ? '/' + scale : ''}`;
+  const inner = `<span class="rating">★ ${rating}</span><span class="meta">${src}${cnt}</span>${badge}`;
+  return t.review_url
+    ? `<div class="rating-row"><a href="${t.review_url}" target="_blank" rel="noopener" style="text-decoration:none;color:inherit">${inner}</a></div>`
+    : `<div class="rating-row">${inner}</div>`;
+}
 
 async function toggleHistory(card, offerId) {
   const panel = card.querySelector('.history');

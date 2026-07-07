@@ -83,6 +83,27 @@ CREATE TABLE IF NOT EXISTS subscriptions(
     created_at TEXT NOT NULL
 );
 
+-- Guest reviews per hotel x platform. Rating stored on a 0..scale scale
+-- (scale kept so a 0..5 Google score and a 0..10 source can coexist). The
+-- product value is the gap vs official stars, computed at read time.
+CREATE TABLE IF NOT EXISTS hotel_reviews(
+    id              INTEGER PRIMARY KEY,
+    source          TEXT NOT NULL,          -- hotel source, e.g. 'joinup'
+    source_hotel_id TEXT NOT NULL,
+    platform        TEXT NOT NULL,          -- 'google' | 'tripadvisor' | ...
+    rating          REAL,                   -- guest score on `scale`
+    rating_scale    REAL NOT NULL DEFAULT 5,
+    reviews_count   INTEGER,
+    summary         TEXT,
+    external_id     TEXT,                   -- platform's own id, for refetch
+    url             TEXT,
+    matched_name    TEXT,                   -- what the platform matched to
+    match_status    TEXT NOT NULL DEFAULT 'ok',  -- ok | not_found | ambiguous
+    fetched_at      TEXT NOT NULL,
+    UNIQUE (source, source_hotel_id, platform)
+);
+CREATE INDEX IF NOT EXISTS idx_reviews_hotel ON hotel_reviews(source, source_hotel_id);
+
 -- One firing: this offer matched this subscription for this reason.
 CREATE TABLE IF NOT EXISTS alerts(
     id              INTEGER PRIMARY KEY,
