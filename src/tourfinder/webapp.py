@@ -78,13 +78,40 @@ def search(
         else:
             rows = search_offers(conn, sort=sort, hotel_id=hotel_id, **filters)
         compositions = queries.available_compositions(conn) if not rows else None
+        # Search for a composition we never crawled auto-queues it: the next
+        # scheduled collect starts covering it, no button pressing required.
+        queued_spec = None
+        if group and not hotel_id and not rows and compositions is not None:
+            queued_spec = _queue_missing_pax(conn, adults, children_ages,
+                                             compositions)
     finally:
         conn.close()
     for r in rows:
         r["star_gap"] = reviews.star_gap(
             r.get("category"), r.get("review_rating"), r.get("review_scale"))
     return JSONResponse({"count": len(rows), "results": rows,
-                         "available_compositions": compositions})
+                         "available_compositions": compositions,
+                         "queued_spec": queued_spec})
+
+
+def _queue_missing_pax(conn, adults: int, children_ages: str | None,
+                       compositions: list[dict]) -> str | None:
+    ages_norm = queries._norm_ages(children_ages)
+    have = {(c["pax_adl"], c["children_ages"]) for c in compositions}
+    if (adults, ages_norm) in have or not 1 <= adults <= 6:
+        return None
+    ages_list = [int(a) for a in ages_norm.split(",") if a != ""]
+    if len(ages_list) > 4 or any(not 0 <= a <= 17 for a in ages_list):
+        return None
+    spec = str(adults)
+    if ages_list:
+        spec += f"+{len(ages_list)}:{ages_norm}"
+    if not conn.execute("SELECT 1 FROM pax_requests WHERE spec = :s",
+                        {"s": spec}).fetchone():
+        conn.execute("INSERT INTO pax_requests(spec, created_at) VALUES (:s, :now)",
+                     {"s": spec, "now": _utcnow()})
+        conn.commit()
+    return spec
 
 
 @app.get("/api/drops")

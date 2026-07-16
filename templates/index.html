@@ -62,10 +62,16 @@
   button.ghost:hover { background: #fff2ec; filter: none; }
   #subs-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
               padding: 0 32px 8px; }
-  #tabs { display: flex; gap: 8px; padding: 4px 32px 10px; }
-  .tab { background: none; border: 1px solid #ddd6cc; color: var(--text);
-         border-radius: 999px; padding: 7px 18px; font-size: 14px; }
-  .tab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  #tabs { display: flex; gap: 22px; padding: 10px 32px 0;
+          border-bottom: 1px solid #e8e2d8; }
+  .tab { background: none; border: 0; border-bottom: 2px solid transparent;
+         border-radius: 0; color: var(--muted); padding: 8px 2px 10px;
+         font-size: 15px; }
+  .tab:hover { filter: none; color: var(--text); }
+  .tab.active { color: var(--text); border-bottom-color: var(--accent);
+                font-weight: 600; }
+  .fallback-note { margin: 0 32px 10px; padding: 10px 14px; background: #fff7ed;
+                   border: 1px solid #fdba74; border-radius: 10px; font-size: 14px; }
   .variants { border-top: 1px dashed #e8e2d8; margin-top: 6px; }
   .vrow { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
           padding: 7px 0; border-bottom: 1px dashed #efe9df; font-size: 13px; }
@@ -100,6 +106,11 @@
   <h1>tour-finder</h1>
   <p>Туры из Риги в последнюю минуту. Направление не обязательно — сортируем по цене.</p>
 </header>
+
+<div id="tabs">
+  <button type="button" class="tab active" data-tab="search">Поиск</button>
+  <button type="button" class="tab" data-tab="drops">Падения цен ↓</button>
+</div>
 
 <form id="f">
   <label>Вылет с <input type="date" name="date_from" required></label>
@@ -138,11 +149,6 @@
   <button type="submit">Искать</button>
   <button type="button" id="save-sub" class="ghost">Сохранить как подписку</button>
 </form>
-
-<div id="tabs">
-  <button type="button" class="tab active" data-tab="search">Поиск</button>
-  <button type="button" class="tab" data-tab="drops">Падения цен ↓</button>
-</div>
 
 <div id="subs-bar">
   <button type="button" id="sound-toggle" class="ghost">🔔 включить звук</button>
@@ -208,34 +214,42 @@ function currentFilters() {
   return flt;
 }
 
-function renderCompositionsHint(comps) {
-  status.innerHTML = '';
-  if (!comps || !comps.length) {
-    status.textContent = 'Ничего не найдено — база ещё пуста, сборщик наполнит её в ближайшие часы.';
+const paxHuman = c => `${c.pax_adl} взр.` + (c.children_ages ? ` + дети ${c.children_ages}` : '');
+
+// No data for the requested party: the server already queued it for the
+// collector; meanwhile show prices for the closest collected party so the
+// user sees the market instead of an empty page.
+async function renderCompositionFallback(data, flt) {
+  const comps = data.available_compositions || [];
+  if (!comps.length) {
+    status.textContent = 'База ещё наполняется сборщиком — загляни через пару часов.';
     return;
   }
-  const human = comps.map(c => {
-    const kids = c.children_ages ? ` + дети ${c.children_ages}` : '';
-    return `${c.pax_adl} взр.${kids}`;
-  }).join(', ');
-  const span = document.createElement('span');
-  span.textContent = `По этому составу данных пока нет (собрано: ${human}). `;
-  const btn = document.createElement('button');
-  btn.type = 'button'; btn.className = 'ghost';
-  btn.style.cssText = 'padding:4px 12px;font-size:13px';
-  btn.textContent = 'Собирать этот состав автоматически';
-  btn.onclick = async () => {
-    const ages = childAgesValue();
-    const r = await fetch('/api/pax-requests', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ adults: +f.adults.value,
-                             children_ages: ages ? ages.split(',').map(Number) : [] }) });
-    const d = await r.json();
-    status.textContent = r.ok
-      ? `Состав ${d.spec} добавлен в автосбор — данные появятся после ближайших сборов (часы). Загляни позже.`
-      : `Не вышло: ${d.error || 'ошибка'}`;
-  };
-  status.append(span, btn);
+  const best = comps.slice().sort((a, b) => b.offers - a.offers)[0];
+  const queuedNote = data.queued_spec
+    ? `Состав добавлен в автосбор — его цены появятся в течение нескольких часов.`
+    : `Состав уже в очереди на сбор — цены появятся в течение нескольких часов.`;
+
+  const note = document.createElement('div');
+  note.className = 'fallback-note';
+  note.textContent = `По вашему составу данных ещё нет. ${queuedNote} `
+    + `Пока показываем цены для «${paxHuman(best)}» — у вашего состава они будут другими.`;
+  results.before(note);
+
+  const p = new URLSearchParams();
+  for (const [k, v] of Object.entries(flt)) p.set(k, v);
+  p.set('adults', best.pax_adl);
+  if (best.children_ages) p.set('children_ages', best.children_ages);
+  else p.delete('children_ages');
+  const r = await fetch('/api/search?' + p);
+  const d = await r.json();
+  status.textContent = d.count
+    ? `Отелей (для «${paxHuman(best)}»): ${d.count}`
+    : 'Под остальные фильтры пока ничего не попало — попробуй расширить даты или ночи.';
+  const fallbackFlt = { ...flt, adults: best.pax_adl };
+  if (best.children_ages) fallbackFlt.children_ages = best.children_ages;
+  else delete fallbackFlt.children_ages;
+  for (const t of d.results) results.appendChild(hotelCard(t, fallbackFlt));
 }
 
 let activeTab = 'search';
@@ -254,11 +268,15 @@ f.addEventListener('submit', async e => {
 
   status.textContent = 'Ищем…';
   results.innerHTML = '';
+  document.querySelectorAll('.fallback-note').forEach(n => n.remove());
   const r = await fetch('/api/search?' + p);
   const data = await r.json();
-  if (data.count) status.textContent = `Отелей: ${data.count}`;
-  else renderCompositionsHint(data.available_compositions);
-  for (const t of data.results) results.appendChild(hotelCard(t, flt));
+  if (data.count) {
+    status.textContent = `Отелей: ${data.count}`;
+    for (const t of data.results) results.appendChild(hotelCard(t, flt));
+  } else {
+    await renderCompositionFallback(data, flt);
+  }
 });
 
 // --- grouped hotel cards ----------------------------------------------------
@@ -333,6 +351,7 @@ function variantRow(o) {
 async function runDrops() {
   status.textContent = 'Ищем падения…';
   results.innerHTML = '';
+  document.querySelectorAll('.fallback-note').forEach(n => n.remove());
   const p = new URLSearchParams({ adults: f.adults.value });
   const ages = childAgesValue(); if (ages) p.set('children_ages', ages);
   const { count, results: rows } = await (await fetch('/api/drops?' + p)).json();
