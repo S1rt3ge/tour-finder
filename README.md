@@ -3,13 +3,22 @@
 Last-minute агрегатор туров из Риги. Продукт: [SPEC.md](SPEC.md).
 Источник данных: Join Up Baltic через неофициальный JSON API — [docs/joinup-api-recon.md](docs/joinup-api-recon.md).
 
-## Прод (облако, $0/мес)
+## Прод (облако, $0/мес, работает без присмотра)
 
 - **Витрина:** https://tour-finder-rose.vercel.app (Vercel, деплой `vercel deploy --prod`)
-- **Сборщик:** GitHub Actions [`collect.yml`](.github/workflows/collect.yml), cron каждые 2 часа; сам решает, какие ярусы пора обновить
+- **Сборщик:** GitHub Actions [`collect.yml`](.github/workflows/collect.yml), cron каждые 2 часа; сам решает, какие ярусы пора обновить; составы — `DEFAULT_PAX` в `cli.py`
 - **БД:** Supabase Postgres (transaction pooler, порт 6543). Единственный секрет — `DATABASE_URL` (GitHub Secrets + Vercel env)
 - Один код на оба бэкенда: `DATABASE_URL` не задан → локальный SQLite `data/tourfinder.db`
 - Перенос локальной истории в облако: `scripts/migrate_sqlite_to_pg.py --wipe` (для миграции бери session-порт 5432)
+
+Самоохрана (ничего делать не надо, только реагировать на письма):
+- **Сторожок свежести** — шаг `assert-fresh` валит ран, если за 26 ч не легло ни
+  одного снимка → GitHub шлёт владельцу письмо о падении workflow.
+- **Keepalive** — [`keepalive.yml`](.github/workflows/keepalive.yml) раз в месяц
+  коммитит heartbeat, чтобы GitHub не отключил cron за 60 дней тишины в репо.
+- **Прунинг** — после каждого сбора плоские серии снимков схлопываются
+  (см. `prune_snapshots`), база не растёт впустую под лимит Supabase 500 МБ.
+- Supabase free не заснёт: сборщик пишет каждые ~2 часа.
 
 ## Запуск локально (Windows)
 
