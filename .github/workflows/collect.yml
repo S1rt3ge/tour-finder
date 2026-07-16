@@ -1,0 +1,27 @@
+name: collect
+
+on:
+  schedule:
+    # Every 2 hours. `collect` itself decides which tiers are due
+    # (near 4h / mid 12h / far 24h) and exits fast when nothing is.
+    - cron: "17 */2 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: collect
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+      - name: run collector
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m tourfinder.cli collect
