@@ -12,7 +12,10 @@
   header { padding: 24px 32px 8px; }
   header h1 { margin: 0; font-size: 22px; }
   header p { margin: 4px 0 0; color: var(--muted); font-size: 14px; }
-  form { display: flex; flex-wrap: wrap; gap: 12px; padding: 16px 32px; align-items: end; }
+  form { display: flex; flex-wrap: wrap; gap: 12px; padding: 16px 32px;
+         align-items: flex-start; max-width: 1200px; }
+  form > label { align-self: flex-end; }
+  form > button, form > .hotcheck { align-self: flex-end; margin-bottom: 2px; }
   label { display: flex; flex-direction: column; font-size: 12px; color: var(--muted); gap: 4px; }
   input, select { padding: 8px 10px; border: 1px solid #ddd6cc; border-radius: 8px;
                   font-size: 14px; background: var(--card); min-width: 110px; }
@@ -205,14 +208,34 @@ function currentFilters() {
   return flt;
 }
 
-function compositionsHint(comps) {
-  if (!comps || !comps.length) return 'Ничего не найдено. Сначала запусти сбор данных.';
+function renderCompositionsHint(comps) {
+  status.innerHTML = '';
+  if (!comps || !comps.length) {
+    status.textContent = 'Ничего не найдено — база ещё пуста, сборщик наполнит её в ближайшие часы.';
+    return;
+  }
   const human = comps.map(c => {
     const kids = c.children_ages ? ` + дети ${c.children_ages}` : '';
-    return `${c.pax_adl} взр.${kids} (${c.offers})`;
+    return `${c.pax_adl} взр.${kids}`;
   }).join(', ');
-  return `Ничего не найдено по этому составу. Собрано только: ${human}. `
-       + `Другой состав нужно сперва собрать: python -m tourfinder.cli fetch --pax "2+1:7"`;
+  const span = document.createElement('span');
+  span.textContent = `По этому составу данных пока нет (собрано: ${human}). `;
+  const btn = document.createElement('button');
+  btn.type = 'button'; btn.className = 'ghost';
+  btn.style.cssText = 'padding:4px 12px;font-size:13px';
+  btn.textContent = 'Собирать этот состав автоматически';
+  btn.onclick = async () => {
+    const ages = childAgesValue();
+    const r = await fetch('/api/pax-requests', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ adults: +f.adults.value,
+                             children_ages: ages ? ages.split(',').map(Number) : [] }) });
+    const d = await r.json();
+    status.textContent = r.ok
+      ? `Состав ${d.spec} добавлен в автосбор — данные появятся после ближайших сборов (часы). Загляни позже.`
+      : `Не вышло: ${d.error || 'ошибка'}`;
+  };
+  status.append(span, btn);
 }
 
 let activeTab = 'search';
@@ -233,9 +256,8 @@ f.addEventListener('submit', async e => {
   results.innerHTML = '';
   const r = await fetch('/api/search?' + p);
   const data = await r.json();
-  status.textContent = data.count
-    ? `Отелей: ${data.count}`
-    : compositionsHint(data.available_compositions);
+  if (data.count) status.textContent = `Отелей: ${data.count}`;
+  else renderCompositionsHint(data.available_compositions);
   for (const t of data.results) results.appendChild(hotelCard(t, flt));
 });
 

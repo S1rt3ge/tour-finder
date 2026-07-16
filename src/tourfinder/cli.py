@@ -28,6 +28,23 @@ TIERS = [
 DEFAULT_PAX = ["2", "2+1:7", "3"]  # couple; couple + child aged 7; three adults
 
 
+def active_pax_specs(conn) -> list[str]:
+    """DEFAULT_PAX plus UI-requested compositions. Each extra spec is a full
+    crawl, so cap at 4 and age requests out after 21 days."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=21)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    rows = conn.execute(
+        """SELECT spec FROM pax_requests WHERE created_at >= :cutoff
+           ORDER BY created_at DESC LIMIT 4""",
+        {"cutoff": cutoff},
+    ).fetchall()
+    specs = list(DEFAULT_PAX)
+    for r in rows:
+        if r["spec"] not in specs:
+            specs.append(r["spec"])
+    return specs
+
+
 def parse_pax(spec: str) -> tuple[int, list[int]]:
     """'2' -> (2, []); '2+1:7' -> (2, [7]); '2+2:6,8' -> (2, [6, 8])."""
     spec = spec.strip()
@@ -97,7 +114,7 @@ def cmd_collect(args):
                  running["id"], running["started_at"])
         return
 
-    pax_specs = args.pax or DEFAULT_PAX
+    pax_specs = args.pax or active_pax_specs(conn)
     for name, days_from, days_till, period_h in TIERS:
         last = conn.execute(
             """SELECT started_at FROM fetch_runs

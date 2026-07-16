@@ -139,6 +139,35 @@ def offer_history(offer_id: int):
                          "history": [dict(r) for r in rows]})
 
 
+@app.post("/api/pax-requests")
+def request_pax(payload: dict = Body(...)):
+    """Ask the collector to start crawling a party composition. Picked up by
+    the next scheduled run (collect crawls DEFAULT_PAX + recent requests)."""
+    try:
+        adults = int(payload.get("adults", 0))
+        ages = [int(a) for a in (payload.get("children_ages") or [])]
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "bad adults/children_ages"}, status_code=400)
+    if not (1 <= adults <= 6) or len(ages) > 4 or any(not 0 <= a <= 17 for a in ages):
+        return JSONResponse({"error": "adults 1..6, up to 4 children aged 0..17"},
+                            status_code=400)
+    spec = str(adults)
+    if ages:
+        spec += f"+{len(ages)}:{','.join(str(a) for a in sorted(ages))}"
+    conn = get_conn()
+    try:
+        existing = conn.execute(
+            "SELECT 1 FROM pax_requests WHERE spec = :s", {"s": spec}).fetchone()
+        if not existing:
+            conn.execute(
+                "INSERT INTO pax_requests(spec, created_at) VALUES (:s, :now)",
+                {"s": spec, "now": _utcnow()})
+            conn.commit()
+    finally:
+        conn.close()
+    return JSONResponse({"spec": spec, "queued": True})
+
+
 # --- subscriptions (saved searches / watchlist) ---------------------------
 
 def _sub_dict(conn, row) -> dict:

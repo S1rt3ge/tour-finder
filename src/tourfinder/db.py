@@ -92,6 +92,16 @@ Table(
     Column("errors", Text),
 )
 
+# Party compositions requested from the UI. collect crawls DEFAULT_PAX
+# plus the freshest few of these (each one is a full extra crawl, so the
+# picker in cli.py caps and ages them out).
+Table(
+    "pax_requests", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("spec", Text, nullable=False, unique=True),  # e.g. '3+1:13'
+    Column("created_at", Text, nullable=False),
+)
+
 # Saved search (watchlist). filters is the JSON search payload; its
 # budget_max doubles as the price threshold.
 Table(
