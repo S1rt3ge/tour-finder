@@ -25,3 +25,10 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python -m tourfinder.cli collect
+      - name: assert data is fresh
+        # Dead-man's switch: if nothing was snapshotted in the last 26h the
+        # pipeline is broken (source changed, blocked, secret expired...) —
+        # fail the run so GitHub emails the owner.
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m tourfinder.cli assert-fresh --hours 26

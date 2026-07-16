@@ -25,7 +25,7 @@ TIERS = [
 # Party compositions collected by `collect`. Each is a full crawl, so keep
 # the default small; add more with `collect --pax`. Price depends on the
 # exact party, so a search only matches a composition we actually collected.
-DEFAULT_PAX = ["2", "2+1:7"]  # 2 adults; 2 adults + 1 child aged 7
+DEFAULT_PAX = ["2", "2+1:7", "3"]  # couple; couple + child aged 7; three adults
 
 
 def parse_pax(spec: str) -> tuple[int, list[int]]:
@@ -142,6 +142,21 @@ def cmd_prune(args):
     print(f"snapshots: {before} -> {before - deleted} (pruned {deleted})")
 
 
+def cmd_assert_fresh(args):
+    """Exit non-zero when the newest snapshot is older than --hours.
+    Dead-man's switch for the scheduled collector."""
+    import sys
+
+    conn = db.connect(args.db)
+    newest = conn.execute("SELECT max(fetched_at) FROM price_snapshots").scalar()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=args.hours)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    if not newest or newest < cutoff:
+        print(f"STALE: newest snapshot {newest!r} older than {args.hours}h cutoff {cutoff}")
+        sys.exit(1)
+    print(f"fresh: newest snapshot {newest} (cutoff {cutoff})")
+
+
 def cmd_reviews(args):
     from . import reviews as reviews_mod
     from .sources.reviews import get_provider
@@ -208,6 +223,10 @@ def main():
 
     pr = sub.add_parser("prune", help="collapse flat runs of price snapshots")
     pr.set_defaults(func=cmd_prune)
+
+    af = sub.add_parser("assert-fresh", help="fail when snapshots are stale (CI watchdog)")
+    af.add_argument("--hours", type=int, default=26)
+    af.set_defaults(func=cmd_assert_fresh)
 
     rv = sub.add_parser("reviews", help="enrich hotels with guest reviews")
     rv.add_argument("--provider", default="google", help="review platform (default: google)")
