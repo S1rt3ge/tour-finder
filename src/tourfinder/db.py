@@ -159,9 +159,12 @@ def get_engine(path: str | Path | None = None):
         if url.startswith("sqlite"):
             engine = create_engine(url)
         else:
-            # Serverless-friendly: Supabase's pgbouncer does the pooling,
-            # we hold no connections between requests.
-            engine = create_engine(url, poolclass=NullPool, pool_pre_ping=True)
+            # Serverless-friendly: Supabase's pgbouncer does the pooling, we
+            # hold no connections between requests. prepare_threshold=None
+            # disables psycopg's server-side prepared statements, which break
+            # behind a transaction-mode pooler.
+            engine = create_engine(url, poolclass=NullPool, pool_pre_ping=True,
+                                   connect_args={"prepare_threshold": None})
         metadata.create_all(engine)
         if url.startswith("sqlite"):
             with engine.begin() as c:
