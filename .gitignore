@@ -4,3 +4,6 @@ __pycache__/
 data/
 .claude/settings.local.json
 *.egg-info/
+
+.vercel
+.env*
