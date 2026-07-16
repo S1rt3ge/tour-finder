@@ -70,17 +70,18 @@ def cmd_collect(args):
     log = logging.getLogger("tourfinder.collect")
     conn = db.connect(args.db)
     now = datetime.now(timezone.utc)
+    # started_at is stored as UTC ISO text, so string comparison == time
+    # comparison; the cutoff is computed here, not in dialect-specific SQL.
+    stale_cutoff = (now - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # Reap runs abandoned by a killed process: no finished_at and started
     # over 3h ago. Their partial data stays (committed per destination);
     # only the run record is closed out so it stops looking "in progress".
     reaped = conn.execute(
         """UPDATE fetch_runs
-           SET finished_at = ?, errors = json_array('abandoned: no completion record')
-           WHERE finished_at IS NULL
-             AND replace(replace(started_at, 'T', ' '), 'Z', '')
-                 <= datetime('now', '-3 hours')""",
-        (utcnow(),),
+           SET finished_at = :now, errors = '["abandoned: no completion record"]'
+           WHERE finished_at IS NULL AND started_at <= :cutoff""",
+        {"now": utcnow(), "cutoff": stale_cutoff},
     ).rowcount
     conn.commit()
     if reaped:
@@ -88,9 +89,8 @@ def cmd_collect(args):
 
     running = conn.execute(
         """SELECT id, started_at FROM fetch_runs
-           WHERE finished_at IS NULL
-             AND replace(replace(started_at, 'T', ' '), 'Z', '')
-                 > datetime('now', '-3 hours')"""
+           WHERE finished_at IS NULL AND started_at > :cutoff""",
+        {"cutoff": stale_cutoff},
     ).fetchone()
     if running:
         log.info("run #%s still in progress (since %s), exit",
@@ -101,9 +101,9 @@ def cmd_collect(args):
     for name, days_from, days_till, period_h in TIERS:
         last = conn.execute(
             """SELECT started_at FROM fetch_runs
-               WHERE json_extract(params, '$.tier') = ? AND finished_at IS NOT NULL
+               WHERE tier = :tier AND finished_at IS NOT NULL
                ORDER BY id DESC LIMIT 1""",
-            (name,),
+            {"tier": name},
         ).fetchone()
         if last:
             last_at = datetime.fromisoformat(last["started_at"].replace("Z", "+00:00"))
@@ -153,7 +153,8 @@ def cmd_serve(args):
 
 def cmd_stats(args):
     conn = db.connect(args.db)
-    q = lambda sql: conn.execute(sql).fetchone()[0]
+    q = lambda sql: conn.execute(sql).scalar()
+    print("backend:  ", conn.dialect)
     print("hotels:   ", q("SELECT count(*) FROM hotels"))
     print("offers:   ", q("SELECT count(*) FROM offers"))
     print("snapshots:", q("SELECT count(*) FROM price_snapshots"))

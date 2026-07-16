@@ -1,6 +1,5 @@
 """Shared read queries over collected offers, used by the web UI and by
 subscription evaluation."""
-import sqlite3
 
 
 def _norm_ages(children_ages: str | None) -> str:
@@ -12,7 +11,7 @@ def _norm_ages(children_ages: str | None) -> str:
     return ",".join(str(a) for a in sorted(ages))
 
 
-def available_compositions(conn: sqlite3.Connection) -> list[dict]:
+def available_compositions(conn) -> list[dict]:
     """Party compositions we actually hold offers for — drives the form and
     the empty-state hint."""
     rows = conn.execute(
@@ -23,7 +22,7 @@ def available_compositions(conn: sqlite3.Connection) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def search_offers(conn: sqlite3.Connection, *, date_from: str, date_till: str,
+def search_offers(conn, *, date_from: str, date_till: str,
                   adults: int = 2, children_ages: str | None = None,
                   nights_min: int = 1, nights_max: int = 30,
                   budget_max: int | None = None, boards: str | None = None,
@@ -88,7 +87,7 @@ def search_offers(conn: sqlite3.Connection, *, date_from: str, date_till: str,
                br.url AS review_url,
                (SELECT count(*) FROM price_snapshots ps2
                 WHERE ps2.offer_id = o.id) AS snapshots_count,
-               (SELECT avg(price_cents) FROM price_snapshots ps5
+               (SELECT CAST(avg(price_cents) AS REAL) FROM price_snapshots ps5
                 WHERE ps5.offer_id = o.id) AS avg_seen_cents,
                (SELECT min(price_cents) FROM price_snapshots ps3
                 WHERE ps3.offer_id = o.id) AS min_seen_cents,

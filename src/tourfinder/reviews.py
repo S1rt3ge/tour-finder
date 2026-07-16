@@ -1,7 +1,6 @@
 """Enrich hotels with guest reviews and compute the stars-vs-guests gap."""
 import logging
-import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from .sources.reviews import ReviewProvider
 
@@ -12,9 +11,14 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def hotels_needing_reviews(conn: sqlite3.Connection, platform: str,
+def _iso_ago(days: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
+
+def hotels_needing_reviews(conn, platform: str,
                            max_age_days: int = 30, limit: int | None = None,
-                           only_searchable: bool = True) -> list[sqlite3.Row]:
+                           only_searchable: bool = True) -> list:
     """Hotels with no review row for this platform, or a stale one.
 
     only_searchable keeps to hotels currently reachable in search (they have
@@ -28,16 +32,16 @@ def hotels_needing_reviews(conn: sqlite3.Connection, platform: str,
             SELECT 1 FROM hotel_reviews r
             WHERE r.source = h.source AND r.source_hotel_id = h.source_hotel_id
               AND r.platform = :platform
-              AND r.fetched_at > datetime('now', :cutoff)
+              AND r.fetched_at > :cutoff_ts
         )
         ORDER BY h.name
     """
-    params = {"platform": platform, "cutoff": f"-{max_age_days} days"}
+    params = {"platform": platform, "cutoff_ts": _iso_ago(max_age_days)}
     rows = conn.execute(sql, params).fetchall()
     return rows[:limit] if limit else rows
 
 
-def enrich(conn: sqlite3.Connection, provider: ReviewProvider,
+def enrich(conn, provider: ReviewProvider,
            max_age_days: int = 30, limit: int | None = None) -> dict:
     if not provider.available():
         return {"available": False, "checked": 0, "stored": 0,

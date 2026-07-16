@@ -6,7 +6,6 @@ pass filtered to hot tours that only flips is_hot on this run's snapshots.
 """
 import json
 import logging
-import sqlite3
 from datetime import date, datetime, timedelta, timezone
 
 from .sources import joinup
@@ -18,7 +17,7 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def run_fetch(conn: sqlite3.Connection, client: joinup.JoinUpClient,
+def run_fetch(conn, client: joinup.JoinUpClient,
               origin: str = joinup.RIGA_ORIGIN_ID,
               days_from: int = 1, days_till: int = 30,
               adults: int = 2, children_ages: list[int] | None = None,
@@ -32,9 +31,10 @@ def run_fetch(conn: sqlite3.Connection, client: joinup.JoinUpClient,
                   children_ages=children_ages,
                   destinations=only_destinations, max_pages=max_pages, tier=tier)
     run_id = conn.execute(
-        "INSERT INTO fetch_runs(started_at, params) VALUES (?, ?)",
-        (utcnow(), json.dumps(params)),
-    ).lastrowid
+        "INSERT INTO fetch_runs(started_at, tier, params) "
+        "VALUES (:now, :tier, :params) RETURNING id",
+        {"now": utcnow(), "tier": tier, "params": json.dumps(params)},
+    ).fetchone()["id"]
     conn.commit()
 
     offers_seen = 0
@@ -97,16 +97,17 @@ def run_fetch(conn: sqlite3.Connection, client: joinup.JoinUpClient,
         log.error("source blocked us, aborting run: %s", exc)
 
     conn.execute(
-        "UPDATE fetch_runs SET finished_at=?, requests_made=?, offers_seen=?, errors=? WHERE id=?",
-        (utcnow(), client.requests_made, offers_seen,
-         json.dumps(errors) if errors else None, run_id),
+        "UPDATE fetch_runs SET finished_at=:now, requests_made=:req, "
+        "offers_seen=:seen, errors=:errors WHERE id=:id",
+        {"now": utcnow(), "req": client.requests_made, "seen": offers_seen,
+         "errors": json.dumps(errors) if errors else None, "id": run_id},
     )
     conn.commit()
     return {"run_id": run_id, "offers_seen": offers_seen,
             "requests_made": client.requests_made, "errors": errors}
 
 
-def _store_tour(conn: sqlite3.Connection, tour: dict, run_id: int,
+def _store_tour(conn, tour: dict, run_id: int,
                 adults: int, children_ages: list[int] | None,
                 lang: str, is_hot: bool) -> int:
     hotel, offers = joinup.normalize(tour, pax_adl=adults,
@@ -127,11 +128,16 @@ def _store_tour(conn: sqlite3.Connection, tour: dict, run_id: int,
     )
 
     stored = 0
+    offer_cols = ("source", "source_hotel_id", "origin_id", "origin_name",
+                  "date_start", "date_end", "nights", "board_code", "board_name",
+                  "room_code", "room_name", "room_placement",
+                  "pax_adl", "pax_chd", "children_ages", "link")
     for o in offers:
         if not o["nights"] or not o["origin_id"]:
             continue
-        o["now"] = now
-        cur = conn.execute(
+        op = {k: o[k] for k in offer_cols}
+        op["now"] = now
+        offer_id = conn.execute(
             """INSERT INTO offers(source, source_hotel_id, origin_id, origin_name,
                                   date_start, date_end, nights, board_code, board_name,
                                   room_code, room_name, room_placement,
@@ -141,29 +147,33 @@ def _store_tour(conn: sqlite3.Connection, tour: dict, run_id: int,
                        :date_start, :date_end, :nights, :board_code, :board_name,
                        :room_code, :room_name, :room_placement,
                        :pax_adl, :pax_chd, :children_ages, :link, :now, :now)
-               ON CONFLICT DO UPDATE SET last_seen_at=:now, link=:link
+               ON CONFLICT (source, source_hotel_id, origin_id, date_start, nights,
+                            board_code, room_code, room_placement,
+                            pax_adl, pax_chd, children_ages)
+               DO UPDATE SET last_seen_at=excluded.last_seen_at, link=excluded.link
                RETURNING id""",
-            o,
-        )
-        offer_id = cur.fetchone()[0]
+            op,
+        ).fetchone()["id"]
 
         existing = conn.execute(
-            "SELECT id FROM price_snapshots WHERE offer_id=? AND run_id=?",
-            (offer_id, run_id),
+            "SELECT id FROM price_snapshots WHERE offer_id=:o AND run_id=:r",
+            {"o": offer_id, "r": run_id},
         ).fetchone()
         if existing:
             if is_hot:
-                conn.execute("UPDATE price_snapshots SET is_hot=1 WHERE id=?",
-                             (existing["id"],))
+                conn.execute("UPDATE price_snapshots SET is_hot=1 WHERE id=:id",
+                             {"id": existing["id"]})
         else:
             conn.execute(
                 """INSERT INTO price_snapshots(offer_id, run_id, fetched_at, price_cents,
                                                currency, is_hot, availability, stop_sale,
                                                operator_avg_price_cents)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (offer_id, run_id, now, o["price_cents"], o["currency"],
-                 int(is_hot), o["availability"], o["stop_sale"],
-                 o["operator_avg_price_cents"]),
+                   VALUES (:offer_id, :run_id, :now, :price, :currency, :is_hot,
+                           :availability, :stop_sale, :op_avg)""",
+                {"offer_id": offer_id, "run_id": run_id, "now": now,
+                 "price": o["price_cents"], "currency": o["currency"],
+                 "is_hot": int(is_hot), "availability": o["availability"],
+                 "stop_sale": o["stop_sale"], "op_avg": o["operator_avg_price_cents"]},
             )
             stored += 1
     return stored

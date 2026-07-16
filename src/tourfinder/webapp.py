@@ -103,9 +103,9 @@ def offer_history(offer_id: int):
 
 def _sub_dict(conn, row) -> dict:
     unseen = conn.execute(
-        "SELECT count(*) FROM alerts WHERE subscription_id=? AND seen=0",
-        (row["id"],),
-    ).fetchone()[0]
+        "SELECT count(*) FROM alerts WHERE subscription_id=:id AND seen=0",
+        {"id": row["id"]},
+    ).scalar()
     return {"id": row["id"], "name": row["name"],
             "filters": json.loads(row["filters"]), "enabled": bool(row["enabled"]),
             "created_at": row["created_at"], "unseen": unseen}
@@ -131,15 +131,15 @@ def create_subscription(payload: dict = Body(...)):
                             status_code=400)
     conn = get_conn()
     try:
-        cur = conn.execute(
+        sub_id = conn.execute(
             "INSERT INTO subscriptions(name, filters, enabled, created_at) "
-            "VALUES (?, ?, 1, ?)",
-            (name, json.dumps(filters), _utcnow()),
-        )
-        sub_id = cur.lastrowid
+            "VALUES (:name, :filters, 1, :now) RETURNING id",
+            {"name": name, "filters": json.dumps(filters), "now": _utcnow()},
+        ).fetchone()["id"]
         conn.commit()
         # Evaluate immediately so the new subscription surfaces current matches.
-        sub = conn.execute("SELECT * FROM subscriptions WHERE id=?", (sub_id,)).fetchone()
+        sub = conn.execute("SELECT * FROM subscriptions WHERE id=:id",
+                           {"id": sub_id}).fetchone()
         new_alerts = subscriptions.evaluate(conn, sub)
         return JSONResponse({"id": sub_id, "new_alerts": new_alerts})
     finally:
@@ -151,11 +151,12 @@ def update_subscription(sub_id: int, payload: dict = Body(...)):
     conn = get_conn()
     try:
         if "enabled" in payload:
-            conn.execute("UPDATE subscriptions SET enabled=? WHERE id=?",
-                         (1 if payload["enabled"] else 0, sub_id))
+            conn.execute("UPDATE subscriptions SET enabled=:e WHERE id=:id",
+                         {"e": 1 if payload["enabled"] else 0, "id": sub_id})
         if "name" in payload:
-            conn.execute("UPDATE subscriptions SET name=? WHERE id=?",
-                         (str(payload["name"]).strip() or "Без названия", sub_id))
+            conn.execute("UPDATE subscriptions SET name=:n WHERE id=:id",
+                         {"n": str(payload["name"]).strip() or "Без названия",
+                          "id": sub_id})
         conn.commit()
         return JSONResponse({"ok": True})
     finally:
@@ -166,7 +167,8 @@ def update_subscription(sub_id: int, payload: dict = Body(...)):
 def delete_subscription(sub_id: int):
     conn = get_conn()
     try:
-        conn.execute("DELETE FROM subscriptions WHERE id=?", (sub_id,))
+        conn.execute("DELETE FROM alerts WHERE subscription_id=:id", {"id": sub_id})
+        conn.execute("DELETE FROM subscriptions WHERE id=:id", {"id": sub_id})
         conn.commit()
         return JSONResponse({"ok": True})
     finally:
@@ -209,8 +211,9 @@ def mark_alerts_seen(payload: dict = Body(default={})):
     conn = get_conn()
     try:
         if ids:
-            marks = ",".join("?" * len(ids))
-            conn.execute(f"UPDATE alerts SET seen=1 WHERE id IN ({marks})", ids)
+            marks = ",".join(f":i{n}" for n in range(len(ids)))
+            conn.execute(f"UPDATE alerts SET seen=1 WHERE id IN ({marks})",
+                         {f"i{n}": v for n, v in enumerate(ids)})
         else:
             conn.execute("UPDATE alerts SET seen=1 WHERE seen=0")
         conn.commit()

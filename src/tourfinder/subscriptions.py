@@ -10,7 +10,6 @@ Anything not cheaper than the last alert is silent, so a tab polling every
 minute does not re-alert the same offer at the same price.
 """
 import json
-import sqlite3
 from datetime import datetime, timezone
 
 from .queries import search_offers
@@ -23,7 +22,7 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def evaluate(conn: sqlite3.Connection, sub: sqlite3.Row) -> int:
+def evaluate(conn, sub) -> int:
     """Evaluate one subscription, insert new alert rows, return their count."""
     filters = {k: v for k, v in json.loads(sub["filters"]).items() if k in _ALLOWED}
     if not filters.get("date_from") or not filters.get("date_till"):
@@ -37,9 +36,9 @@ def evaluate(conn: sqlite3.Connection, sub: sqlite3.Row) -> int:
         price = m["price_cents"]
         last = conn.execute(
             """SELECT price_cents FROM alerts
-               WHERE subscription_id=? AND offer_id=?
+               WHERE subscription_id=:s AND offer_id=:o
                ORDER BY created_at DESC, id DESC LIMIT 1""",
-            (sub["id"], offer_id),
+            {"s": sub["id"], "o": offer_id},
         ).fetchone()
 
         if last is None:
@@ -52,15 +51,16 @@ def evaluate(conn: sqlite3.Connection, sub: sqlite3.Row) -> int:
         conn.execute(
             """INSERT INTO alerts(subscription_id, offer_id, reason, price_cents,
                                   created_at, seen)
-               VALUES (?, ?, ?, ?, ?, 0)""",
-            (sub["id"], offer_id, reason, price, now),
+               VALUES (:s, :o, :reason, :price, :now, 0)""",
+            {"s": sub["id"], "o": offer_id, "reason": reason,
+             "price": price, "now": now},
         )
         created += 1
     conn.commit()
     return created
 
 
-def evaluate_all(conn: sqlite3.Connection) -> int:
+def evaluate_all(conn) -> int:
     """Evaluate every enabled subscription. Returns total new alerts."""
     subs = conn.execute("SELECT * FROM subscriptions WHERE enabled=1").fetchall()
     return sum(evaluate(conn, s) for s in subs)
