@@ -1,5 +1,15 @@
 """Shared read queries over collected offers, used by the web UI and by
 subscription evaluation."""
+from datetime import datetime, timedelta, timezone
+
+# An offer not seen in search results for this long is treated as gone
+# (sold out or withdrawn): hidden from search and drops, flagged in history.
+FRESH_HOURS = 48
+
+
+def _fresh_cutoff(hours: int = FRESH_HOURS) -> str:
+    return (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
 
 
 def _norm_ages(children_ages: str | None) -> str:
@@ -42,10 +52,12 @@ def _build_filters(*, date_from: str, date_till: str, adults: int,
     where = ["o.date_start BETWEEN :date_from AND :date_till",
              "o.nights BETWEEN :nights_min AND :nights_max",
              "o.pax_adl = :adults",
-             "o.children_ages = :ages"]
+             "o.children_ages = :ages",
+             "o.last_seen_at >= :fresh_cutoff"]
     params = {"date_from": date_from, "date_till": date_till,
               "nights_min": nights_min, "nights_max": nights_max,
-              "adults": adults, "ages": ages, "limit": min(limit, 500)}
+              "adults": adults, "ages": ages, "limit": min(limit, 500),
+              "fresh_cutoff": _fresh_cutoff()}
     if budget_max:
         where.append("l.price_cents <= :budget_cents")
         params["budget_cents"] = budget_max * 100
@@ -207,8 +219,8 @@ def price_drops(conn, *, adults: int = 2, children_ages: str | None = None,
     today: exclude departures already gone.
     """
     params = {"adults": adults, "ages": _norm_ages(children_ages),
-              "limit": min(limit, 300)}
-    extra = ""
+              "limit": min(limit, 300), "fresh_cutoff": _fresh_cutoff()}
+    extra = " AND o.last_seen_at >= :fresh_cutoff"
     if since:
         extra += " AND cur.fetched_at >= :since"
         params["since"] = since

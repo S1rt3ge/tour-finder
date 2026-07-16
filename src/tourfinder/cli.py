@@ -127,6 +127,20 @@ def cmd_collect(args):
     if new_alerts:
         log.info("subscriptions: %s new alert(s)", new_alerts)
 
+    from .fetcher import prune_snapshots
+    pruned = prune_snapshots(conn)
+    if pruned:
+        log.info("pruned %s flat snapshot(s)", pruned)
+
+
+def cmd_prune(args):
+    from .fetcher import prune_snapshots
+
+    conn = db.connect(args.db)
+    before = conn.execute("SELECT count(*) FROM price_snapshots").scalar()
+    deleted = prune_snapshots(conn)
+    print(f"snapshots: {before} -> {before - deleted} (pruned {deleted})")
+
 
 def cmd_reviews(args):
     from . import reviews as reviews_mod
@@ -191,6 +205,9 @@ def main():
                    help=f"party composition, repeatable (default: {DEFAULT_PAX})")
     c.add_argument("--delay", type=float, default=1.2)
     c.set_defaults(func=cmd_collect)
+
+    pr = sub.add_parser("prune", help="collapse flat runs of price snapshots")
+    pr.set_defaults(func=cmd_prune)
 
     rv = sub.add_parser("reviews", help="enrich hotels with guest reviews")
     rv.add_argument("--provider", default="google", help="review platform (default: google)")

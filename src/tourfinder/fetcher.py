@@ -107,6 +107,41 @@ def run_fetch(conn, client: joinup.JoinUpClient,
             "requests_made": client.requests_made, "errors": errors}
 
 
+def prune_snapshots(conn) -> int:
+    """Collapse constant runs of snapshots to their first and last point.
+
+    A snapshot is dropped when its neighbours (same offer, time order) carry
+    identical price / hot flag / availability / operator average — the trend
+    line through the survivors is unchanged, so history loses nothing while
+    the table stops growing linearly with polling frequency (Supabase free
+    tier is 500 MB).
+    """
+    result = conn.execute("""
+        DELETE FROM price_snapshots WHERE id IN (
+            SELECT id FROM (
+                SELECT id, price_cents, is_hot,
+                       COALESCE(availability, '') AS a,
+                       COALESCE(operator_avg_price_cents, -1) AS oa,
+                       LAG(price_cents)  OVER w AS pp,
+                       LEAD(price_cents) OVER w AS np,
+                       LAG(is_hot)       OVER w AS ph,
+                       LEAD(is_hot)      OVER w AS nh,
+                       COALESCE(LAG(availability)  OVER w, '') AS pa,
+                       COALESCE(LEAD(availability) OVER w, '') AS na,
+                       COALESCE(LAG(operator_avg_price_cents)  OVER w, -1) AS poa,
+                       COALESCE(LEAD(operator_avg_price_cents) OVER w, -1) AS noa
+                FROM price_snapshots
+                WINDOW w AS (PARTITION BY offer_id ORDER BY fetched_at, id)
+            ) t
+            WHERE pp = price_cents AND np = price_cents
+              AND ph = is_hot AND nh = is_hot
+              AND pa = a AND na = a
+              AND poa = oa AND noa = oa
+        )""")
+    conn.commit()
+    return result.rowcount
+
+
 def _store_tour(conn, tour: dict, run_id: int,
                 adults: int, children_ages: list[int] | None,
                 lang: str, is_hot: bool) -> int:

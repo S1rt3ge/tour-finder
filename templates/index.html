@@ -370,10 +370,13 @@ async function toggleHistory(card, offerId) {
   if (panel.innerHTML) { panel.innerHTML = ''; return; }
   panel.innerHTML = '<span class="meta">грузим…</span>';
   const r = await fetch(`/api/offers/${offerId}/history`);
-  const { history } = await r.json();
-  panel.innerHTML = history.length < 2
+  const { history, gone, last_seen_at } = await r.json();
+  const goneNote = gone
+    ? `<div class="meta" style="color:#b91c1c">⚠ исчез из продажи — не видели с ${new Date(last_seen_at).toLocaleDateString('ru-RU')} (распродан или снят)</div>`
+    : '';
+  panel.innerHTML = (history.length < 2
     ? '<span class="meta">Пока одно наблюдение — график появится после следующих сборов.</span>'
-    : priceChart(history);
+    : priceChart(history)) + goneNote;
 }
 
 function priceChart(hist) {

@@ -119,12 +119,23 @@ def offer_history(offer_id: int):
     try:
         rows = conn.execute(
             """SELECT fetched_at, price_cents, currency, is_hot, availability
-               FROM price_snapshots WHERE offer_id=? ORDER BY fetched_at""",
-            (offer_id,),
+               FROM price_snapshots WHERE offer_id = :oid ORDER BY fetched_at""",
+            {"oid": offer_id},
         ).fetchall()
+        offer = conn.execute(
+            "SELECT last_seen_at, date_start FROM offers WHERE id = :oid",
+            {"oid": offer_id},
+        ).fetchone()
     finally:
         conn.close()
-    return JSONResponse({"offer_id": offer_id,
+    # Sold out / withdrawn: departure still ahead but the collector no longer
+    # sees the offer. Signal for the v4 "scarcity vs price" hypothesis too.
+    gone = bool(
+        offer
+        and offer["date_start"] >= datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        and offer["last_seen_at"] < queries._fresh_cutoff())
+    return JSONResponse({"offer_id": offer_id, "gone": gone,
+                         "last_seen_at": offer["last_seen_at"] if offer else None,
                          "history": [dict(r) for r in rows]})
 
 
