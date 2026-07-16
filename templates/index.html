@@ -59,6 +59,19 @@
   button.ghost:hover { background: #fff2ec; filter: none; }
   #subs-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
               padding: 0 32px 8px; }
+  #tabs { display: flex; gap: 8px; padding: 4px 32px 10px; }
+  .tab { background: none; border: 1px solid #ddd6cc; color: var(--text);
+         border-radius: 999px; padding: 7px 18px; font-size: 14px; }
+  .tab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .variants { border-top: 1px dashed #e8e2d8; margin-top: 6px; }
+  .vrow { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+          padding: 7px 0; border-bottom: 1px dashed #efe9df; font-size: 13px; }
+  .vrow .vprice { font-weight: 700; margin-left: auto; }
+  .vrow a { color: var(--accent); text-decoration: none; }
+  .vhist { flex-basis: 100%; }
+  .badge-drop { background: #dcfce7; color: #15803d; font-size: 12px;
+                padding: 2px 8px; border-radius: 999px; font-weight: 600; }
+  .was { color: var(--muted); text-decoration: line-through; font-size: 14px; }
   #subs { padding: 0 32px 8px; }
   .sub { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
          background: var(--card); border-radius: 8px; padding: 8px 12px;
@@ -104,10 +117,29 @@
     <legend>Страна (не обязательно)</legend>
     {% for c in countries %}<label class="chip"><input type="checkbox" name="country" value="{{ c.country_id }}"> {{ c.country_name }}</label>{% endfor %}
   </fieldset>
+  <label>Звёзды
+    <select name="stars_min">
+      <option value="">любые</option>
+      <option value="3">3★ и выше</option>
+      <option value="4">4★ и выше</option>
+      <option value="5">только 5★</option>
+    </select>
+  </label>
+  <label>Сортировка
+    <select name="sort">
+      <option value="price">цена за тур</option>
+      <option value="price_per_night">цена за ночь</option>
+    </select>
+  </label>
   <label class="hotcheck"><input type="checkbox" name="only_hot"> только горящие</label>
   <button type="submit">Искать</button>
   <button type="button" id="save-sub" class="ghost">Сохранить как подписку</button>
 </form>
+
+<div id="tabs">
+  <button type="button" class="tab active" data-tab="search">Поиск</button>
+  <button type="button" class="tab" data-tab="drops">Падения цен ↓</button>
+</div>
 
 <div id="subs-bar">
   <button type="button" id="sound-toggle" class="ghost">🔔 включить звук</button>
@@ -168,6 +200,8 @@ function currentFilters() {
   const b = checked('board').join(','); if (b) flt.boards = b;
   const c = checked('country').join(','); if (c) flt.countries = c;
   if (f.only_hot.checked) flt.only_hot = true;
+  if (f.stars_min.value) flt.stars_min = +f.stars_min.value;
+  if (f.sort.value !== 'price') flt.sort = f.sort.value;
   return flt;
 }
 
@@ -181,8 +215,16 @@ function compositionsHint(comps) {
        + `Другой состав нужно сперва собрать: python -m tourfinder.cli fetch --pax "2+1:7"`;
 }
 
+let activeTab = 'search';
+document.querySelectorAll('#tabs .tab').forEach(btn => btn.addEventListener('click', () => {
+  activeTab = btn.dataset.tab;
+  document.querySelectorAll('#tabs .tab').forEach(b => b.classList.toggle('active', b === btn));
+  if (activeTab === 'drops') runDrops(); else f.requestSubmit();
+}));
+
 f.addEventListener('submit', async e => {
   e.preventDefault();
+  if (activeTab === 'drops') { runDrops(); return; }
   const flt = currentFilters();
   const p = new URLSearchParams();
   for (const [k, v] of Object.entries(flt)) p.set(k, v);
@@ -192,43 +234,117 @@ f.addEventListener('submit', async e => {
   const r = await fetch('/api/search?' + p);
   const data = await r.json();
   status.textContent = data.count
-    ? `Найдено: ${data.count}`
+    ? `Отелей: ${data.count}`
     : compositionsHint(data.available_compositions);
-
-  for (const t of data.results) {
-    // "hot but pricier than its own average": our observed average when we
-    // have enough history, otherwise the operator's own average if present
-    const ourAvgReady = t.snapshots_count >= 3 && t.avg_seen_cents;
-    const overAvg = t.is_hot && (
-      (ourAvgReady && t.price_cents > t.avg_seen_cents * 1.02) ||
-      (!ourAvgReady && t.operator_avg_price_cents && t.price_cents > t.operator_avg_price_cents));
-    const stars = t.category ? '★'.repeat(parseInt(t.category)) : '';
-    const card = document.createElement('div');
-    card.className = 'card';
-    card.innerHTML = `
-      ${t.photo_url ? `<img src="${t.photo_url}" loading="lazy" alt="">` : '<img alt="">'}
-      <div class="body">
-        <h3>${t.hotel_name} <span class="meta">${stars}</span></h3>
-        <div class="meta">${t.country_name || ''}${t.city_name ? ', ' + t.city_name : ''}</div>
-        ${ratingRow(t)}
-        <div class="meta">${t.date_start} → ${t.date_end || ''} · ${t.nights} н. · ${t.board_name || t.board_code}${t.room_name ? ' · ' + t.room_name : ''}</div>
-        <div class="price-row">
-          <span class="price">${euro(t.price_cents)}</span>
-          ${t.is_hot ? '<span class="badge-hot">горящий</span>' : ''}
-          ${overAvg ? '<span class="badge-overavg">дороже среднего</span>' : ''}
-          ${t.availability ? `<span class="meta">мест: ${t.availability}</span>` : ''}
-        </div>
-        <button type="button" class="range history-toggle">${t.snapshots_count > 1
-          ? `история цены: ${t.snapshots_count} наблюдений, ${euro(t.min_seen_cents)}–${euro(t.max_seen_cents)} ▾`
-          : 'первое наблюдение'}</button>
-        <div class="history"></div>
-        <a class="book" href="${t.link}" target="_blank" rel="noopener">Открыть у оператора →</a>
-      </div>`;
-    card.querySelector('.history-toggle')
-        .addEventListener('click', () => toggleHistory(card, t.offer_id));
-    results.appendChild(card);
-  }
+  for (const t of data.results) results.appendChild(hotelCard(t, flt));
 });
+
+// --- grouped hotel cards ----------------------------------------------------
+
+function hotelCard(t, flt) {
+  const stars = t.category ? '★'.repeat(parseInt(t.category)) : '';
+  const perNight = t.nights > 1 ? ` · ${euro(t.price_per_night_cents)}/ночь` : '';
+  const range = t.variants_min_cents !== t.variants_max_cents
+    ? `${euro(t.variants_min_cents)}–${euro(t.variants_max_cents)}` : euro(t.variants_min_cents);
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.innerHTML = `
+    ${t.photo_url ? `<img src="${t.photo_url}" loading="lazy" alt="">` : '<img alt="">'}
+    <div class="body">
+      <h3>${t.hotel_name} <span class="meta">${stars}</span></h3>
+      <div class="meta">${t.country_name || ''}${t.city_name ? ', ' + t.city_name : ''}</div>
+      ${ratingRow(t)}
+      <div class="meta">лучшее: ${t.date_start} · ${t.nights} н. · ${t.board_name || t.board_code}${t.room_name ? ' · ' + t.room_name : ''}</div>
+      <div class="price-row">
+        <span class="price">${euro(t.price_cents)}</span>
+        <span class="meta">${perNight}</span>
+        ${t.is_hot ? '<span class="badge-hot">горящий</span>' : ''}
+        ${t.availability ? `<span class="meta">мест: ${t.availability}</span>` : ''}
+      </div>
+      <button type="button" class="range history-toggle">${
+        t.variants > 1
+          ? `${t.variants} вариантов · ${range} · ${t.variants_date_from}–${t.variants_date_till} ▾`
+          : 'история цены ▾'}</button>
+      <div class="variants"></div>
+      <a class="book" href="${t.link}" target="_blank" rel="noopener">Открыть у оператора →</a>
+    </div>`;
+  card.querySelector('.history-toggle')
+      .addEventListener('click', () => toggleVariants(card, t, flt));
+  return card;
+}
+
+async function toggleVariants(card, t, flt) {
+  const box = card.querySelector('.variants');
+  if (box.innerHTML) { box.innerHTML = ''; return; }
+  box.innerHTML = '<span class="meta">грузим…</span>';
+  const p = new URLSearchParams();
+  for (const [k, v] of Object.entries(flt)) p.set(k, v);
+  p.set('hotel_id', t.source_hotel_id);
+  p.set('group', 'false');
+  p.set('limit', '50');
+  const { results: offers } = await (await fetch('/api/search?' + p)).json();
+  box.innerHTML = '';
+  for (const o of offers) box.appendChild(variantRow(o));
+}
+
+function variantRow(o) {
+  const row = document.createElement('div');
+  row.className = 'vrow';
+  const overAvg = o.is_hot && o.snapshots_count >= 3 && o.avg_seen_cents
+    && o.price_cents > o.avg_seen_cents * 1.02;
+  row.innerHTML = `
+    <span>${o.date_start}</span><span>${o.nights} н.</span>
+    <span>${o.board_code}</span><span class="meta">${o.room_name || ''}</span>
+    ${o.is_hot ? '<span class="badge-hot">горящий</span>' : ''}
+    ${overAvg ? '<span class="badge-overavg">дороже среднего</span>' : ''}
+    <a href="#" data-h>история${o.snapshots_count > 1 ? ` (${o.snapshots_count})` : ''}</a>
+    <span class="vprice">${euro(o.price_cents)}</span>
+    <div class="history vhist"></div>`;
+  row.querySelector('[data-h]').addEventListener('click', e => {
+    e.preventDefault(); toggleHistory(row, o.offer_id);
+  });
+  return row;
+}
+
+// --- price drops tab --------------------------------------------------------
+
+async function runDrops() {
+  status.textContent = 'Ищем падения…';
+  results.innerHTML = '';
+  const p = new URLSearchParams({ adults: f.adults.value });
+  const ages = childAgesValue(); if (ages) p.set('children_ages', ages);
+  const { count, results: rows } = await (await fetch('/api/drops?' + p)).json();
+  status.textContent = count
+    ? `Подешевело за последние 3 суток: ${count}`
+    : 'Падений цен за последние 3 суток не поймано. История копится — загляни позже.';
+  for (const o of rows) results.appendChild(dropCard(o));
+}
+
+function dropCard(o) {
+  const stars = o.category ? '★'.repeat(parseInt(o.category)) : '';
+  const pct = Math.round((o.drop_cents / o.prev_price_cents) * 100);
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.innerHTML = `
+    ${o.photo_url ? `<img src="${o.photo_url}" loading="lazy" alt="">` : '<img alt="">'}
+    <div class="body">
+      <h3>${o.hotel_name} <span class="meta">${stars}</span></h3>
+      <div class="meta">${o.country_name || ''}${o.city_name ? ', ' + o.city_name : ''}</div>
+      <div class="meta">${o.date_start} → ${o.date_end || ''} · ${o.nights} н. · ${o.board_name || o.board_code}</div>
+      <div class="price-row">
+        <span class="price">${euro(o.price_cents)}</span>
+        <span class="was">${euro(o.prev_price_cents)}</span>
+        <span class="badge-drop">−${pct}%</span>
+        ${o.is_hot ? '<span class="badge-hot">горящий</span>' : ''}
+      </div>
+      <button type="button" class="range history-toggle">история цены (${o.snapshots_count}) ▾</button>
+      <div class="history"></div>
+      <a class="book" href="${o.link}" target="_blank" rel="noopener">Открыть у оператора →</a>
+    </div>`;
+  card.querySelector('.history-toggle')
+      .addEventListener('click', () => toggleHistory(card, o.offer_id));
+  return card;
+}
 
 // Guest rating + the gap vs official stars. star_gap < 0 → guests rate below
 // the star class (overrated); > 0 → underrated. Small gaps are noise.

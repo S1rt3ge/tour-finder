@@ -1,6 +1,6 @@
 """Local web UI: search over collected offers, no direction required."""
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import Body, FastAPI, Query, Request
@@ -56,15 +56,27 @@ def search(
     boards: str | None = None,
     countries: str | None = None,
     only_hot: bool = False,
+    stars_min: int | None = None,
+    hotel_id: str | None = None,
+    sort: str = "price",
+    group: bool = True,
     limit: int = 100,
 ):
+    """group=True (default) returns one card per hotel with variant stats;
+    group=False or hotel_id set returns raw offers (used for expanding a
+    hotel's variants)."""
+    filters = dict(
+        date_from=date_from, date_till=date_till, adults=adults,
+        children_ages=children_ages, nights_min=nights_min,
+        nights_max=nights_max, budget_max=budget_max, boards=boards,
+        countries=countries, only_hot=only_hot, stars_min=stars_min,
+        limit=limit)
     conn = get_conn()
     try:
-        rows = search_offers(
-            conn, date_from=date_from, date_till=date_till, adults=adults,
-            children_ages=children_ages, nights_min=nights_min,
-            nights_max=nights_max, budget_max=budget_max, boards=boards,
-            countries=countries, only_hot=only_hot, limit=limit)
+        if group and not hotel_id:
+            rows = queries.search_hotels_grouped(conn, sort=sort, **filters)
+        else:
+            rows = search_offers(conn, sort=sort, hotel_id=hotel_id, **filters)
         compositions = queries.available_compositions(conn) if not rows else None
     finally:
         conn.close()
@@ -73,6 +85,23 @@ def search(
             r.get("category"), r.get("review_rating"), r.get("review_scale"))
     return JSONResponse({"count": len(rows), "results": rows,
                          "available_compositions": compositions})
+
+
+@app.get("/api/drops")
+def drops(adults: int = 2, children_ages: str | None = None,
+          hours: int = 72, limit: int = 100):
+    """Offers that got cheaper between the two latest observations."""
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    conn = get_conn()
+    try:
+        rows = queries.price_drops(conn, adults=adults,
+                                   children_ages=children_ages,
+                                   since=since, today=today, limit=limit)
+    finally:
+        conn.close()
+    return JSONResponse({"count": len(rows), "results": rows})
 
 
 @app.get("/api/compositions")
