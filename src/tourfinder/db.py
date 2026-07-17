@@ -86,6 +86,7 @@ Table(
     Column("started_at", Text, nullable=False),
     Column("finished_at", Text),
     Column("tier", Text),
+    Column("pax_spec", Text),
     Column("params", Text),
     Column("requests_made", Integer, nullable=False, server_default="0"),
     Column("offers_seen", Integer, nullable=False, server_default="0"),
@@ -176,6 +177,7 @@ def get_engine(path: str | Path | None = None):
             engine = create_engine(url, poolclass=NullPool, pool_pre_ping=True,
                                    connect_args={"prepare_threshold": None})
         metadata.create_all(engine)
+        _ensure_new_columns(engine)
         if url.startswith("sqlite"):
             with engine.begin() as c:
                 c.exec_driver_sql("PRAGMA journal_mode=WAL")
@@ -190,6 +192,45 @@ def get_engine(path: str | Path | None = None):
                         "UPDATE fetch_runs SET tier = json_extract(params, '$.tier')")
         _engines[url] = engine
     return _engines[url]
+
+
+def _ensure_new_columns(engine):
+    """create_all doesn't ALTER existing tables — add columns introduced
+    after the first deployment (no-op when already present)."""
+    added = {"fetch_runs": ["pax_spec TEXT"]}
+    for table, cols in added.items():
+        for col in cols:
+            try:
+                with engine.begin() as c:
+                    c.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {col}")
+            except Exception:
+                continue  # column already exists
+            if table == "fetch_runs" and col.startswith("pax_spec"):
+                _backfill_pax_spec(engine)
+
+
+def _backfill_pax_spec(engine):
+    """Derive pax_spec for pre-existing runs from their params JSON, so the
+    per-(tier, pax) freshness check doesn't consider everything stale."""
+    import json as _json
+    with engine.begin() as c:
+        rows = c.execute(text(
+            "SELECT id, params FROM fetch_runs "
+            "WHERE pax_spec IS NULL AND params IS NOT NULL")).fetchall()
+        for row in rows:
+            try:
+                p = _json.loads(row[1])
+                adults = int(p.get("adults") or 0)
+                ages = sorted(int(a) for a in (p.get("children_ages") or []))
+            except (ValueError, TypeError):
+                continue
+            if not adults:
+                continue
+            spec = str(adults)
+            if ages:
+                spec += f"+{len(ages)}:{','.join(str(a) for a in ages)}"
+            c.execute(text("UPDATE fetch_runs SET pax_spec = :s WHERE id = :i"),
+                      {"s": spec, "i": row[0]})
 
 
 class DB:

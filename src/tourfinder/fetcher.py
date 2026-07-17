@@ -22,7 +22,8 @@ def run_fetch(conn, client: joinup.JoinUpClient,
               days_from: int = 1, days_till: int = 30,
               adults: int = 2, children_ages: list[int] | None = None,
               only_destinations: list[str] | None = None,
-              max_pages: int | None = None, tier: str | None = None) -> dict:
+              max_pages: int | None = None, tier: str | None = None,
+              pax_spec: str | None = None) -> dict:
     date_from = date.today() + timedelta(days=days_from)
     date_till = date.today() + timedelta(days=days_till)
     dates = f"{date_from.isoformat()}:{date_till.isoformat()}"
@@ -31,9 +32,10 @@ def run_fetch(conn, client: joinup.JoinUpClient,
                   children_ages=children_ages,
                   destinations=only_destinations, max_pages=max_pages, tier=tier)
     run_id = conn.execute(
-        "INSERT INTO fetch_runs(started_at, tier, params) "
-        "VALUES (:now, :tier, :params) RETURNING id",
-        {"now": utcnow(), "tier": tier, "params": json.dumps(params)},
+        "INSERT INTO fetch_runs(started_at, tier, pax_spec, params) "
+        "VALUES (:now, :tier, :pax, :params) RETURNING id",
+        {"now": utcnow(), "tier": tier, "pax": pax_spec,
+         "params": json.dumps(params)},
     ).fetchone()["id"]
     conn.commit()
 

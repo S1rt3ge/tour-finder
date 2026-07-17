@@ -116,25 +116,33 @@ def cmd_collect(args):
 
     pax_specs = args.pax or active_pax_specs(conn)
     for name, days_from, days_till, period_h in TIERS:
-        last = conn.execute(
-            """SELECT started_at FROM fetch_runs
-               WHERE tier = :tier AND finished_at IS NOT NULL
-               ORDER BY id DESC LIMIT 1""",
-            {"tier": name},
-        ).fetchone()
-        if last:
-            last_at = datetime.fromisoformat(last["started_at"].replace("Z", "+00:00"))
-            # 10 min grace so an hourly task doesn't miss its own boundary
-            if now - last_at < timedelta(hours=period_h, minutes=-10):
-                log.info("tier %s: fresh (last run %s), skip", name, last["started_at"])
-                continue
-        log.info("tier %s: due, fetching days %s..%s for pax %s",
-                 name, days_from, days_till, pax_specs)
         for spec in pax_specs:
+            # Freshness is per (tier, pax): a newly requested composition
+            # gets every tier on its first run instead of waiting out the
+            # shared tier timer. Abandoned (reaped) runs don't count.
+            last = conn.execute(
+                """SELECT started_at FROM fetch_runs
+                   WHERE tier = :tier AND pax_spec = :pax
+                     AND finished_at IS NOT NULL
+                     AND (errors IS NULL OR errors NOT LIKE '%abandoned%')
+                   ORDER BY id DESC LIMIT 1""",
+                {"tier": name, "pax": spec},
+            ).fetchone()
+            if last:
+                last_at = datetime.fromisoformat(
+                    last["started_at"].replace("Z", "+00:00"))
+                # 10 min grace so an hourly task doesn't miss its own boundary
+                if now - last_at < timedelta(hours=period_h, minutes=-10):
+                    log.info("tier %s pax %s: fresh (last run %s), skip",
+                             name, spec, last["started_at"])
+                    continue
+            log.info("tier %s pax %s: due, fetching days %s..%s",
+                     name, spec, days_from, days_till)
             adults, child_ages = parse_pax(spec)
             result = run_fetch(conn, JoinUpClient(delay=args.delay),
                                days_from=days_from, days_till=days_till,
-                               adults=adults, children_ages=child_ages, tier=name)
+                               adults=adults, children_ages=child_ages,
+                               tier=name, pax_spec=spec)
             log.info("tier %s pax %s: run #%s, offers %s, requests %s, errors: %s",
                      name, spec, result["run_id"], result["offers_seen"],
                      result["requests_made"], result["errors"] or "none")
