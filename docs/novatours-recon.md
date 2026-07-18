@@ -62,8 +62,44 @@ cURL из своего браузера (WAF там пройден живой с
 
 ## Проверенные факты (для следующей сессии)
 
-- Эндпоинт: `https://www.novatours.lv/lv/graphql` (Store-заголовок `lv`).
-- Прямой POST без сессии → 302. APQ persisted queries по `hash` + `identifiers`.
+- **Эндпоинт: `https://www.novatours.lv/graphql`** (без `/lv`! отсюда был 302).
+  Заголовок `Store: lv`. С сессионной кукой `PHPSESSID` POST отдаёт 200.
+- Прямой POST без сессии → 302. С `PHPSESSID` (гостевая сессия, `authorization`
+  пустой) → 200. Интроспекция включена.
 - Отели: `pim.novatours.eu/Hotels/{id}`, коды стран-префиксом (VN, GR, …).
-- Стек: Magento 2 + ScandiPWA + Apollo GraphQL. Виджеты рассылки (soundest/klaviyo),
-  чат beesender — шум, не наше.
+- Стек: Magento 2 + ScandiPWA + Apollo GraphQL.
+
+## Модель данных (раскопано интроспекцией через сессию юзера, 2026-07-18)
+
+- Схема: **533 типа, 88 top-level query**. Отдельного `tourSearch` НЕТ.
+- **Туры = Magento-продукты (отели).** Листинг — стандартный
+  `products(search, filter: ProductAttributeFilterInput, pageSize, currentPage, sort)`.
+  Направление = категория (`category_uid`/`category_id`). Фильтры продукта стоковые
+  (price, name, category…) — travel-специфики (даты/ночи/чартер) в них НЕТ.
+- **`ProductInterface` / `VirtualProduct` — сток Magento** (нет типизированных
+  charter-полей). Значит цена-от и длительность в листинге приходят кастомными
+  атрибутами продукта — точную выборку видно только из живого PLP-запроса.
+- **Бонус: у продуктов есть отзывы Magento** — `rating_summary`, `review_count`,
+  `reviews`. На карточках PLP видел «4/5». Возможно, отзывы Novatours дадутся
+  бесплатно (полезно для v3).
+- **Тип `Offer` = ровно наш снимок оффера** (появляется в `ReservationData.offer`,
+  т.е. на этапе выбора/резервации отеля):
+  `dep_city_id, arr_city_id, check_in, checkout, nights, board, room, hotel_code,
+  price, accom, offer_id, pricelist, full_offer`. Маппится 1:1 на нашу схему.
+- Ещё travel-типы: `Flights`, `HolidayDetails` (детали брони).
+
+## Что осталось выяснить (последняя миля)
+
+1. **Живой PLP-запрос `products`** — та выборка полей, что несёт charter-цену и
+   длительность по отелю. Юзер прислал по ошибке `cmsPage` (id 1117). Нужен POST
+   `/graphql`, в теле которого `query` содержит `products(` (а не `cmsPage`), и чей
+   ответ содержит список отелей (Sol Nessebar и т.п.).
+2. **Как тянется availability по отелю** (список конкретных вылетов/дат/цен при
+   клике на отель) — вероятно тем же `Offer`-механизмом; проверить на карточке отеля.
+
+## Оценка постройки (уточнённая)
+
+Реально, интерфейс источника тот же (`destinations`=категории, `search`=`products`,
+снимок=`Offer`). Работа: GraphQL-клиент с сессией + разбор кастомных charter-атрибутов
+продукта + маппинг + матчинг отелей между операторами. Средний кусок, но не
+блокер — модель понятна.
