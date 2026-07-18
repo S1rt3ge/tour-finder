@@ -46,6 +46,7 @@
                border-radius: 999px; font-weight: 600; }
   .badge-overavg { background: #fef3c7; color: #92400e; font-size: 12px; padding: 2px 8px;
                    border-radius: 999px; }
+  .op { color: var(--accent); font-weight: 600; }
   .rating-row { display: flex; align-items: center; gap: 8px; font-size: 13px; }
   .rating { font-weight: 600; }
   .badge-overrated { background: #fee2e2; color: #b91c1c; font-size: 12px; padding: 2px 8px;
@@ -216,6 +217,10 @@ function currentFilters() {
 
 const paxHuman = c => `${c.pax_adl} взр.` + (c.children_ages ? ` + дети ${c.children_ages}` : '');
 
+const OPERATORS = { joinup: 'Join Up', teztour: 'Tez Tour', novaturas: 'Novatours',
+                    coral: 'Coral', anextour: 'Anex', itaka: 'Itaka' };
+const operatorName = code => OPERATORS[code] || code;
+
 // Every response goes through here: a non-200 or network failure surfaces a
 // message instead of leaving the page stuck on "Ищем…".
 async function fetchJson(url) {
@@ -302,7 +307,7 @@ function hotelCard(t, flt) {
     ${t.photo_url ? `<img src="${t.photo_url}" loading="lazy" alt="">` : '<img alt="">'}
     <div class="body">
       <h3>${t.hotel_name} <span class="meta">${stars}</span></h3>
-      <div class="meta">${t.country_name || ''}${t.city_name ? ', ' + t.city_name : ''}</div>
+      <div class="meta">${t.country_name || ''}${t.city_name ? ', ' + t.city_name : ''}${t.operator ? ` · <span class="op">${operatorName(t.operator)}</span>` : ''}</div>
       ${ratingRow(t)}
       <div class="meta">лучшее: ${t.date_start} · ${t.nights} н. · ${t.board_name || t.board_code}${t.room_name ? ' · ' + t.room_name : ''}</div>
       <div class="price-row">

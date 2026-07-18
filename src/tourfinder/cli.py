@@ -79,10 +79,9 @@ def cmd_fetch(args):
 
 
 def cmd_collect(args):
-    from .fetcher import run_fetch
+    from .fetcher import run_fetch, run_waavo_fetch, utcnow
     from .sources.joinup import JoinUpClient
-
-    from .fetcher import utcnow
+    from .sources.waavo import WaavoClient
 
     log = logging.getLogger("tourfinder.collect")
     conn = db.connect(args.db)
@@ -139,13 +138,22 @@ def cmd_collect(args):
             log.info("tier %s pax %s: due, fetching days %s..%s",
                      name, spec, days_from, days_till)
             adults, child_ages = parse_pax(spec)
+            # Join Up directly (complete for that operator)...
             result = run_fetch(conn, JoinUpClient(delay=args.delay),
                                days_from=days_from, days_till=days_till,
                                adults=adults, children_ages=child_ages,
                                tier=name, pax_spec=spec)
-            log.info("tier %s pax %s: run #%s, offers %s, requests %s, errors: %s",
+            log.info("tier %s pax %s joinup: run #%s, offers %s, requests %s, errors: %s",
                      name, spec, result["run_id"], result["offers_seen"],
                      result["requests_made"], result["errors"] or "none")
+            # ...then Waavo for every OTHER operator (see docs/waavo-recon.md).
+            wresult = run_waavo_fetch(conn, WaavoClient(delay=args.delay),
+                                      days_from=days_from, days_till=days_till,
+                                      adults=adults, children_ages=child_ages,
+                                      tier=name, pax_spec=spec)
+            log.info("tier %s pax %s waavo: run #%s, offers %s, requests %s, errors: %s",
+                     name, spec, wresult["run_id"], wresult["offers_seen"],
+                     wresult["requests_made"], wresult["errors"] or "none")
 
     from . import subscriptions
     new_alerts = subscriptions.evaluate_all(conn)

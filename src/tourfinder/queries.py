@@ -124,7 +124,7 @@ def search_offers(conn, *, date_from: str, date_till: str,
         )
         SELECT o.id AS offer_id, o.source_hotel_id, o.date_start, o.date_end,
                o.nights, o.board_code, o.board_name, o.room_name, o.link,
-               o.origin_name, o.pax_adl,
+               o.origin_name, o.pax_adl, o.operator,
                h.name AS hotel_name, h.category, h.country_name, h.city_name,
                h.photo_url,
                l.price_cents, l.currency, l.is_hot, l.fetched_at,
@@ -174,7 +174,7 @@ def search_hotels_grouped(conn, *, sort: str = "price", **filters) -> list[dict]
         matched AS (
             SELECT o.id AS offer_id, o.source, o.source_hotel_id, o.date_start,
                    o.date_end, o.nights, o.board_code, o.board_name,
-                   o.room_name, o.link, o.origin_name, o.pax_adl,
+                   o.room_name, o.link, o.origin_name, o.pax_adl, o.operator,
                    h.name AS hotel_name, h.category, h.country_name,
                    h.city_name, h.photo_url,
                    l.price_cents, l.currency, l.is_hot, l.fetched_at,

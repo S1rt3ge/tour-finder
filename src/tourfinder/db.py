@@ -52,6 +52,7 @@ Table(
     Column("pax_adl", Integer, nullable=False),
     Column("pax_chd", Integer, nullable=False, server_default="0"),
     Column("children_ages", Text, nullable=False, server_default=""),
+    Column("operator", Text),  # real operator behind an aggregator source
     Column("link", Text),
     Column("first_seen_at", Text, nullable=False),
     Column("last_seen_at", Text, nullable=False),
@@ -197,7 +198,7 @@ def get_engine(path: str | Path | None = None):
 def _ensure_new_columns(engine):
     """create_all doesn't ALTER existing tables — add columns introduced
     after the first deployment (no-op when already present)."""
-    added = {"fetch_runs": ["pax_spec TEXT"]}
+    added = {"fetch_runs": ["pax_spec TEXT"], "offers": ["operator TEXT"]}
     for table, cols in added.items():
         for col in cols:
             try:
