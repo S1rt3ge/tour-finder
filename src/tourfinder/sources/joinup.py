@@ -16,6 +16,26 @@ log = logging.getLogger(__name__)
 SOURCE_NAME = "joinup"
 BASE_URL = "https://joinup.lv/api/main"
 PUBLIC_HOTEL_URL = "https://joinup.lv/{lang}/hotel/{hotel_id}"
+
+
+def hotel_deeplink(hotel_id, origin_id, date_start, nights, pax_adl,
+                   children_ages: str, board_code: str, lang: str = "lv") -> str:
+    """Hotel page pre-filled with this offer's search context, so the
+    operator site opens on the same dates/party/board the user saw here.
+    Verified param names (the SPA reads these and picks the matching offer):
+    origin, date, stay, pax_adl, pax_chd, children_ages, board."""
+    from urllib.parse import urlencode
+    q = {"origin": origin_id, "date": date_start, "stay": nights,
+         "pax_adl": pax_adl}
+    ages = [a for a in (children_ages or "").split(",") if a]
+    if ages:
+        q["pax_chd"] = len(ages)
+        q["children_ages"] = ",".join(ages)
+    if board_code:
+        q["board"] = board_code
+    # keep the comma in children_ages literal (matches the URL the SPA emits)
+    return (f"{PUBLIC_HOTEL_URL.format(lang=lang, hotel_id=hotel_id)}"
+            f"?{urlencode(q, safe=',')}")
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
@@ -177,7 +197,10 @@ def normalize(tour: dict, pax_adl: int, children_ages: list[int] | None = None,
             "pax_adl": pax_adl,
             "pax_chd": len(children_ages) if children_ages else 0,
             "children_ages": ages,
-            "link": PUBLIC_HOTEL_URL.format(lang=lang, hotel_id=h["id"]),
+            "link": hotel_deeplink(
+                h["id"], frm.get("id"), o["date_start"],
+                (o.get("stay") or {}).get("stay"), pax_adl, ages,
+                board.get("board_type") or board.get("code") or "", lang),
             # snapshot fields
             "price_cents": price_cents,
             "currency": (total.get("currency") or {}).get("code", "EUR"),
