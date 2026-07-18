@@ -19,11 +19,13 @@ PUBLIC_HOTEL_URL = "https://joinup.lv/{lang}/hotel/{hotel_id}"
 
 
 def hotel_deeplink(hotel_id, origin_id, date_start, nights, pax_adl,
-                   children_ages: str, board_code: str, lang: str = "lv") -> str:
+                   children_ages: str, meal_code: str, lang: str = "lv") -> str:
     """Hotel page pre-filled with this offer's search context, so the
     operator site opens on the same dates/party/board the user saw here.
     Verified param names (the SPA reads these and picks the matching offer):
-    origin, date, stay, pax_adl, pax_chd, children_ages, board."""
+    origin, date, stay, pax_adl, pax_chd, children_ages, board. The `board`
+    value is the numeric meal code (board.code, e.g. 1202=AI), NOT the
+    board_type letters — the selector ignores 'AI'/'BB'."""
     from urllib.parse import urlencode
     q = {"origin": origin_id, "date": date_start, "stay": nights,
          "pax_adl": pax_adl}
@@ -31,8 +33,8 @@ def hotel_deeplink(hotel_id, origin_id, date_start, nights, pax_adl,
     if ages:
         q["pax_chd"] = len(ages)
         q["children_ages"] = ",".join(ages)
-    if board_code:
-        q["board"] = board_code
+    if meal_code:
+        q["board"] = meal_code
     # keep the comma in children_ages literal (matches the URL the SPA emits)
     return (f"{PUBLIC_HOTEL_URL.format(lang=lang, hotel_id=hotel_id)}"
             f"?{urlencode(q, safe=',')}")
@@ -200,7 +202,9 @@ def normalize(tour: dict, pax_adl: int, children_ages: list[int] | None = None,
             "link": hotel_deeplink(
                 h["id"], frm.get("id"), o["date_start"],
                 (o.get("stay") or {}).get("stay"), pax_adl, ages,
-                board.get("board_type") or board.get("code") or "", lang),
+                # the hotel page's board selector keys on the numeric meal
+                # code (e.g. 1202 = AI), not the board_type letters
+                board.get("code") or "", lang),
             # snapshot fields
             "price_cents": price_cents,
             "currency": (total.get("currency") or {}).get("code", "EUR"),

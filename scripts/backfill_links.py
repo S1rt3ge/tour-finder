@@ -19,6 +19,8 @@ from sqlalchemy.exc import OperationalError, DBAPIError  # noqa: E402
 from tourfinder import db  # noqa: E402
 
 CHUNK = 1000
+# SKIP LOCKED keeps us moving past rows the concurrent collector holds
+# instead of livelocking on the same physical-order rows every retry.
 UPDATE = text("""
 UPDATE offers SET link =
   'https://joinup.lv/lv/hotel/' || source_hotel_id
@@ -29,7 +31,9 @@ UPDATE offers SET link =
        || '&children_ages=' || children_ages ELSE '' END
   || CASE WHEN board_code <> '' THEN '&board=' || board_code ELSE '' END
 WHERE id IN (
-  SELECT id FROM offers WHERE link NOT LIKE '%?origin=%' LIMIT :chunk
+  SELECT id FROM offers WHERE link NOT LIKE '%?origin=%'
+  ORDER BY id LIMIT :chunk
+  FOR UPDATE SKIP LOCKED
 )
 """)
 
