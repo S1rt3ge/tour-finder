@@ -76,8 +76,12 @@ def _build_filters(*, date_from: str, date_till: str, adults: int,
     if only_hot:
         where.append("l.is_hot = 1")
     if stars_min:
-        # NULLIF guards Postgres against casting '' — NULL comparison drops the row
-        where.append("CAST(NULLIF(h.category, '') AS INTEGER) >= :stars_min")
+        # category is free text: '4', '4+', 'Aparthotel', 'HV1'... A strict
+        # CAST blows up on '4+' in Postgres, so cast only a leading digit and
+        # let everything non-numeric fall to NULL (correctly dropped by >=).
+        where.append(
+            "CASE WHEN substr(h.category, 1, 1) BETWEEN '0' AND '9' "
+            "THEN CAST(substr(h.category, 1, 1) AS INTEGER) END >= :stars_min")
         params["stars_min"] = stars_min
     if hotel_id:
         where.append("o.source_hotel_id = :hotel_id")

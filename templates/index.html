@@ -216,6 +216,14 @@ function currentFilters() {
 
 const paxHuman = c => `${c.pax_adl} взр.` + (c.children_ages ? ` + дети ${c.children_ages}` : '');
 
+// Every response goes through here: a non-200 or network failure surfaces a
+// message instead of leaving the page stuck on "Ищем…".
+async function fetchJson(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+
 // No data for the requested party: the server already queued it for the
 // collector; meanwhile show prices for the closest collected party so the
 // user sees the market instead of an empty page.
@@ -241,8 +249,7 @@ async function renderCompositionFallback(data, flt) {
   p.set('adults', best.pax_adl);
   if (best.children_ages) p.set('children_ages', best.children_ages);
   else p.delete('children_ages');
-  const r = await fetch('/api/search?' + p);
-  const d = await r.json();
+  const d = await fetchJson('/api/search?' + p);
   status.textContent = d.count
     ? `Отелей (для «${paxHuman(best)}»): ${d.count}`
     : 'Под остальные фильтры пока ничего не попало — попробуй расширить даты или ночи.';
@@ -269,13 +276,16 @@ f.addEventListener('submit', async e => {
   status.textContent = 'Ищем…';
   results.innerHTML = '';
   document.querySelectorAll('.fallback-note').forEach(n => n.remove());
-  const r = await fetch('/api/search?' + p);
-  const data = await r.json();
-  if (data.count) {
-    status.textContent = `Отелей: ${data.count}`;
-    for (const t of data.results) results.appendChild(hotelCard(t, flt));
-  } else {
-    await renderCompositionFallback(data, flt);
+  try {
+    const data = await fetchJson('/api/search?' + p);
+    if (data.count) {
+      status.textContent = `Отелей: ${data.count}`;
+      for (const t of data.results) results.appendChild(hotelCard(t, flt));
+    } else {
+      await renderCompositionFallback(data, flt);
+    }
+  } catch (err) {
+    status.textContent = `Ошибка поиска (${err.message}). Попробуй ещё раз или измени фильтры.`;
   }
 });
 
@@ -354,11 +364,15 @@ async function runDrops() {
   document.querySelectorAll('.fallback-note').forEach(n => n.remove());
   const p = new URLSearchParams({ adults: f.adults.value });
   const ages = childAgesValue(); if (ages) p.set('children_ages', ages);
-  const { count, results: rows } = await (await fetch('/api/drops?' + p)).json();
-  status.textContent = count
-    ? `Подешевело за последние 3 суток: ${count}`
-    : 'Падений цен за последние 3 суток не поймано. История копится — загляни позже.';
-  for (const o of rows) results.appendChild(dropCard(o));
+  try {
+    const { count, results: rows } = await fetchJson('/api/drops?' + p);
+    status.textContent = count
+      ? `Подешевело за последние 3 суток: ${count}`
+      : 'Падений цен за последние 3 суток не поймано. История копится — загляни позже.';
+    for (const o of rows) results.appendChild(dropCard(o));
+  } catch (err) {
+    status.textContent = `Ошибка (${err.message}). Попробуй ещё раз.`;
+  }
 }
 
 function dropCard(o) {
