@@ -86,7 +86,9 @@ class WaavoClient:
                           limit=PAGE_SIZE, offset=offset)
             if children_ages:
                 params["children"] = len(children_ages)
-                params["childrenAge"] = ",".join(str(a) for a in children_ages)
+                # plural! `childrenAge` (singular) 400s: "Children(1) does
+                # not match children ages: " — verified live 2026-07-27.
+                params["childrenAges"] = ",".join(str(a) for a in children_ages)
             data = self._get(**params)
             offers = ((data or {}).get("data") or {}).get("offers") or []
             yield from offers
