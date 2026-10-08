@@ -7,7 +7,10 @@
   stats   — quick DB numbers
 """
 import argparse
+import json
 import logging
+import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -26,6 +29,7 @@ TIERS = [
 # the default small; add more with `collect --pax`. Price depends on the
 # exact party, so a search only matches a composition we actually collected.
 DEFAULT_PAX = ["2", "2+1:7", "3"]  # couple; couple + child aged 7; three adults
+SOURCES = ("joinup", "waavo")
 
 
 def active_pax_specs(conn) -> list[str]:
@@ -78,92 +82,175 @@ def cmd_fetch(args):
               f"requests {result['requests_made']}, errors: {result['errors'] or 'none'}")
 
 
+@dataclass(frozen=True)
+class CollectTask:
+    source: str
+    tier: str
+    pax: str
+    days_from: int
+    days_till: int
+    period_hours: int
+
+    @property
+    def key(self):
+        return (self.source, self.tier, self.pax)
+
+
+def _run_history(conn):
+    """Read the small run log once; legacy Join Up params lack source."""
+    history = {}
+    for row in conn.execute(
+            "SELECT id, tier, pax_spec, started_at, finished_at, errors, params "
+            "FROM fetch_runs ORDER BY id").fetchall():
+        try:
+            params = json.loads(row["params"] or "{}")
+            source = params.get("source", "joinup")
+            started = datetime.fromisoformat(row["started_at"].replace("Z", "+00:00"))
+            errors = json.loads(row["errors"]) if row["errors"] else []
+        except (ValueError, TypeError, AttributeError):
+            continue  # malformed metadata is never evidence of fresh coverage
+        key = (source, row["tier"], row["pax_spec"])
+        item = history.setdefault(key, {"attempted": None, "succeeded": None})
+        if item["attempted"] is None or started > item["attempted"]:
+            item["attempted"] = started
+        if row["finished_at"] and errors == [] and not params.get("max_pages"):
+            try:
+                finished = datetime.fromisoformat(row["finished_at"].replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                continue
+            if item["succeeded"] is None or finished > item["succeeded"]:
+                item["succeeded"] = finished
+    return history
+
+
+def _collect_tasks(pax_specs):
+    return [CollectTask(source, tier, spec, start, end, hours)
+            for tier, start, end, hours in TIERS
+            for spec in dict.fromkeys(pax_specs) for source in SOURCES]
+
+
+def plan_collection(conn, pax_specs, now=None):
+    """Rotate overdue work by last attempt so failures cannot starve other tiers.
+
+    Only full successful runs refresh that exact source/tier/composition. Once
+    all new tasks have had a turn, the oldest attempted overdue task goes first.
+    """
+    now = now or datetime.now(timezone.utc)
+    history = _run_history(conn)
+    epoch = datetime.min.replace(tzinfo=timezone.utc)
+    due = []
+    for task in _collect_tasks(pax_specs):
+        record = history.get(task.key, {})
+        finished = record.get("succeeded")
+        if finished and now - finished < timedelta(hours=task.period_hours, minutes=-10):
+            continue
+        due.append(task)
+    due.sort(key=lambda task: history.get(task.key, {}).get("attempted") or epoch)
+    return due
+
+
+def _prepare_collection(conn, now):
+    """Recover abandoned rows; a live/unknown owner produces a failed job.
+
+    GitHub's workflow concurrency prevents two collect jobs from running at
+    once. A record carrying an earlier run ID for this same workflow is known
+    to be abandoned even when its start is recent. Unknown/local owners retain
+    the existing conservative three-hour lease.
+    """
+    from .fetcher import collector_owner
+
+    owner = collector_owner()
+    cutoff = now - timedelta(hours=3)
+    recovered = 0
+    blocking = []
+    for row in conn.execute(
+            "SELECT id, started_at, params FROM fetch_runs WHERE finished_at IS NULL").fetchall():
+        try:
+            params = json.loads(row["params"] or "{}")
+            old_owner = params.get("collector_owner") or {}
+            old_time = datetime.fromisoformat(row["started_at"].replace("Z", "+00:00"))
+        except (ValueError, TypeError, AttributeError):
+            blocking.append(row["id"])
+            continue
+        previous_job = (all(owner.get(key) and old_owner.get(key) for key in
+                            ("GITHUB_RUN_ID", "GITHUB_WORKFLOW", "GITHUB_REPOSITORY"))
+                        and (owner.get("GITHUB_RUN_ID"), owner.get("GITHUB_RUN_ATTEMPT", "1")) !=
+                            (old_owner.get("GITHUB_RUN_ID"), old_owner.get("GITHUB_RUN_ATTEMPT", "1"))
+                        and owner.get("GITHUB_WORKFLOW") == old_owner.get("GITHUB_WORKFLOW")
+                        and owner.get("GITHUB_REPOSITORY") == old_owner.get("GITHUB_REPOSITORY"))
+        if previous_job or old_time <= cutoff:
+            conn.execute(
+                "UPDATE fetch_runs SET finished_at=:now, errors=:errors "
+                "WHERE id=:id AND finished_at IS NULL",
+                {"now": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "id": row["id"],
+                 "errors": '["abandoned: no completion record"]'})
+            recovered += 1
+        else:
+            blocking.append(row["id"])
+    conn.commit()
+    if blocking:
+        raise RuntimeError("collection blocked by unfinished run(s): " +
+                           ", ".join(map(str, blocking)))
+    return recovered
+
+
 def cmd_collect(args):
-    from .fetcher import run_fetch, run_waavo_fetch, utcnow
+    from .fetcher import run_fetch, run_waavo_fetch
     from .sources.joinup import JoinUpClient
     from .sources.waavo import WaavoClient
 
     log = logging.getLogger("tourfinder.collect")
     conn = db.connect(args.db)
-    now = datetime.now(timezone.utc)
-    # started_at is stored as UTC ISO text, so string comparison == time
-    # comparison; the cutoff is computed here, not in dialect-specific SQL.
-    stale_cutoff = (now - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    # Reap runs abandoned by a killed process: no finished_at and started
-    # over 3h ago. Their partial data stays (committed per destination);
-    # only the run record is closed out so it stops looking "in progress".
-    reaped = conn.execute(
-        """UPDATE fetch_runs
-           SET finished_at = :now, errors = '["abandoned: no completion record"]'
-           WHERE finished_at IS NULL AND started_at <= :cutoff""",
-        {"now": utcnow(), "cutoff": stale_cutoff},
-    ).rowcount
-    conn.commit()
-    if reaped:
-        log.warning("reaped %s abandoned run(s)", reaped)
-
-    running = conn.execute(
-        """SELECT id, started_at FROM fetch_runs
-           WHERE finished_at IS NULL AND started_at > :cutoff""",
-        {"cutoff": stale_cutoff},
-    ).fetchone()
-    if running:
-        log.info("run #%s still in progress (since %s), exit",
-                 running["id"], running["started_at"])
-        return
-
-    pax_specs = args.pax or active_pax_specs(conn)
-    for name, days_from, days_till, period_h in TIERS:
-        for spec in pax_specs:
-            # Freshness is per (tier, pax): a newly requested composition
-            # gets every tier on its first run instead of waiting out the
-            # shared tier timer. Abandoned (reaped) runs don't count.
-            last = conn.execute(
-                """SELECT started_at FROM fetch_runs
-                   WHERE tier = :tier AND pax_spec = :pax
-                     AND finished_at IS NOT NULL
-                     AND (errors IS NULL OR errors NOT LIKE '%abandoned%')
-                   ORDER BY id DESC LIMIT 1""",
-                {"tier": name, "pax": spec},
-            ).fetchone()
-            if last:
-                last_at = datetime.fromisoformat(
-                    last["started_at"].replace("Z", "+00:00"))
-                # 10 min grace so an hourly task doesn't miss its own boundary
-                if now - last_at < timedelta(hours=period_h, minutes=-10):
-                    log.info("tier %s pax %s: fresh (last run %s), skip",
-                             name, spec, last["started_at"])
-                    continue
-            log.info("tier %s pax %s: due, fetching days %s..%s",
-                     name, spec, days_from, days_till)
-            adults, child_ages = parse_pax(spec)
-            # Join Up directly (complete for that operator)...
-            result = run_fetch(conn, JoinUpClient(delay=args.delay),
-                               days_from=days_from, days_till=days_till,
-                               adults=adults, children_ages=child_ages,
-                               tier=name, pax_spec=spec)
-            log.info("tier %s pax %s joinup: run #%s, offers %s, requests %s, errors: %s",
-                     name, spec, result["run_id"], result["offers_seen"],
-                     result["requests_made"], result["errors"] or "none")
-            # ...then Waavo for every OTHER operator (see docs/waavo-recon.md).
-            wresult = run_waavo_fetch(conn, WaavoClient(delay=args.delay),
-                                      days_from=days_from, days_till=days_till,
-                                      adults=adults, children_ages=child_ages,
-                                      tier=name, pax_spec=spec)
-            log.info("tier %s pax %s waavo: run #%s, offers %s, requests %s, errors: %s",
-                     name, spec, wresult["run_id"], wresult["offers_seen"],
-                     wresult["requests_made"], wresult["errors"] or "none")
-
-    from . import subscriptions
-    new_alerts = subscriptions.evaluate_all(conn)
-    if new_alerts:
-        log.info("subscriptions: %s new alert(s)", new_alerts)
-
-    from .fetcher import prune_snapshots
-    pruned = prune_snapshots(conn)
-    if pruned:
-        log.info("pruned %s flat snapshot(s)", pruned)
+    max_tasks, max_minutes = args.max_tasks, args.max_minutes
+    if max_tasks < 1 or max_minutes <= 0:
+        conn.close()
+        raise ValueError("max-tasks and max-minutes must be positive")
+    deadline = time.monotonic() + max_minutes * 60
+    completed, attempted, failures = 0, 0, 0
+    try:
+        recovered = _prepare_collection(conn, datetime.now(timezone.utc))
+        if recovered:
+            log.warning("marked %s abandoned run(s) incomplete", recovered)
+        pax_specs = args.pax or active_pax_specs(conn)
+        tasks = plan_collection(conn, pax_specs)
+        log.info("%s source/tier/party tasks due; invocation budget: %s tasks, %s min",
+                 len(tasks), max_tasks, max_minutes)
+        from . import subscriptions
+        for task in tasks[:max_tasks]:
+            if time.monotonic() >= deadline:
+                break
+            attempted += 1
+            adults, ages = parse_pax(task.pax)
+            log.info("fetching %s/%s/%s days %s..%s", *task.key,
+                     task.days_from, task.days_till)
+            fetch, client_type = ((run_fetch, JoinUpClient) if task.source == "joinup"
+                                  else (run_waavo_fetch, WaavoClient))
+            result = fetch(conn, client_type(delay=args.delay),
+                           days_from=task.days_from, days_till=task.days_till,
+                           adults=adults, children_ages=ages,
+                           tier=task.tier, pax_spec=task.pax, deadline=deadline)
+            if result["errors"]:
+                failures += 1
+            else:
+                completed += 1
+            log.info("%s/%s/%s run #%s: %s offers, %s requests, completed=%s",
+                     *task.key, result["run_id"], result["offers_seen"],
+                     result["requests_made"], not result["errors"])
+            # A completed task must make notifications reachable even when the
+            # remaining backlog spans several scheduled invocations.
+            new_alerts = subscriptions.evaluate_all(conn, deadline=deadline)
+            if new_alerts:
+                log.info("subscriptions: %s new alert(s)", new_alerts)
+        if not attempted:
+            subscriptions.evaluate_all(conn, deadline=deadline)
+        pending = len(plan_collection(conn, pax_specs))
+        log.info("collection summary: completed=%s attempted=%s failed_or_partial=%s pending=%s",
+                 completed, attempted, failures, pending)
+        if failures:
+            raise RuntimeError(f"{failures} collection task(s) failed or incomplete; {pending} pending")
+        return {"completed": completed, "attempted": attempted, "pending": pending}
+    finally:
+        conn.close()
 
 
 def cmd_prune(args):
@@ -176,18 +263,20 @@ def cmd_prune(args):
 
 
 def cmd_assert_fresh(args):
-    """Exit non-zero when the newest snapshot is older than --hours.
-    Dead-man's switch for the scheduled collector."""
-    import sys
-
+    """All requested source/tier/party tasks need a recent successful run."""
     conn = db.connect(args.db)
-    newest = conn.execute("SELECT max(fetched_at) FROM price_snapshots").scalar()
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=args.hours)).strftime(
-        "%Y-%m-%dT%H:%M:%SZ")
-    if not newest or newest < cutoff:
-        print(f"STALE: newest snapshot {newest!r} older than {args.hours}h cutoff {cutoff}")
-        sys.exit(1)
-    print(f"fresh: newest snapshot {newest} (cutoff {cutoff})")
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=args.hours)
+        history = _run_history(conn)
+        tasks = _collect_tasks(args.pax or active_pax_specs(conn))
+        stale = ["/".join(task.key) for task in tasks
+                 if not history.get(task.key, {}).get("succeeded") or
+                 history[task.key]["succeeded"] < cutoff]
+        if stale:
+            raise RuntimeError("STALE or never completed: " + ", ".join(stale))
+        print(f"fresh: all {len(tasks)} source/tier/party tasks completed within {args.hours}h")
+    finally:
+        conn.close()
 
 
 def cmd_reviews(args):
@@ -252,6 +341,10 @@ def main():
     c.add_argument("--pax", action="append",
                    help=f"party composition, repeatable (default: {DEFAULT_PAX})")
     c.add_argument("--delay", type=float, default=1.2)
+    c.add_argument("--max-tasks", type=int, default=6,
+                   help="maximum source/tier/party tasks per invocation")
+    c.add_argument("--max-minutes", type=float, default=50,
+                   help="cooperative collection time budget; partial runs remain due")
     c.set_defaults(func=cmd_collect)
 
     pr = sub.add_parser("prune", help="collapse flat runs of price snapshots")
@@ -259,6 +352,7 @@ def main():
 
     af = sub.add_parser("assert-fresh", help="fail when snapshots are stale (CI watchdog)")
     af.add_argument("--hours", type=int, default=26)
+    af.add_argument("--pax", action="append", help="party composition, repeatable")
     af.set_defaults(func=cmd_assert_fresh)
 
     rv = sub.add_parser("reviews", help="enrich hotels with guest reviews")
