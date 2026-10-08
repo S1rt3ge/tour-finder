@@ -20,7 +20,8 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.pool import NullPool
 
 from . import db, subscriptions
-from .telegram_bot import BotAPIError, BotClient, allowed_user_ids, bot_token, public_app_url
+from .telegram_bot import (BotAPIError, BotClient, allowed_user_ids, approved_user_ids,
+                           bot_token, has_access, public_app_url)
 
 MAX_PER_USER_24H = 3
 MAX_ALERT_AGE = timedelta(hours=24)
@@ -80,7 +81,8 @@ def _ineligible(conn, row, owners, now):
         return "alert_expired"
     if not row["enabled"]:
         return "subscription_disabled"
-    if not row["owner_id"] or str(row["owner_id"]) not in owners:
+    if (not row["owner_id"] or str(row["owner_id"]) not in owners
+            or not has_access(conn, row["owner_id"])):
         return "owner_not_allowed"
     if not row["can_notify"]:
         return "notifications_disabled"
@@ -268,7 +270,7 @@ def _finish(conn, row, status, now, *, reason=None, message_id=None, retry_at=No
 
 
 def run_worker(conn, *, client=None, dry_run=False, now=None, limit=100):
-    owners = allowed_user_ids()
+    owners = approved_user_ids(conn)
     if not 1 <= limit <= 500:
         raise ValueError("limit must be between 1 and 500")
     clock = (lambda: now) if now is not None else (lambda: datetime.now(timezone.utc))

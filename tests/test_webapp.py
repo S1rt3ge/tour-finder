@@ -23,6 +23,8 @@ def auth(user=123):
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
+    monkeypatch.delenv("TOURFINDER_DEMO", raising=False)
+    monkeypatch.delenv("VERCEL", raising=False)
     monkeypatch.setenv("DATABASE_URL", "sqlite:///" + (tmp_path / "api.sqlite").as_posix())
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", TOKEN)
     monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "123,456")
@@ -70,6 +72,7 @@ def seed_offer(*, board="AI", board_name="All inclusive", price=80_000,
 
 def test_preview_and_readonly_search_without_bot(client, monkeypatch):
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN")
+    monkeypatch.setenv("TOURFINDER_DEMO", "1")
     assert client.get("/app").status_code == 200
     assert client.get("/api/search", params=payload()["filters"]).status_code == 200
     assert client.get("/api/subscriptions").status_code == 503
@@ -101,8 +104,8 @@ def test_invalid_filters_and_policies(client):
     assert client.post("/api/subscriptions", json=item, headers=auth()).status_code == 422
     item["filters"]["budget_max"] = 1500
     assert client.post("/api/subscriptions", json=item, headers=auth()).status_code == 200
-    assert client.get("/api/search", params={**payload()["filters"], "adults": 0}).status_code == 400
-    assert client.get("/api/drops?children_ages=no").status_code == 400
+    assert client.get("/api/search", params={**payload()["filters"], "adults": 0}, headers=auth()).status_code == 400
+    assert client.get("/api/drops?children_ages=no", headers=auth()).status_code == 400
 
 
 def test_seen_only_explicit_ids_and_owner(client):
@@ -146,7 +149,7 @@ def test_legacy_ownerless_subscriptions_stay_private(client):
 @pytest.mark.parametrize("category", ["UNKNOWN", "AI,NOT_A_MEAL", "AI'); DROP TABLE offers;--"])
 def test_unknown_board_category_rejected_by_public_and_subscription_api(client, category):
     filters = {**payload()["filters"], "board_categories": category}
-    assert client.get("/api/search", params=filters).status_code == 400
+    assert client.get("/api/search", params=filters, headers=auth()).status_code == 400
     assert client.post("/api/subscriptions", json={**payload(), "filters": filters}, headers=auth()).status_code == 422
 
 
@@ -161,13 +164,13 @@ def test_board_categories_normalize_saved_filters_and_support_legacy_boards(clie
     assert len(saved["board_categories"].split(",")) == 2
     assert saved["boards"] == "SOFTAI"
     for group in (True, False):
-        response = client.get("/api/search", params={**filters, "group": group, "limit": 1})
+        response = client.get("/api/search", params={**filters, "group": group, "limit": 1}, headers=auth())
         assert response.status_code == 200, response.text
         rows = response.json()["results"]
         assert [row["offer_id"] for row in rows] == [selected]
         assert rows[0]["board_category"] == "AI"
         assert rows[0]["board_label"]
-    conflicting = client.get("/api/search", params={**filters, "boards": "BB"})
+    conflicting = client.get("/api/search", params={**filters, "boards": "BB"}, headers=auth())
     assert conflicting.status_code == 200 and conflicting.json()["count"] == 0
 
 
@@ -182,6 +185,7 @@ def test_absent_or_empty_board_categories_keep_unrestricted_saved_search(client,
 
 def test_public_offer_detail_and_lazy_history_agree_on_latest_snapshot(client, monkeypatch):
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN")
+    monkeypatch.setenv("TOURFINDER_DEMO", "1")
     offer = seed_offer(board="OT", board_name="SELF CATERING", price=100_000)
     conn = db.connect()
     try:
@@ -210,11 +214,83 @@ def test_public_offer_detail_and_lazy_history_agree_on_latest_snapshot(client, m
 def test_public_offer_detail_retains_stale_card_and_returns_404_without_history(client):
     stale_offer = seed_offer(last_seen_at="2000-01-01T00:00:00Z", price=70_000)
     unseen_offer = seed_offer(history=False)
-    response = client.get(f"/api/offers/{stale_offer}")
+    response = client.get(f"/api/offers/{stale_offer}", headers=auth())
     assert response.status_code == 200
     assert response.json()["offer"]["stale"] is True
     assert response.json()["offer"]["price_cents"] == 70_000
-    search = client.get("/api/search", params=payload()["filters"])
+    search = client.get("/api/search", params=payload()["filters"], headers=auth())
     assert search.status_code == 200 and search.json()["count"] == 0
-    assert client.get(f"/api/offers/{unseen_offer}").status_code == 404
-    assert client.get("/api/offers/999999999").status_code == 404
+    assert client.get(f"/api/offers/{unseen_offer}", headers=auth()).status_code == 404
+    assert client.get("/api/offers/999999999", headers=auth()).status_code == 404
+
+
+def access_record(user=789, status="approved"):
+    conn = db.connect()
+    try:
+        conn.execute("""INSERT INTO telegram_access_requests(user_id,status,first_name,requested_at)
+            VALUES (:id,:status,'Fixture approved user','2026-10-09T00:00:00Z')
+            ON CONFLICT(user_id) DO UPDATE SET status=excluded.status""", {"id": str(user), "status": status})
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("path", ["/api/search", "/api/drops", "/api/compositions", "/api/offers/1", "/api/offers/1/history"])
+def test_all_tour_data_requires_approved_session(client, path):
+    assert client.get(path, params=payload()["filters"]).status_code == 401
+    response = client.get(path, params=payload()["filters"], headers=auth(789))
+    assert response.status_code == 403
+    assert response.json()["detail"]["access_state"] == "not_requested"
+    assert "Fixture" not in response.text
+
+
+@pytest.mark.parametrize("state", ["pending", "denied"])
+def test_session_exposes_only_own_access_state_and_blocks_personal_mutations(client, state):
+    access_record(status=state)
+    response = client.get("/api/telegram/session", headers=auth(789))
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "access_required"
+    assert response.json()["detail"]["access_state"] == state
+    assert "Fixture approved user" not in response.text
+    assert client.post("/api/subscriptions", json=payload(), headers=auth(789)).status_code == 403
+    assert client.post("/api/pax-requests", json={"adults": 2}, headers=auth(789)).status_code == 403
+
+
+def test_approved_user_can_read_and_save_but_revoked_user_loses_access(client):
+    access_record()
+    session = client.get("/api/telegram/session", headers=auth(789))
+    assert session.status_code == 200 and session.json()["is_owner"] is False
+    assert client.get("/api/search", params=payload()["filters"], headers=auth(789)).status_code == 200
+    created = client.post("/api/subscriptions", json=payload(), headers=auth(789))
+    assert created.status_code == 200
+    assert client.get("/api/subscriptions", headers=auth()).json()["subscriptions"] == []
+    access_record(status="denied")
+    assert client.get("/api/subscriptions", headers=auth(789)).status_code == 403
+    assert client.get("/api/search", params=payload()["filters"], headers=auth(789)).status_code == 403
+    assert client.delete(f"/api/subscriptions/{created.json()['id']}", headers=auth(789)).status_code == 403
+
+
+def test_owner_session_survives_database_failure_other_users_fail_closed(client, monkeypatch):
+    from tourfinder import webapp
+    def unavailable():
+        raise RuntimeError("private connection details must not be exposed")
+    monkeypatch.setattr(webapp, "get_conn", unavailable)
+    owner = client.get("/api/telegram/session", headers=auth())
+    assert owner.status_code == 200
+    assert owner.json()["is_admin"] is True and owner.json()["can_notify"] is False
+    assert client.get("/app").status_code == 200
+    response = client.get("/api/telegram/session", headers=auth(789))
+    assert response.status_code == 503 and "private connection" not in response.text
+
+
+def test_demo_bypass_requires_explicit_local_no_token_and_never_allows_writes(client, monkeypatch):
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN")
+    assert client.get("/api/compositions").status_code == 503
+    monkeypatch.setenv("TOURFINDER_DEMO", "1")
+    assert client.get("/api/compositions").status_code == 200
+    assert client.post("/api/subscriptions", json=payload()).status_code == 503
+    monkeypatch.setenv("VERCEL", "1")
+    assert client.get("/api/compositions").status_code == 503
+    monkeypatch.delenv("VERCEL")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", TOKEN)
+    assert client.get("/api/compositions").status_code == 401

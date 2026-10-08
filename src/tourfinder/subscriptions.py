@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from .deals import assess
 from .queries import search_offers
-from .telegram_bot import allowed_user_ids
+from .telegram_bot import has_access
 
 _ALLOWED = {"date_from", "date_till", "adults", "children_ages", "nights_min",
             "nights_max", "budget_max", "boards", "board_categories", "countries", "only_hot", "stars_min"}
@@ -19,7 +19,7 @@ def evaluate(conn, sub) -> int:
         conn.commit()
         return 0
     sub = dict(conn.execute("SELECT * FROM subscriptions WHERE id=:id", {"id": sub["id"]}).fetchone())
-    if str(sub.get("owner_id")) not in allowed_user_ids():
+    if not sub.get("owner_id") or not has_access(conn, sub["owner_id"]):
         conn.commit()
         return 0
     filters = {k: v for k, v in json.loads(sub["filters"]).items() if k in _ALLOWED}

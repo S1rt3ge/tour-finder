@@ -6,8 +6,9 @@
   const tg = window.Telegram?.WebApp;
   const initData = typeof tg?.initData === 'string' ? tg.initData : '';
   const configured = document.body.dataset.telegramEnabled === 'true';
+  const demoMode = document.body.dataset.demoMode === 'true';
   const state = {
-    view: 'search', user: null, canNotify: false, session: configured ? 'preview' : 'unconfigured',
+    view: 'search', user: null, isOwner: false, canNotify: false, session: demoMode ? 'demo' : configured ? 'preview' : 'unconfigured', accessState: 'not_requested', accessVersion: 0, sessionSerial: 0,
     botUsername: document.body.dataset.botUsername || '', lastFilters: null, saveFilters: null,
     searchRequest: null, searchSerial: 0, dealsRequest: null, dealsSerial: 0,
     savedSerial: 0, historySerial: 0, detailSerial: 0, detailRequest: null, toastTimer: null, subscriptions: [],
@@ -16,6 +17,7 @@
   const BOARD_LABELS = {RO: 'Без питания', BB: 'Завтраки', HB: 'Двухразовое питание', FB: 'Трёхразовое питание', AI: 'Всё включено', UAI: 'Ультра всё включено', OTHER: 'Другое / не указано'};
   const INCLUDED_MEALS = ['BB', 'HB', 'FB', 'AI', 'UAI'];
   const dialogOpeners = new WeakMap();
+  const activeRequests = new Set();
   const SVG_NS = 'http://www.w3.org/2000/svg';
 
   function el(tag, className, text) {
@@ -133,10 +135,34 @@
     target.replaceChildren(box);
   }
 
+  function hasAccess() { return demoMode || Boolean(state.user); }
+  function restrictAccess(error) {
+    const wasOpen = hasAccess();
+    state.user = null; state.isOwner = false; state.canNotify = false;
+    state.session = error.status === 401 ? 'expired' : error.status === 403 ? 'forbidden' : error.status === 503 && !configured ? 'unconfigured' : 'unavailable';
+    state.accessState = ['pending', 'denied', 'not_requested'].includes(error.accessState) ? error.accessState : 'not_requested';
+    state.accessVersion++; state.sessionSerial++; state.searchSerial++; state.dealsSerial++; state.savedSerial++; state.historySerial++; state.detailSerial++;
+    for (const controller of activeRequests) controller.abort();
+    state.lastFilters = null; state.saveFilters = null; state.subscriptions = [];
+    clearTimeout(state.toastTimer); $('toast').hidden = true; $('toast').textContent = '';
+    for (const dialog of document.querySelectorAll('dialog[open]')) closeDialog(dialog);
+    for (const id of ['deals-results', 'subscriptions-list', 'alerts-list', 'history-content', 'offer-content', 'offer-booking']) $(id).replaceChildren();
+    $('save-form').reset(); $('save-filters-summary').textContent = ''; $('saved-caption').textContent = ''; $('deals-caption').textContent = ''; $('saved-nav-count').hidden = true; $('save-search').hidden = true;
+    $('search-results-title').textContent = 'Выберите свой следующий отпуск'; $('search-results-caption').textContent = 'Предложения появятся после поиска';
+    $('search-submit').disabled = false; $('search-submit').querySelector('span').textContent = 'Найти мой отпуск'; $('refresh-deals').disabled = false;
+    empty($('search-results'), 'Начнём с ваших параметров', 'Выберите даты, состав туристов и питание, затем запустите поиск.');
+    renderAccess();
+    if (wasOpen && !demoMode) $('gate-title').focus({preventScroll: true});
+  }
+
   async function api(path, {method = 'GET', body, signal, timeout = 45000} = {}) {
     // initData is sent only to this app's API. Never add it to source/image links.
     if (!path.startsWith('/api/')) throw new Error('Недопустимый адрес запроса');
+    const isSession = path.split('?')[0] === '/api/telegram/session';
+    if (!isSession && !hasAccess()) throw new Error('Дождитесь одобрения доступа владельцем.');
+    const accessVersion = state.accessVersion;
     const controller = new AbortController();
+    activeRequests.add(controller);
     const cancel = () => controller.abort();
     if (signal?.aborted) controller.abort();
     else signal?.addEventListener('abort', cancel, {once: true});
@@ -152,8 +178,12 @@
       if (!response.ok) {
         const descriptions = {401: 'Сессия истекла. Закройте приложение и откройте его снова через бота.', 403: 'Этот личный бот пока недоступен вашему Telegram-аккаунту.', 429: 'Слишком много запросов. Попробуйте через минуту.', 503: 'Сервис ещё не настроен или временно недоступен.'};
         const error = new Error(descriptions[response.status] || (response.status >= 500 ? 'Сервис не смог обработать запрос. Попробуйте чуть позже.' : 'Не удалось сохранить изменения. Проверьте параметры.'));
-        error.status = response.status; throw error;
+        error.status = response.status;
+        if (data?.detail?.code === 'access_required') error.accessState = data.detail.access_state;
+        if (!isSession && !demoMode && [401, 403].includes(response.status)) restrictAccess(error);
+        throw error;
       }
+      if (!isSession && accessVersion !== state.accessVersion) throw new DOMException('Доступ изменился', 'AbortError');
       return data;
     } catch (error) {
       if (timedOut) throw new Error('Ответ занимает слишком много времени. Попробуйте позже или сузьте даты поиска.');
@@ -161,7 +191,7 @@
       if (error instanceof TypeError) throw new Error('Нет соединения с сервисом. Проверьте интернет и повторите.');
       throw error;
     } finally {
-      clearTimeout(timer); signal?.removeEventListener('abort', cancel);
+      clearTimeout(timer); signal?.removeEventListener('abort', cancel); activeRequests.delete(controller);
     }
   }
 
@@ -244,11 +274,13 @@
   function updateBackButton() {
     try {
       if (!initData || !tg?.BackButton) return;
+      if (!hasAccess()) { tg.BackButton.hide(); return; }
       if (state.view !== 'search' || document.querySelector('dialog[open]')) tg.BackButton.show();
       else tg.BackButton.hide();
     } catch { /* Compatibility with older clients. */ }
   }
   function navigate(view) {
+    if (!hasAccess()) { renderAccess(); return; }
     if (!['search', 'deals', 'saved'].includes(view)) return;
     state.view = view;
     for (const section of document.querySelectorAll('.view')) section.hidden = section.id !== 'view-' + view;
@@ -265,53 +297,84 @@
   function closeDialog(dialog) { dialog.close(); updateBackButton(); }
 
   async function verifySession() {
-    if (!configured || !initData) { renderAccess(); return; }
+    if (demoMode || !configured || !initData || state.session === 'checking') { renderAccess(); return; }
+    const serial = ++state.sessionSerial;
     state.session = 'checking'; renderAccess();
     try {
       const data = await api('/api/telegram/session', {timeout: 15000});
+      if (serial !== state.sessionSerial) return;
       if (!data.user || !Number.isSafeInteger(Number(data.user.id))) throw new Error('Telegram-сессия не подтверждена. Откройте приложение заново через бота.');
-      state.user = data.user; state.canNotify = data.can_notify === true; state.session = 'authorized';
+      state.user = data.user; state.isOwner = data.is_owner === true; state.canNotify = data.can_notify === true; state.session = 'authorized'; state.accessState = 'approved';
       if (typeof data.bot_username === 'string') state.botUsername = data.bot_username;
     } catch (error) {
-      state.user = null; state.canNotify = false;
-      state.session = error.status === 403 ? 'forbidden' : error.status === 503 ? 'unconfigured' : error.status === 401 ? 'expired' : 'unavailable';
+      if (serial !== state.sessionSerial) return;
+      restrictAccess(error); return;
     }
     renderAccess();
     if (state.view === 'saved' && state.user) loadSaved();
   }
+  function renderGate() {
+    let title = ['Вход', 'через Telegram.'];
+    let description = 'Поиск туров доступен только после одобрения владельцем. Откройте бота и нажмите «Старт», чтобы отправить заявку. Затем запустите приложение из чата с ботом.';
+    let footnote = 'До одобрения предложения и личные поиски закрыты.';
+    if (state.session === 'checking') {
+      title = ['Проверяем', 'ваш доступ.']; description = 'Подтверждаем Telegram-сессию и разрешение владельца.'; footnote = 'Это займёт несколько секунд.';
+    } else if (state.session === 'unconfigured') {
+      title = ['Сервис', 'готовится к запуску.']; description = 'Владелец ещё не завершил подключение Telegram. Доступ к поиску пока закрыт.';
+    } else if (state.session === 'expired') {
+      title = ['Откройте', 'приложение заново.']; description = 'Telegram-сессия истекла или не подтвердилась. Закройте это окно и снова запустите приложение кнопкой в чате с ботом.';
+    } else if (state.session === 'unavailable') {
+      title = ['Не удалось', 'проверить доступ.']; description = 'Проверьте соединение и повторите попытку. Пока сессия не подтверждена, поиск остаётся закрыт.';
+    } else if (state.session === 'forbidden') {
+      if (state.accessState === 'pending') {
+        title = ['Заявка', 'на рассмотрении.']; description = 'Ваша заявка передана владельцу. После одобрения бот сообщит об этом, и вы сможете искать туры и сохранять поиски.'; footnote = 'Повторно отправлять заявку не нужно.';
+      } else if (state.accessState === 'denied') {
+        title = ['Доступ', 'пока не одобрен.']; description = 'Владелец не предоставил доступ этому Telegram-аккаунту. Статус заявки можно посмотреть в чате с ботом.';
+      } else {
+        title = ['Запросите', 'доступ к поиску.']; description = 'Откройте бота и нажмите «Старт». Он передаст вашу заявку владельцу; после одобрения здесь появится поиск туров.';
+      }
+    }
+    $('gate-title').replaceChildren(document.createTextNode(title[0]), el('br'), el('span', '', title[1]));
+    $('gate-description').textContent = description; $('gate-footnote').textContent = footnote;
+    $('gate-mark').replaceChildren(state.session === 'checking' ? el('span', 'spinner') : icon(state.accessState === 'pending' ? 'clock' : 'lock'));
+    const actions = $('gate-actions'); actions.replaceChildren();
+    if (!['checking', 'unconfigured'].includes(state.session)) {
+      const link = botLink(state.session === 'forbidden' && state.accessState === 'not_requested' ? 'Открыть бота и подать заявку' : 'Открыть бота');
+      if (link) actions.append(link);
+      else actions.append(el('p', 'field-hint', 'Ссылку на бота можно получить у владельца Tour Finder.'));
+    }
+    if (initData && ['forbidden', 'unavailable'].includes(state.session)) actions.append(button(state.accessState === 'pending' ? 'Проверить решение' : 'Проверить доступ', 'button', verifySession));
+    $('access-gate').setAttribute('aria-busy', String(state.session === 'checking'));
+  }
   function renderAccess() {
-    const access = $('saved-access'); const note = $('connection-note');
-    access.replaceChildren(); note.replaceChildren();
+    const allowed = hasAccess();
+    $('access-gate').hidden = allowed; $('main-content').hidden = !allowed; $('app-nav').hidden = !allowed; $('app-footer').hidden = !allowed;
+    document.body.classList.toggle('access-restricted', !allowed);
+    const access = $('saved-access'); const note = $('connection-note'); const ownerNote = $('owner-note');
+    access.replaceChildren(); note.replaceChildren(); ownerNote.replaceChildren();
+    note.hidden = true; access.hidden = true; ownerNote.hidden = true;
     $('watchlist-content').hidden = !state.user;
     $('session-badge').classList.toggle('connected', Boolean(state.user));
-    $('session-badge').textContent = state.user ? (state.user.first_name || 'В Telegram') : state.session === 'checking' ? 'Подключаем…' : 'Предпросмотр';
-    let heading, description;
-    if (state.user && state.canNotify) { note.hidden = true; access.hidden = true; return; }
-    if (state.user) {
-      heading = 'Остался один шаг'; description = 'Откройте бота и нажмите «Старт», чтобы он мог присылать вам сообщения. Сохранённые поиски уже доступны.';
-    } else if (state.session === 'checking') {
-      heading = 'Подключаем ваш Telegram'; description = 'Проверяем сессию для личных поисков.';
-    } else if (state.session === 'unconfigured') {
-      heading = 'Поиск готов к знакомству'; description = 'Telegram-бот ещё не подключён. Пока доступны поиск, предложения и история цены. Личные поиски и сообщения появятся после подключения.';
-    } else if (state.session === 'forbidden') {
-      heading = 'Это личный Tour Finder'; description = 'Ваш Telegram-аккаунт пока не добавлен в доступ. Поиск можно посмотреть; сохранение недоступно.';
-    } else if (state.session === 'expired') {
-      heading = 'Нужно открыть приложение заново'; description = 'Telegram-сессия истекла. Закройте Mini App и снова откройте его через бота.';
-    } else if (state.session === 'unavailable') {
-      heading = 'Не удалось подключить Telegram'; description = 'Поиск можно посмотреть. Для сохранения нужна проверенная сессия — повторите подключение.';
-    } else {
-      heading = 'Ваши поиски — в Telegram'; description = 'Сейчас открыт предпросмотр. Откройте бота, нажмите «Старт» и запустите приложение, чтобы сохранять поиски и получать сообщения.';
+    $('session-badge').textContent = state.user ? (state.isOwner ? 'Владелец · ' : '') + (state.user.first_name || 'В Telegram') : demoMode ? 'Локальное демо' : state.session === 'checking' ? 'Проверяем доступ…' : 'Закрытый доступ';
+    if (!allowed) { renderGate(); updateBackButton(); return; }
+    if (demoMode) {
+      access.hidden = false; access.append(el('h3', '', 'Локальный демонстрационный режим'), el('p', '', 'Здесь можно проверить поиск, карточки и историю на тестовых данных. Личные поиски и сообщения требуют одобренной Telegram-сессии.'));
+      return;
     }
-    access.hidden = false; access.append(el('h3', '', heading), el('p', '', description));
-    const showBot = !['unconfigured', 'forbidden', 'checking'].includes(state.session);
-    if (showBot) { const link = botLink(); if (link) access.append(link); }
-    if (state.session === 'unavailable' || (state.user && !state.canNotify)) access.append(button('Проверить подключение', 'text-button', verifySession));
-    note.hidden = Boolean(state.user && state.canNotify);
-    note.append(icon('bell'), el('p', '', state.user ? 'Для сообщений откройте бота и нажмите «Старт».' : state.session === 'unconfigured' ? 'Бот ещё не подключён. Это предпросмотр поиска.' : description));
-    if (showBot) { const link = botLink('В Telegram', 'text-button'); if (link) note.append(link); }
+    if (state.isOwner) {
+      ownerNote.hidden = false; ownerNote.append(icon('lock'), el('p', '', 'Вы управляете доступом. Заявки — /requests, одобренные пользователи — /approved в чате с ботом.'));
+      const link = botLink('В бот', 'text-button'); if (link) ownerNote.append(link);
+    }
+    if (state.canNotify) return;
+    access.hidden = false; access.append(el('h3', '', 'Подключите сообщения от бота'), el('p', '', 'Доступ к поиску одобрен. Откройте бота и нажмите «Старт», чтобы получать уведомления; сохранение поисков уже доступно.'));
+    const link = botLink(); if (link) access.append(link);
+    access.append(button('Проверить подключение', 'text-button', verifySession));
+    note.hidden = false; note.append(icon('bell'), el('p', '', 'Для уведомлений откройте бота и нажмите «Старт».'));
+    const shortLink = botLink('В Telegram', 'text-button'); if (shortLink) note.append(shortLink);
   }
 
   async function runSearch() {
+    if (!hasAccess()) { renderAccess(); return; }
     const filters = validateFilters();
     if (!filters) return;
     state.searchRequest?.abort();
@@ -422,6 +485,7 @@
     card.append(body); return card;
   }
   async function toggleVariants(box, trigger, hotel, filters) {
+    if (!hasAccess()) { renderAccess(); return; }
     if (!box.hidden) { box.hidden = true; trigger.setAttribute('aria-expanded', 'false'); return; }
     box.hidden = false; trigger.setAttribute('aria-expanded', 'true');
     if (box.dataset.loaded === 'true') return;
@@ -450,6 +514,7 @@
   }
 
   async function showOffer(seed, filters = state.lastFilters || currentFilters()) {
+    if (!hasAccess()) { renderAccess(); return; }
     if (!seed.offer_id) { toast('У этого предложения нет идентификатора для подробного просмотра.'); return; }
     state.detailRequest?.abort();
     const controller = new AbortController(); state.detailRequest = controller;
@@ -556,6 +621,7 @@
   }
 
   async function runDeals() {
+    if (!hasAccess()) { renderAccess(); return; }
     // /api/drops currently supports party composition, not the other search filters.
     const filters = currentFilters();
     const ages = String(filters.children_ages || '').split(',').filter(Boolean).map(Number);
@@ -580,6 +646,7 @@
   }
 
   async function showHistory(offer, embeddedTarget = null, isCurrent = () => true) {
+    if (!hasAccess()) { renderAccess(); return; }
     const serial = embeddedTarget ? null : ++state.historySerial;
     const target = embeddedTarget || $('history-content');
     const current = () => embeddedTarget ? isCurrent() && target.isConnected : serial === state.historySerial && $('history-dialog').open;
@@ -788,6 +855,6 @@
     } catch { /* Search still works in older Telegram clients. */ }
   }
   window.matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', syncTelegramTheme);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden && state.user && !state.canNotify) verifySession(); });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden && initData && !demoMode && state.session !== 'expired') verifySession(); });
   syncTelegramTheme(); syncSafeArea(); syncMealPresets(); updateBackButton(); renderAccess(); verifySession();
 })();

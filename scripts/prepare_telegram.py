@@ -54,6 +54,13 @@ NEW_TABLES = {
     "telegram_updates": {
         "update_id": Column("TEXT", primary=True), "processed_at": Column("TEXT", True),
     },
+    "telegram_access_requests": {
+        "user_id": Column("TEXT", primary=True),
+        "status": Column("TEXT", True, "'pending'"),
+        "first_name": Column("TEXT", True, "''"),
+        "requested_at": Column("TEXT", True),
+        "decided_at": Column("TEXT"), "decided_by": Column("TEXT"),
+    },
 }
 ADDITIONS = {
     "subscriptions": {
@@ -83,6 +90,7 @@ SMALL_INDEXES = {
     "idx_subscriptions_owner": ("subscriptions", ["owner_id", "enabled"]),
     "idx_telegram_delivery_queue": ("telegram_deliveries", ["status", "next_attempt_at"]),
     "idx_telegram_delivery_owner": ("telegram_deliveries", ["owner_id", "sent_at"]),
+    "idx_telegram_access_status": ("telegram_access_requests", ["status", "requested_at"]),
 }
 LARGE_INDEX = {"idx_snapshots_latest": ("price_snapshots", ["offer_id", "fetched_at", "id"])}
 
@@ -284,7 +292,7 @@ def telegram_counts(conn) -> dict[str, int]:
     with conn.transaction():
         transaction(conn, readonly=True)
         return {table: conn.execute(f'SELECT count(*) AS count FROM public."{table}"').fetchone()["count"]
-                for table in ("telegram_users", "telegram_deliveries", "telegram_updates")}
+                for table in ("telegram_users", "telegram_deliveries", "telegram_updates", "telegram_access_requests")}
 
 
 def main(argv=None) -> int:

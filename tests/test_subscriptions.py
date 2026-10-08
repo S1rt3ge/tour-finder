@@ -191,6 +191,18 @@ class SubscriptionTests(unittest.TestCase):
         self.assertEqual([row["offer_id"] for row in self.conn.execute("SELECT offer_id FROM alerts")], [selected])
         self.assertEqual(self.count("telegram_deliveries"), 1)
 
+    def test_persisted_approved_user_can_evaluate_but_revocation_stops_new_alerts(self):
+        offer = self.offer()
+        self.conn.execute("""INSERT INTO telegram_access_requests(user_id,status,first_name,requested_at)
+            VALUES ('789','approved','Fixture','2026-10-08T00:00:00Z')""")
+        sub = self.subscription(owner="789")
+        self.assertEqual(subscriptions.evaluate(self.conn, sub), 1)
+        self.conn.execute("UPDATE telegram_access_requests SET status='denied' WHERE user_id='789'")
+        self.snapshot(offer, "2026-10-08T11:00:00Z", 60_000)
+        self.conn.commit()
+        self.assertEqual(subscriptions.evaluate(self.conn, sub), 0)
+        self.assertEqual(self.count("alerts"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
