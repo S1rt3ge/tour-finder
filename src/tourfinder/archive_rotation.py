@@ -373,8 +373,15 @@ class Publisher:
         base_tree = None
         if self.expected_head:
             base_tree = self.request("GET", f"/git/commits/{self.expected_head}")["tree"]["sha"]
-        payload = {"tree": [{"path": "latest.json", "mode": "100644", "type": "blob",
-                              "content": fmt.canonical_json(pointer).decode()}]}
+        # This data-only branch starts as an orphan, so main's Vercel config
+        # is not inherited. Keep deployment prevention in every pointer tree,
+        # including updates of branches created before this guard existed.
+        payload = {"tree": [
+            {"path": "latest.json", "mode": "100644", "type": "blob",
+             "content": fmt.canonical_json(pointer).decode()},
+            {"path": "vercel.json", "mode": "100644", "type": "blob",
+             "content": fmt.canonical_json({"git": {"deploymentEnabled": False}}).decode()},
+        ]}
         if base_tree:
             payload["base_tree"] = base_tree
         tree = self.request("POST", "/git/trees", payload=payload)["sha"]

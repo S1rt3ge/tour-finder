@@ -531,6 +531,58 @@ def test_pointer_cas_rejects_race_before_writing_any_git_object():
     assert calls == [("GET", "/git/ref/heads/archive-index")]
 
 
+@pytest.mark.parametrize("existing", [False, True], ids=["first-orphan-tree", "existing-branch-update"])
+def test_pointer_tree_disables_vercel_without_inheriting_main(existing):
+    publisher = rotation.Publisher("fixture-unused")
+    old_head, new_head, old_tree, new_tree = (character * 40 for character in "abcd")
+    publisher.expected_head = old_head if existing else None
+    state = {"head": publisher.expected_head, "files": {
+        "README.md": "Keep the existing branch contents",
+        "vercel.json": '{"git":{"deploymentEnabled":true}}',
+    } if existing else {}}
+    pointer = {"format": fmt.POINTER_FORMAT, "generation": "generation-2", "dataset_id": DATASET,
+               "manifest_bytes": 123, "manifest_sha256": "f" * 64,
+               "manifest_url": "https://github.com/S1rt3ge/tour-finder/releases/download/fixture/manifest.json"}
+    calls = []
+
+    def request(method, path, *, payload=None, missing=False):
+        calls.append((method, path, deepcopy(payload)))
+        if method == "GET" and path == "/git/ref/heads/archive-index":
+            return {"object": {"sha": state["head"]}} if state["head"] else None
+        if method == "GET" and path == f"/git/commits/{old_head}":
+            assert existing
+            return {"tree": {"sha": old_tree}}
+        if method == "POST" and path == "/git/trees":
+            assert payload.get("base_tree") == (old_tree if existing else None)
+            assert {entry["path"] for entry in payload["tree"]} == {"latest.json", "vercel.json"}
+            for entry in payload["tree"]:
+                assert entry["mode"] == "100644" and entry["type"] == "blob"
+                state["files"][entry["path"]] = entry["content"]
+            return {"sha": new_tree}
+        if method == "POST" and path == "/git/commits":
+            assert payload["tree"] == new_tree
+            assert payload["parents"] == ([old_head] if existing else [])
+            return {"sha": new_head}
+        if existing and method == "PATCH" and path == "/git/refs/heads/archive-index":
+            assert payload == {"sha": new_head, "force": False}
+            state["head"] = new_head
+            return {}
+        if not existing and method == "POST" and path == "/git/refs":
+            assert payload == {"ref": "refs/heads/archive-index", "sha": new_head}
+            state["head"] = new_head
+            return {}
+        if method == "GET" and path == f"/contents/latest.json?ref={new_head}":
+            return {"content": base64.b64encode(state["files"]["latest.json"].encode()).decode()}
+        pytest.fail(f"unexpected fixture request: {method} {path}")
+
+    publisher.request = request
+    assert publisher.publish_pointer(pointer) == new_head
+    assert json.loads(state["files"]["latest.json"]) == pointer
+    assert json.loads(state["files"]["vercel.json"]) == {"git": {"deploymentEnabled": False}}
+    assert ("README.md" in state["files"]) is existing
+    assert len([call for call in calls if call[:2] == ("POST", "/git/trees")]) == 1
+
+
 def test_credentialed_requests_never_follow_redirect_to_another_host():
     class Session:
         def request(self, method, url, **kwargs):
