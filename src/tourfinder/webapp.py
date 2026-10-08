@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from . import db, queries, reviews
+from . import db, meals, queries, reviews
 from .telegram_bot import (InitDataError, allowed_user_ids, bot_token, now_iso,
                            validate_init_data, webhook_response)
 
@@ -47,6 +47,7 @@ class SearchFilters(BaseModel):
     nights_max: int = Field(30, ge=1, le=30)
     budget_max: int | None = Field(None, ge=1, le=100000)
     boards: str | None = Field(None, max_length=256)
+    board_categories: str | None = Field(None, max_length=128)
     countries: str | None = Field(None, max_length=512)
     only_hot: bool = False
     stars_min: int | None = Field(None, ge=1, le=5)
@@ -62,6 +63,7 @@ class SearchFilters(BaseModel):
         if len(values) > 4 or any(a < 0 or a > 17 for a in values):
             raise ValueError("Допустимо до 4 детей, возраст 0–17.")
         self.children_ages = ages or None
+        self.board_categories = meals.normalize_categories(self.board_categories)
         return self
 
 
@@ -118,6 +120,7 @@ def search(request: Request, date_from: date, date_till: date,
            adults: int = 2, children_ages: str | None = None,
            nights_min: int = 1, nights_max: int = 30, budget_max: int | None = None,
            boards: str | None = None, countries: str | None = None,
+           board_categories: str | None = Query(None, max_length=128),
            only_hot: bool = False, stars_min: int | None = None,
            hotel_id: str | None = Query(None, max_length=128),
            source: str | None = Query(None, max_length=32),
@@ -125,7 +128,7 @@ def search(request: Request, date_from: date, date_till: date,
     try:
         filters = SearchFilters(date_from=date_from, date_till=date_till, adults=adults,
             children_ages=children_ages, nights_min=nights_min, nights_max=nights_max,
-            budget_max=budget_max, boards=boards, countries=countries,
+            budget_max=budget_max, boards=boards, board_categories=board_categories, countries=countries,
             only_hot=only_hot, stars_min=stars_min).model_dump(mode="json")
     except (ValidationError, ValueError):
         raise HTTPException(400, "Проверь даты, состав туристов и фильтры.") from None
@@ -186,6 +189,19 @@ def offer_history(offer_id: int):
                     and offer["last_seen_at"] < queries._fresh_cutoff())
         return {"offer_id": offer_id, "gone": gone, "last_seen_at": offer["last_seen_at"] if offer else None,
                 "history": [dict(r) for r in reversed(rows)]}
+    finally:
+        conn.close()
+
+
+@app.get("/api/offers/{offer_id}")
+def get_offer_detail(offer_id: int):
+    conn = get_conn()
+    try:
+        offer = queries.offer_detail(conn, offer_id)
+        if offer is None:
+            raise HTTPException(404, "Предложение не найдено.")
+        offer["star_gap"] = reviews.star_gap(offer.get("category"), offer.get("review_rating"), offer.get("review_scale"))
+        return {"offer": offer}
     finally:
         conn.close()
 

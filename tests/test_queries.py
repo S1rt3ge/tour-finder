@@ -189,6 +189,101 @@ class QueryTests(unittest.TestCase):
                 self.assertEqual([r["offer_id"] for r in query(hotel_id="h1", source="waavo")], [aggregator])
                 self.assertEqual(query(hotel_id="h1", source="' OR 1=1 --"), [])
 
+    def test_board_categories_cover_standard_codes_and_source_fallback_names(self):
+        examples = [
+            ("RO", "Room only", "RO"), ("BB", "Breakfast", "BB"),
+            ("HB", "Half board", "HB"), ("FB", "Full board", "FB"),
+            ("AI", "All inclusive", "AI"), ("UAI", "Ultra all inclusive", "UAI"),
+            ("SOFTAI", "Soft all inclusive", "AI"),
+            ("OT", "SELF CATERING", "RO"), ("", "SELF CATERING", "RO"),
+            ("", "Super UAI", "UAI"), ("ZZ", "Unspecified package", "OTHER"),
+            # Explicit standard codes win over a conflicting source description.
+            ("BB", "Ultra all inclusive", "BB"), ("AI", "Super UAI", "AI"),
+        ]
+        expected = {}
+        for code, name, category in examples:
+            offer = self.offer(board_code=code, board_name=name)
+            self.snapshot(offer, 80_000)
+            expected[offer] = category
+        rows = self.search()
+        self.assertEqual({row["offer_id"]: row["board_category"] for row in rows}, expected)
+        self.assertTrue(all(isinstance(row["board_label"], str) and row["board_label"].strip() for row in rows))
+        for category in {item[2] for item in examples}:
+            with self.subTest(category=category):
+                grouped = self.grouped(board_categories=category)
+                self.assertEqual(len(grouped), 1)
+                self.assertEqual(grouped[0]["board_category"], category)
+                self.assertEqual(grouped[0]["variants"], sum(value == category for value in expected.values()))
+
+    def test_board_category_filter_precedes_limit_and_grouped_variant_statistics(self):
+        for _ in range(8):
+            self.snapshot(self.offer(board_code="BB", board_name="Breakfast"), 10_000)
+        selected = self.offer(board_code="SOFTAI", board_name="Soft all inclusive")
+        self.snapshot(selected, 80_000)
+        self.snapshot(self.offer(board_code="AI", date_start="2026-10-21"), 90_000)
+        self.hotel("h2")
+        self.snapshot(self.offer(source_hotel_id="h2", board_code="AI"), 95_000)
+        for query in (self.search, self.grouped):
+            with self.subTest(query=query.__name__):
+                self.assertEqual([row["offer_id"] for row in query(board_categories="AI", limit=1)], [selected])
+        grouped = self.grouped(board_categories="AI", limit=1)[0]
+        self.assertEqual(grouped["variants"], 2)
+        self.assertEqual((grouped["variants_min_cents"], grouped["variants_max_cents"]), (80_000, 90_000))
+        self.assertEqual((grouped["variants_date_from"], grouped["variants_date_till"]), ("2026-10-20", "2026-10-21"))
+
+    def test_board_categories_intersect_legacy_raw_board_codes(self):
+        soft = self.offer(board_code="SOFTAI")
+        standard = self.offer(board_code="AI")
+        breakfast = self.offer(board_code="BB", board_name="Breakfast")
+        for offer, price in ((soft, 70_000), (standard, 80_000), (breakfast, 50_000)):
+            self.snapshot(offer, price)
+        for query in (self.search, self.grouped):
+            with self.subTest(query=query.__name__):
+                self.assertEqual([row["offer_id"] for row in query(boards="SOFTAI")], [soft])
+                self.assertEqual([row["offer_id"] for row in query(board_categories="AI", boards="AI")], [standard])
+                self.assertEqual(query(board_categories="AI", boards="BB"), [])
+                self.assertEqual(query(board_categories=None), query())
+
+    def test_offer_detail_uses_latest_timestamp_then_id_and_preserves_search_data(self):
+        offer = self.offer(date_start="2999-10-20", date_end="2999-10-27", room_placement="2AD+1CH")
+        self.snapshot(offer, 100_000)
+        self.snapshot(offer, 80_000, hot=1, stop_sale="closed")
+        self.snapshot(offer, 50_000, "2026-10-07T10:00:00Z")  # Backfill with higher id.
+        searched = self.search(date_from="2999-10-10", date_till="2999-10-31")[0]
+        detail = queries.offer_detail(self.conn, offer)
+        self.assertEqual(detail["offer_id"], offer)
+        self.assertEqual(detail["price_cents"], 80_000)
+        self.assertEqual(detail["fetched_at"], "2026-10-08T10:00:00Z")
+        self.assertEqual(detail["stop_sale"], "closed")
+        self.assertEqual(detail["room_placement"], "2AD+1CH")
+        self.assertEqual(detail["last_seen_at"], "2026-10-08T10:00:00Z")
+        self.assertIs(detail["stale"], False)
+        for key in ("source", "source_hotel_id", "hotel_name", "board_category", "board_label",
+                    "snapshots_count", "avg_seen_cents", "min_seen_cents", "max_seen_cents"):
+            self.assertEqual(detail[key], searched[key], key)
+
+    def test_offer_detail_reads_old_offer_but_marks_it_stale(self):
+        offer = self.offer(date_start="2999-10-20", last_seen_at="2026-10-01T00:00:00Z")
+        self.snapshot(offer, 70_000)
+        self.assertEqual(self.search(date_from="2999-10-01", date_till="2999-10-31"), [])
+        detail = queries.offer_detail(self.conn, offer)
+        self.assertEqual(detail["price_cents"], 70_000)
+        self.assertIs(detail["stale"], True)
+
+    def test_offer_detail_marks_old_snapshot_and_past_departure_stale(self):
+        old_snapshot = self.offer(date_start="2999-10-20")
+        self.snapshot(old_snapshot, 70_000, "2026-10-01T00:00:00Z")
+        departed = self.offer(date_start="2000-01-01")
+        self.snapshot(departed, 60_000)
+        for offer in (old_snapshot, departed):
+            with self.subTest(offer=offer):
+                self.assertIs(queries.offer_detail(self.conn, offer)["stale"], True)
+
+    def test_offer_detail_missing_offer_or_missing_history_is_absent(self):
+        without_history = self.offer()
+        self.assertIsNone(queries.offer_detail(self.conn, without_history))
+        self.assertIsNone(queries.offer_detail(self.conn, 999_999))
+
     def test_price_per_night_changes_best_variant_and_hotel_order(self):
         short = self.offer(nights=3)
         long = self.offer(nights=9)

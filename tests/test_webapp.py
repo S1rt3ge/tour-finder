@@ -2,7 +2,7 @@ import hashlib
 import hmac
 import json
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 import pytest
@@ -38,6 +38,34 @@ def client(tmp_path, monkeypatch):
 def payload():
     start = date.today() + timedelta(days=2)
     return {"name": "Отпуск", "filters": {"date_from": start.isoformat(), "date_till": (start + timedelta(days=10)).isoformat()}}
+
+
+def seed_offer(*, board="AI", board_name="All inclusive", price=80_000,
+               observed_at=None, last_seen_at=None, history=True):
+    """Uses only the explicit temporary DATABASE_URL supplied by client."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    conn = db.connect()
+    try:
+        conn.execute("INSERT INTO hotels(source,source_hotel_id,name) VALUES ('joinup','h1','Fixture Hotel') ON CONFLICT(source,source_hotel_id) DO NOTHING")
+        number = conn.execute("SELECT count(*) FROM offers").scalar() + 1
+        offer_id = conn.execute("""INSERT INTO offers(source,source_hotel_id,origin_id,origin_name,
+            date_start,date_end,nights,board_code,board_name,room_code,room_name,room_placement,
+            pax_adl,pax_chd,children_ages,first_seen_at,last_seen_at,link)
+            VALUES ('joinup','h1','RIX','Riga',:start,:finish,7,:board,:board_name,:room,'Standard','2AD',
+            2,0,'',:now,:seen,'https://example.test/tour') RETURNING id""", {
+                "start": payload()["filters"]["date_from"],
+                "finish": (date.fromisoformat(payload()["filters"]["date_from"]) + timedelta(days=7)).isoformat(),
+                "board": board, "board_name": board_name, "room": str(number),
+                "now": now, "seen": last_seen_at or now,
+            }).scalar()
+        if history:
+            conn.execute("""INSERT INTO price_snapshots(offer_id,fetched_at,price_cents,currency,is_hot)
+                VALUES (:id,:when,:price,'EUR',0)""",
+                {"id": offer_id, "when": observed_at or now, "price": price})
+        conn.commit()
+        return offer_id
+    finally:
+        conn.close()
 
 
 def test_preview_and_readonly_search_without_bot(client, monkeypatch):
@@ -113,3 +141,80 @@ def test_legacy_ownerless_subscriptions_stay_private(client):
     conn.commit()
     conn.close()
     assert client.get("/api/subscriptions", headers=auth()).json()["subscriptions"] == []
+
+
+@pytest.mark.parametrize("category", ["UNKNOWN", "AI,NOT_A_MEAL", "AI'); DROP TABLE offers;--"])
+def test_unknown_board_category_rejected_by_public_and_subscription_api(client, category):
+    filters = {**payload()["filters"], "board_categories": category}
+    assert client.get("/api/search", params=filters).status_code == 400
+    assert client.post("/api/subscriptions", json={**payload(), "filters": filters}, headers=auth()).status_code == 422
+
+
+def test_board_categories_normalize_saved_filters_and_support_legacy_boards(client):
+    selected = seed_offer(board="SOFTAI", board_name="Soft all inclusive", price=80_000)
+    seed_offer(board="BB", board_name="Breakfast", price=10_000)
+    filters = {**payload()["filters"], "board_categories": " ai, uai, AI ", "boards": "SOFTAI"}
+    created = client.post("/api/subscriptions", json={**payload(), "filters": filters}, headers=auth())
+    assert created.status_code == 200, created.text
+    saved = client.get("/api/subscriptions", headers=auth()).json()["subscriptions"][0]["filters"]
+    assert set(saved["board_categories"].split(",")) == {"AI", "UAI"}
+    assert len(saved["board_categories"].split(",")) == 2
+    assert saved["boards"] == "SOFTAI"
+    for group in (True, False):
+        response = client.get("/api/search", params={**filters, "group": group, "limit": 1})
+        assert response.status_code == 200, response.text
+        rows = response.json()["results"]
+        assert [row["offer_id"] for row in rows] == [selected]
+        assert rows[0]["board_category"] == "AI"
+        assert rows[0]["board_label"]
+    conflicting = client.get("/api/search", params={**filters, "boards": "BB"})
+    assert conflicting.status_code == 200 and conflicting.json()["count"] == 0
+
+
+@pytest.mark.parametrize("category", [None, ""])
+def test_absent_or_empty_board_categories_keep_unrestricted_saved_search(client, category):
+    item = payload()
+    item["filters"]["board_categories"] = category
+    assert client.post("/api/subscriptions", json=item, headers=auth()).status_code == 200
+    saved = client.get("/api/subscriptions", headers=auth()).json()["subscriptions"][0]["filters"]
+    assert saved["board_categories"] is None
+
+
+def test_public_offer_detail_and_lazy_history_agree_on_latest_snapshot(client, monkeypatch):
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN")
+    offer = seed_offer(board="OT", board_name="SELF CATERING", price=100_000)
+    conn = db.connect()
+    try:
+        timestamp = conn.execute("SELECT fetched_at FROM price_snapshots WHERE offer_id=:id", {"id": offer}).scalar()
+        conn.execute("""INSERT INTO price_snapshots(offer_id,fetched_at,price_cents,currency,is_hot)
+            VALUES (:id,:when,80000,'EUR',1)""", {"id": offer, "when": timestamp})
+        conn.execute("""INSERT INTO price_snapshots(offer_id,fetched_at,price_cents,currency,is_hot)
+            VALUES (:id,'2000-01-01T00:00:00Z',50000,'EUR',0)""", {"id": offer})
+        conn.commit()
+    finally:
+        conn.close()
+    response = client.get(f"/api/offers/{offer}")
+    assert response.status_code == 200, response.text
+    detail = response.json()["offer"]
+    assert detail["offer_id"] == offer and detail["price_cents"] == 80_000
+    assert detail["board_category"] == "RO" and detail["board_label"]
+    assert detail["room_placement"] == "2AD" and detail["last_seen_at"]
+    assert detail["stale"] is False
+    assert "history" not in detail
+    history = client.get(f"/api/offers/{offer}/history").json()["history"]
+    assert [row["price_cents"] for row in history] == [50_000, 100_000, 80_000]
+    assert history[-1]["price_cents"] == detail["price_cents"]
+    assert history[-1]["fetched_at"] == detail["fetched_at"]
+
+
+def test_public_offer_detail_retains_stale_card_and_returns_404_without_history(client):
+    stale_offer = seed_offer(last_seen_at="2000-01-01T00:00:00Z", price=70_000)
+    unseen_offer = seed_offer(history=False)
+    response = client.get(f"/api/offers/{stale_offer}")
+    assert response.status_code == 200
+    assert response.json()["offer"]["stale"] is True
+    assert response.json()["offer"]["price_cents"] == 70_000
+    search = client.get("/api/search", params=payload()["filters"])
+    assert search.status_code == 200 and search.json()["count"] == 0
+    assert client.get(f"/api/offers/{unseen_offer}").status_code == 404
+    assert client.get("/api/offers/999999999").status_code == 404

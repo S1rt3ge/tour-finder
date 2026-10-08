@@ -10,9 +10,12 @@
     view: 'search', user: null, canNotify: false, session: configured ? 'preview' : 'unconfigured',
     botUsername: document.body.dataset.botUsername || '', lastFilters: null, saveFilters: null,
     searchRequest: null, searchSerial: 0, dealsRequest: null, dealsSerial: 0,
-    savedSerial: 0, historySerial: 0, toastTimer: null, subscriptions: [],
+    savedSerial: 0, historySerial: 0, detailSerial: 0, detailRequest: null, toastTimer: null, subscriptions: [],
   };
   const OPERATORS = {joinup: 'Join Up', teztour: 'Tez Tour', novaturas: 'Novatours', coral: 'Coral', anextour: 'Anex', itaka: 'Itaka'};
+  const BOARD_LABELS = {RO: 'Без питания', BB: 'Завтраки', HB: 'Двухразовое питание', FB: 'Трёхразовое питание', AI: 'Всё включено', UAI: 'Ультра всё включено', OTHER: 'Другое / не указано'};
+  const INCLUDED_MEALS = ['BB', 'HB', 'FB', 'AI', 'UAI'];
+  const dialogOpeners = new WeakMap();
   const SVG_NS = 'http://www.w3.org/2000/svg';
 
   function el(tag, className, text) {
@@ -86,11 +89,17 @@
     const ages = String(filters.children_ages || '').split(',').filter(Boolean);
     return adults + (adults === 1 ? ' взрослый' : ' взрослых') + (ages.length ? ' + дети ' + ages.join(', ') + ' лет' : '');
   }
+  function boardLabel(offer) {
+    const original = offer.board_name || offer.board_code;
+    if (offer.board_category === 'OTHER') return original ? 'Другое: ' + original : 'Питание не указано';
+    return offer.board_label || BOARD_LABELS[offer.board_category] || original || 'Питание не указано';
+  }
   function filterDescription(filters) {
     const parts = [dateLabel(filters.date_from) + ' — ' + dateLabel(filters.date_till), partyLabel(filters), filters.nights_min + '–' + filters.nights_max + ' ночей'];
     if (filters.budget_max) parts.push('до ' + money(Number(filters.budget_max) * 100));
     if (filters.stars_min) parts.push('от ' + filters.stars_min + ' ★');
-    if (filters.boards) parts.push(String(filters.boards).split(',').join(' / '));
+    if (filters.board_categories) parts.push(String(filters.board_categories).split(',').map(code => BOARD_LABELS[code] || code).join(' / '));
+    if (filters.boards) parts.push('у источника: ' + String(filters.boards).split(',').join(' / '));
     if (filters.countries) {
       const names = String(filters.countries).split(',').map(id => {
         const input = Array.from(form.querySelectorAll('[name=country]')).find(item => item.value === id);
@@ -176,7 +185,7 @@
     const ages = Array.from($('age-inputs').querySelectorAll('input')).map(input => Number(input.value)).sort((a, b) => a - b);
     if (ages.length) filters.children_ages = ages.join(',');
     if (fields.budget_max.value) filters.budget_max = Number(fields.budget_max.value);
-    for (const [name, key] of [['board', 'boards'], ['country', 'countries']]) {
+    for (const [name, key] of [['board', 'boards'], ['board_category', 'board_categories'], ['country', 'countries']]) {
       const selected = Array.from(form.querySelectorAll('input[name=' + name + ']:checked')).map(input => input.value);
       if (selected.length) filters[key] = selected.join(',');
     }
@@ -212,11 +221,24 @@
     form.elements.only_hot.checked = Boolean(filters.only_hot);
     const ages = String(filters.children_ages || '').split(',').filter(Boolean);
     form.elements.children.value = ages.length; syncChildAges(ages);
-    for (const [name, key] of [['board', 'boards'], ['country', 'countries']]) {
+    for (const [name, key] of [['board', 'boards'], ['board_category', 'board_categories'], ['country', 'countries']]) {
       const selected = new Set(String(filters[key] || '').split(','));
       for (const input of form.querySelectorAll('[name=' + name + ']')) input.checked = selected.has(input.value);
     }
-    collapseFilters(false);
+    if (filters.boards) { $('raw-meals').open = true; $('raw-meals').closest('.more-filters').open = true; }
+    syncMealPresets(); collapseFilters(false);
+  }
+
+  function syncMealPresets() {
+    const selected = Array.from(form.querySelectorAll('[name=board_category]:checked')).map(input => input.value);
+    const hasRaw = Boolean(form.querySelector('[name=board]:checked'));
+    $('meals-any').setAttribute('aria-pressed', String(!selected.length && !hasRaw));
+    $('meals-included').setAttribute('aria-pressed', String(!hasRaw && selected.length === INCLUDED_MEALS.length && INCLUDED_MEALS.every(code => selected.includes(code))));
+  }
+  function selectMeals(categories) {
+    for (const input of form.querySelectorAll('[name=board_category]')) input.checked = categories.includes(input.value);
+    for (const input of form.querySelectorAll('[name=board]')) input.checked = false;
+    syncMealPresets(); haptic();
   }
 
   function updateBackButton() {
@@ -239,7 +261,7 @@
     if (view === 'deals') runDeals();
     if (view === 'saved') { renderAccess(); if (state.user) loadSaved(); }
   }
-  function openDialog(dialog) { dialog.showModal(); updateBackButton(); }
+  function openDialog(dialog) { if (!dialog.open) { dialogOpeners.set(dialog, document.activeElement); dialog.showModal(); } updateBackButton(); }
   function closeDialog(dialog) { dialog.close(); updateBackButton(); }
 
   async function verifySession() {
@@ -330,15 +352,23 @@
     }
   }
 
-  function hotelCard(row, filters, isDrop = false) {
-    const card = el('article', 'hotel-card');
+  function hotelPhoto(row, eager = false) {
     const photo = el('div', 'hotel-photo');
     const placeholder = el('div', 'photo-placeholder'); placeholder.append(icon('sun'), el('span', '', 'Здесь начинается отпуск')); photo.append(placeholder);
     const url = validUrl(row.photo_url);
     if (url) {
-      const img = el('img'); img.src = url; img.alt = row.hotel_name ? 'Фото отеля ' + row.hotel_name : 'Фото отеля'; img.loading = 'lazy'; img.referrerPolicy = 'no-referrer';
-      img.addEventListener('error', () => img.remove(), {once: true}); photo.append(img);
+      const img = el('img'); img.alt = row.hotel_name ? 'Фото отеля ' + row.hotel_name : 'Фото отеля'; img.loading = eager ? 'eager' : 'lazy'; img.referrerPolicy = 'no-referrer';
+      img.addEventListener('load', () => { placeholder.hidden = true; }, {once: true});
+      img.addEventListener('error', () => img.remove(), {once: true}); img.src = url; photo.append(img);
     }
+    return photo;
+  }
+  function hotelCard(row, filters, isDrop = false) {
+    const card = el('article', 'hotel-card');
+    const photo = hotelPhoto(row);
+    const photoOpen = button('', 'photo-open', () => showOffer(row, filters));
+    photoOpen.setAttribute('aria-label', 'Подробнее: ' + (row.hotel_name || 'предложение'));
+    photo.append(photoOpen);
     const badges = el('div', 'photo-badges');
     const operator = OPERATORS[row.operator] || row.operator;
     if (operator) badges.append(el('span', 'badge badge-photo', operator));
@@ -349,7 +379,8 @@
     photo.append(badges); card.append(photo);
     const body = el('div', 'hotel-body');
     body.append(el('p', 'hotel-location', [row.country_name, row.city_name].filter(Boolean).join(' · ') || 'Курорт не указан'));
-    const title = el('h3', 'hotel-title', row.hotel_name || 'Отель без названия');
+    const title = el('h3', 'hotel-title');
+    title.append(button(row.hotel_name || 'Отель без названия', 'hotel-title-button', () => showOffer(row, filters)));
     const stars = String(row.category || '').match(/^([1-5])(\+)?/);
     if (stars) title.append(el('span', 'hotel-stars', stars[1] + ' ★' + (stars[2] || '')));
     body.append(title);
@@ -362,7 +393,7 @@
       body.append(rating);
     }
     const facts = el('div', 'hotel-facts');
-    [dateLabel(row.date_start), row.nights + ' ночей', row.board_name || row.board_code || 'Питание не указано'].forEach(text => facts.append(el('span', '', text)));
+    [dateLabel(row.date_start), row.nights + ' ночей', boardLabel(row)].forEach(text => facts.append(el('span', '', text)));
     body.append(facts);
     if (row.room_name) body.append(el('p', 'room-name', row.room_name));
     const prices = el('div', 'price-block'); const priceMain = el('div');
@@ -386,7 +417,7 @@
       trigger.setAttribute('aria-expanded', 'false'); actions.append(trigger);
       body.append(actions); body.append(variants);
     }
-    actions.append(externalLink(row.link, 'К предложению ↗'));
+    actions.append(button('Подробнее', 'button button-primary', () => showOffer(row, filters), 'arrow'));
     if (!actions.parentElement) body.append(actions);
     card.append(body); return card;
   }
@@ -401,7 +432,7 @@
       if (hotel.source) params.source = hotel.source;
       const data = await api('/api/search?' + new URLSearchParams(params));
       if (!Array.isArray(data.results)) throw new Error('Не удалось загрузить варианты.');
-      box.removeAttribute('aria-busy'); box.replaceChildren(...data.results.map(offer => variantRow(offer)));
+      box.removeAttribute('aria-busy'); box.replaceChildren(...data.results.map(offer => variantRow(offer, filters)));
       box.dataset.loaded = 'true';
       if (!data.results.length) box.append(el('p', 'field-hint', 'Варианты больше не доступны по этим фильтрам.'));
       if (data.results.length >= 50) box.append(el('p', 'variant-count-note', 'Показаны первые 50 вариантов. Сузьте даты или число ночей.'));
@@ -409,13 +440,119 @@
       empty(box, 'Варианты не загрузились', error.message, () => { box.hidden = true; toggleVariants(box, trigger, hotel, filters); });
     } finally { trigger.disabled = false; }
   }
-  function variantRow(offer) {
+  function variantRow(offer, filters) {
     const row = el('div', 'variant-row'); const head = el('div', 'variant-head');
-    head.append(el('span', 'variant-title', dateLabel(offer.date_start) + ' · ' + offer.nights + ' н. · ' + (offer.board_code || '')), el('strong', 'variant-price', money(offer.price_cents, offer.currency)));
+    head.append(el('span', 'variant-title', dateLabel(offer.date_start) + ' · ' + offer.nights + ' н. · ' + boardLabel(offer)), el('strong', 'variant-price', money(offer.price_cents, offer.currency)));
     row.append(head, el('p', 'room-name', offer.room_name || offer.board_name || ''));
     const actions = el('div', 'variant-actions');
-    actions.append(button('История цены', 'text-button', () => showHistory(offer)), externalLink(offer.link, 'Открыть ↗', 'text-link'));
+    actions.append(button('Подробнее о варианте', 'text-button', () => showOffer(offer, filters)), externalLink(offer.link, 'У продавца ↗', 'text-link'));
     row.append(actions); return row;
+  }
+
+  async function showOffer(seed, filters = state.lastFilters || currentFilters()) {
+    if (!seed.offer_id) { toast('У этого предложения нет идентификатора для подробного просмотра.'); return; }
+    state.detailRequest?.abort();
+    const controller = new AbortController(); state.detailRequest = controller;
+    const serial = ++state.detailSerial;
+    const dialog = $('offer-dialog'); const target = $('offer-content');
+    const replacingFocusedContent = dialog.open && target.contains(document.activeElement);
+    const selectedFilters = {...filters};
+    $('offer-booking').hidden = true;
+    loading(target, 'Открываем детали предложения…');
+    openDialog(dialog); target.scrollTop = 0;
+    if (replacingFocusedContent) dialog.querySelector('[data-close-dialog]').focus({preventScroll: true});
+    try {
+      const data = await api('/api/offers/' + encodeURIComponent(seed.offer_id), {signal: controller.signal});
+      if (serial !== state.detailSerial || !dialog.open) return;
+      if (!data.offer || !data.offer.offer_id) throw new Error('Не удалось прочитать детали предложения.');
+      renderOffer(data.offer, selectedFilters, serial);
+    } catch (error) {
+      if (serial !== state.detailSerial || !dialog.open || error.name === 'AbortError') return;
+      empty(target, error.status === 404 ? 'Предложение не найдено' : 'Детали пока недоступны', error.status === 404 ? 'Возможно, оно уже удалено из базы. Обновите поиск или выберите другой вариант.' : error.message, () => showOffer(seed, selectedFilters));
+    }
+  }
+  function renderOffer(offer, filters, serial) {
+    const target = $('offer-content'); target.removeAttribute('aria-busy');
+    const photo = hotelPhoto(offer, true); photo.classList.add('offer-photo');
+    const body = el('div', 'offer-body');
+    const location = [offer.country_name, offer.city_name].filter(Boolean).join(' · ');
+    body.append(el('p', 'hotel-location', location || 'Курорт не указан'));
+    const title = el('h3', 'offer-hotel-title', offer.hotel_name || 'Отель без названия');
+    const stars = String(offer.category || '').match(/^([1-5])(\+)?/);
+    if (stars) title.append(el('span', 'hotel-stars', stars[1] + ' ★' + (stars[2] || '')));
+    body.append(title);
+    if (offer.review_rating !== null && offer.review_rating !== undefined && Number.isFinite(Number(offer.review_rating))) {
+      const rating = el('div', 'hotel-rating');
+      const platform = {google: 'Google', tripadvisor: 'TripAdvisor'}[offer.review_platform] || offer.review_platform || 'Гости';
+      rating.append(el('span', 'rating-score', Number(offer.review_rating).toFixed(1).replace('.', ',') + ' / ' + (offer.review_scale || 5)), el('span', '', platform + (offer.review_count ? ' · ' + Number(offer.review_count).toLocaleString('ru-RU') + ' отзывов' : '')));
+      body.append(rating);
+    }
+    const party = {adults: offer.pax_adl ?? filters.adults, children_ages: offer.children_ages ?? filters.children_ages};
+    const partyText = Number(offer.pax_chd) > 0 && !party.children_ages
+      ? String(party.adults) + ' взрослых · ' + offer.pax_chd + ' детей (возраст не указан)'
+      : partyLabel(party);
+    const price = el('div', 'offer-price');
+    price.append(el('strong', '', money(offer.price_cents, offer.currency)), el('span', '', 'за весь тур · ' + partyText));
+    body.append(price);
+    const stopped = !['', '0', 'false', 'no', 'n'].includes(String(offer.stop_sale || '').trim().toLowerCase());
+    if (stopped) body.append(el('p', 'history-warning', 'По последней проверке источник отметил остановку продаж этого варианта. Уточните у продавца, доступно ли предложение сейчас.'));
+    if (offer.stale) body.append(el('p', 'history-warning', 'Предложение давно не встречалось в сборе. Последний раз: ' + dateLabel(offer.last_seen_at, true) + '. Наличие и цену нужно подтвердить у продавца.'));
+    const specs = el('dl', 'offer-specs');
+    const facts = [
+      ['Даты тура', dateLabel(offer.date_start) + (offer.date_end ? ' — ' + dateLabel(offer.date_end) : '')],
+      ['Продолжительность', Number(offer.nights) > 0 ? offer.nights + ' ночей' : 'Не указана'],
+      ['Питание', boardLabel(offer)],
+      ['Номер', offer.room_name || 'Не указан'],
+      ['Туристы', partyText],
+      ['Оператор', OPERATORS[offer.operator] || offer.operator || 'Не указан'],
+    ];
+    if (offer.room_placement) facts.push(['Размещение', offer.room_placement]);
+    if (Number(offer.nights) > 0) facts.push(['Цена за ночь', money(offer.price_per_night_cents ?? Number(offer.price_cents) / Number(offer.nights), offer.currency) + ' за всех']);
+    for (const [label, value] of facts) { const item = el('div'); item.append(el('dt', '', label), el('dd', '', value)); specs.append(item); }
+    body.append(specs);
+    const originalMeal = offer.board_name || offer.board_code;
+    if (originalMeal && originalMeal !== boardLabel(offer)) body.append(el('p', 'field-hint meal-original', 'Питание у источника: ' + originalMeal));
+    const observed = offer.fetched_at || offer.last_seen_at;
+    if (observed) { const note = el('p', 'observation-note'); note.append(icon('clock'), document.createTextNode('Цена проверена ' + dateLabel(observed, true))); body.append(note); }
+    body.append(el('p', 'offer-note', 'Это собранные данные предложения. Состав услуг, правила питания, наличие и окончательную стоимость подтвердит продавец.'));
+
+    const history = el('details', 'detail-section'); const historySummary = el('summary');
+    historySummary.append(icon('trend'), el('span', '', 'История цены'), icon('down')); history.append(historySummary);
+    const historyContent = el('div', 'detail-section-content'); history.append(historyContent);
+    let historyStarted = false;
+    history.addEventListener('toggle', () => {
+      if (!history.open || historyStarted) return; historyStarted = true;
+      showHistory(offer, historyContent, () => serial === state.detailSerial && $('offer-dialog').open);
+    });
+    body.append(history);
+
+    if (offer.source && offer.source_hotel_id) {
+      const variants = el('details', 'detail-section'); const summary = el('summary');
+      summary.append(icon('tune'), el('span', '', 'Другие варианты этого отеля'), icon('down')); variants.append(summary);
+      const caption = el('p', 'field-hint', 'По параметрам вашего поиска: ' + filterDescription(filters));
+      const list = el('div', 'detail-variants'); const content = el('div', 'detail-section-content'); content.append(caption, list); variants.append(content);
+      let variantsStarted = false;
+      const load = async () => {
+        loading(list, 'Ищем другие даты, номера и питание…');
+        try {
+          const params = {...filters, hotel_id: offer.source_hotel_id, source: offer.source, group: 'false', limit: '50'};
+          const data = await api('/api/search?' + new URLSearchParams(params), {signal: state.detailRequest.signal});
+          if (serial !== state.detailSerial || !variants.isConnected) return;
+          if (!Array.isArray(data.results)) throw new Error('Не удалось прочитать варианты.');
+          const alternatives = data.results.filter(row => String(row.offer_id) !== String(offer.offer_id));
+          list.removeAttribute('aria-busy'); list.replaceChildren(...alternatives.map(row => variantRow(row, filters)));
+          if (!alternatives.length) list.append(el('p', 'field-hint', 'Других вариантов по этим параметрам пока нет. Можно расширить даты или снять часть фильтров в поиске.'));
+          if (data.results.length >= 50) list.append(el('p', 'variant-count-note', 'Показаны первые 50 совпадений.'));
+        } catch (error) { if (serial === state.detailSerial && error.name !== 'AbortError' && variants.isConnected) empty(list, 'Варианты не загрузились', error.message, load); }
+      };
+      variants.addEventListener('toggle', () => { if (variants.open && !variantsStarted) { variantsStarted = true; load(); } });
+      body.append(variants);
+    }
+    target.replaceChildren(photo, body); target.scrollTop = 0;
+    const booking = $('offer-booking'); const summary = el('div', 'offer-booking-price');
+    summary.append(el('strong', '', money(offer.price_cents, offer.currency)), el('span', '', 'за всех'));
+    booking.replaceChildren(summary, externalLink(offer.link, stopped ? 'Проверить у продавца ↗' : 'Бронировать у продавца ↗'));
+    booking.hidden = false;
   }
 
   async function runDeals() {
@@ -442,18 +579,19 @@
     finally { if (serial === state.dealsSerial) $('refresh-deals').disabled = false; }
   }
 
-  async function showHistory(offer) {
-    const serial = ++state.historySerial;
-    if (!$('history-dialog').open) openDialog($('history-dialog'));
-    $('history-title').textContent = 'История цены';
-    loading($('history-content'), 'Загружаем наши наблюдения…');
+  async function showHistory(offer, embeddedTarget = null, isCurrent = () => true) {
+    const serial = embeddedTarget ? null : ++state.historySerial;
+    const target = embeddedTarget || $('history-content');
+    const current = () => embeddedTarget ? isCurrent() && target.isConnected : serial === state.historySerial && $('history-dialog').open;
+    if (!embeddedTarget) { openDialog($('history-dialog')); $('history-title').textContent = 'История цены'; }
+    loading(target, 'Загружаем наши наблюдения…');
     try {
       const data = await api('/api/offers/' + encodeURIComponent(offer.offer_id) + '/history');
-      if (serial !== state.historySerial || !$('history-dialog').open) return;
+      if (!current()) return;
       const rows = (Array.isArray(data.history) ? data.history : []).filter(row => Number.isFinite(Number(row.price_cents)) && Number.isFinite(Date.parse(row.fetched_at))).sort((a, b) => Date.parse(a.fetched_at) - Date.parse(b.fetched_at));
       const currency = rows.at(-1)?.currency || offer.currency || 'EUR';
       const history = rows.filter(row => (row.currency || currency) === currency);
-      const target = $('history-content'); target.removeAttribute('aria-busy'); target.replaceChildren(el('h3', 'history-headline', offer.hotel_name || 'Выбранный вариант'), el('p', 'field-hint', dateLabel(offer.date_start) + ' · ' + offer.nights + ' ночей · ' + (offer.board_name || offer.board_code || '')));
+      target.removeAttribute('aria-busy'); target.replaceChildren(el('h3', 'history-headline', offer.hotel_name || 'Выбранный вариант'), el('p', 'field-hint', dateLabel(offer.date_start) + ' · ' + offer.nights + ' ночей · ' + boardLabel(offer)));
       if (data.gone) target.append(el('p', 'history-warning', 'Предложение давно не встречалось в сборе. Последний раз: ' + dateLabel(data.last_seen_at, true) + '. Это не подтверждение, что оно распродано.'));
       if (!history.length) { target.append(el('p', 'history-warning', 'Для этого предложения пока нет доступных наблюдений.')); return; }
       const first = history[0]; const last = history.at(-1);
@@ -476,7 +614,7 @@
       table.append(tbody); detail.append(table);
       if (history.length > 50) detail.append(el('p', 'field-hint', 'В таблице последние 50 наблюдений; график учитывает всю доступную историю.'));
       target.append(detail);
-    } catch (error) { if (serial === state.historySerial) empty($('history-content'), 'История не загрузилась', error.message, () => showHistory(offer), 'Повторить', 'trend'); }
+    } catch (error) { if (current()) empty(target, 'История не загрузилась', error.message, () => showHistory(offer, embeddedTarget, isCurrent), 'Повторить', 'trend'); }
   }
   function priceChart(history) {
     const svg = document.createElementNS(SVG_NS, 'svg'); svg.classList.add('history-chart'); svg.setAttribute('viewBox', '0 0 400 160'); svg.setAttribute('role', 'img'); svg.setAttribute('aria-label', 'График фактических наблюдений цены');
@@ -512,7 +650,7 @@
     if (mode !== 'deal' && !state.saveFilters.budget_max) { showError($('save-validation'), 'Для сигналов по бюджету сначала задайте бюджет в поиске. Или выберите «О заметной выгоде».'); return; }
     if (!$('save-form').reportValidity()) return;
     if (!fields.name.value.trim()) { showError($('save-validation'), 'Дайте поиску короткое название.'); return; }
-    const allowedFilters = ['date_from', 'date_till', 'adults', 'children_ages', 'nights_min', 'nights_max', 'budget_max', 'boards', 'countries', 'only_hot', 'stars_min'];
+    const allowedFilters = ['date_from', 'date_till', 'adults', 'children_ages', 'nights_min', 'nights_max', 'budget_max', 'boards', 'board_categories', 'countries', 'only_hot', 'stars_min'];
     const filters = Object.fromEntries(allowedFilters.filter(key => state.saveFilters[key] !== undefined).map(key => [key, state.saveFilters[key]]));
     const payload = {name: fields.name.value.trim(), filters, notify_mode: mode, min_drop_pct: mode === 'budget' ? 10 : Number(fields.min_drop_pct.value), min_saving_eur: mode === 'budget' ? 100 : Number(fields.min_saving_eur.value), min_review_rating: mode === 'budget' ? 4 : Number(fields.min_review_rating.value), min_review_count: mode === 'budget' ? 20 : Number(fields.min_review_count.value)};
     $('confirm-save').disabled = true; showError($('save-validation'), '');
@@ -580,7 +718,8 @@
     const card = el('article', 'alert-card');
     const description = alert.reason === 'price_drop' ? 'Цена снизилась' : alert.reason === 'deal' ? 'Есть заметная выгода' : 'Подходит вашему поиску';
     card.append(el('span', 'badge badge-deal', description), el('h3', '', alert.hotel_name || 'Предложение'), el('p', '', alert.sub_name || 'Сохранённый поиск'), el('p', '', [alert.country_name, dateLabel(alert.date_start), alert.nights + ' ночей', alert.board_code].filter(Boolean).join(' · ')), el('p', 'alert-price', money(alert.price_cents, alert.currency || 'EUR')));
-    const actions = el('div', 'alert-actions'); actions.append(externalLink(alert.link, 'Посмотреть ↗'));
+    const actions = el('div', 'alert-actions');
+    actions.append(alert.offer_id ? button('Подробнее', 'button button-primary', () => showOffer(alert)) : externalLink(alert.link, 'Посмотреть ↗'));
     const dismiss = button('Прочитано', 'text-button', async () => {
       dismiss.disabled = true;
       try { await api('/api/alerts/seen', {method: 'POST', body: {ids: [alert.id]}}); card.remove(); if (!$('alerts-list').children.length) loadSaved(); else { const count = $('alerts-list').children.length; $('saved-nav-count').textContent = count > 99 ? '99+' : count; } }
@@ -614,6 +753,9 @@
   form.elements.date_from.min = localDate(); form.elements.date_till.min = localDate();
   form.addEventListener('submit', event => { event.preventDefault(); runSearch(); });
   form.elements.children.addEventListener('input', () => syncChildAges());
+  $('meals-any').addEventListener('click', () => selectMeals([]));
+  $('meals-included').addEventListener('click', () => selectMeals(INCLUDED_MEALS));
+  for (const input of form.querySelectorAll('[name=board_category], [name=board]')) input.addEventListener('change', syncMealPresets);
   for (const step of document.querySelectorAll('[data-step]')) step.addEventListener('click', () => {
     const [name, amount] = step.dataset.step.split(':'); const input = form.elements[name];
     input.value = Math.max(Number(input.min), Math.min(Number(input.max), (Number(input.value) || 0) + Number(amount)));
@@ -630,18 +772,22 @@
   for (const nav of document.querySelectorAll('[data-view]')) nav.addEventListener('click', () => { haptic(); navigate(nav.dataset.view); });
   for (const closer of document.querySelectorAll('[data-close-dialog]')) closer.addEventListener('click', () => closeDialog(closer.closest('dialog')));
   for (const dialog of document.querySelectorAll('dialog')) {
-    dialog.addEventListener('close', updateBackButton);
+    dialog.addEventListener('close', () => {
+      if (dialog.id === 'offer-dialog') { state.detailRequest?.abort(); state.detailRequest = null; state.detailSerial++; }
+      updateBackButton();
+      const opener = dialogOpeners.get(dialog); if (opener?.isConnected) opener.focus({preventScroll: true});
+    });
     dialog.addEventListener('click', event => { if (event.target === dialog) { const rect = dialog.getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) closeDialog(dialog); } });
   }
   if (initData && tg) {
     try {
       tg.ready(); tg.expand();
       tg.onEvent('themeChanged', syncTelegramTheme); tg.onEvent('safeAreaChanged', syncSafeArea); tg.onEvent('contentSafeAreaChanged', syncSafeArea);
-      tg.BackButton?.onClick(() => { const dialog = document.querySelector('dialog[open]'); if (dialog) closeDialog(dialog); else navigate('search'); });
+      tg.BackButton?.onClick(() => { const dialog = Array.from(document.querySelectorAll('dialog[open]')).at(-1); if (dialog) closeDialog(dialog); else navigate('search'); });
       tg.MainButton?.hide();
     } catch { /* Search still works in older Telegram clients. */ }
   }
   window.matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', syncTelegramTheme);
   document.addEventListener('visibilitychange', () => { if (!document.hidden && state.user && !state.canNotify) verifySession(); });
-  syncTelegramTheme(); syncSafeArea(); updateBackButton(); renderAccess(); verifySession();
+  syncTelegramTheme(); syncSafeArea(); syncMealPresets(); updateBackButton(); renderAccess(); verifySession();
 })();
