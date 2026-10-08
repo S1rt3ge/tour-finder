@@ -10,7 +10,7 @@
   <script src="https://telegram.org/js/telegram-web-app.js" defer></script>
   <script src="/static/miniapp.js" defer></script>
 </head>
-<body data-telegram-enabled="{{ 'true' if telegram_enabled else 'false' }}" data-bot-username="{{ telegram_bot_username or '' }}">
+<body data-telegram-enabled="{{ 'true' if telegram_enabled else 'false' }}" data-bot-username="{{ telegram_bot_username or '' }}" data-demo-mode="{{ 'true' if demo_mode|default(false) else 'false' }}">
   <svg class="icon-definitions" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
     <symbol id="i-plane" viewBox="0 0 24 24"><path d="m22 2-7 20-4-9-9-4Z M22 2 11 13"/></symbol>
     <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="7.5"/><path d="m16 16 5 5"/></symbol>
@@ -24,16 +24,26 @@
     <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
     <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
     <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="3"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3"/></symbol>
   </svg>
 
   <div class="app-shell">
     <header class="topbar">
       <a class="brand" href="/app" aria-label="Tour Finder, главная"><span class="brand-mark"><svg class="icon"><use href="#i-plane"/></svg></span><span>tour<span class="brand-light">finder</span></span></a>
-      <span id="session-badge" class="session-badge">Предпросмотр</span>
+      <span id="session-badge" class="session-badge">Закрытый доступ</span>
     </header>
     {% if demo_mode|default(false) %}<p class="demo-banner" role="note">Локальный макет · демонстрационные данные</p>{% endif %}
 
-    <main id="main-content">
+    <main id="access-gate" class="access-gate" aria-labelledby="gate-title">
+      <div id="gate-mark" class="gate-mark" aria-hidden="true"><svg class="icon"><use href="#i-lock"/></svg></div>
+      <div class="eyebrow">ЛИЧНЫЙ TOUR FINDER</div>
+      <h1 id="gate-title" tabindex="-1">Доступ<br><span>по одобрению.</span></h1>
+      <p id="gate-description" aria-live="polite">Поиск туров доступен в Telegram после одобрения владельцем. Откройте бота и нажмите «Старт», чтобы отправить заявку.</p>
+      <div id="gate-actions" class="gate-actions"></div>
+      <p id="gate-footnote" class="gate-footnote">До одобрения предложения и личные поиски закрыты.</p>
+      <div class="gate-decoration" aria-hidden="true"><svg class="icon"><use href="#i-plane"/></svg><span></span><svg class="icon"><use href="#i-sun"/></svg></div>
+    </main>
+    <main id="main-content" hidden>
       <section id="view-search" class="view" aria-labelledby="search-title">
         <div class="hero">
           <div class="eyebrow"><span class="live-dot"></span> ВЫЛЕТ ИЗ РИГИ</div>
@@ -43,6 +53,7 @@
         </div>
 
         <div id="connection-note" class="connection-note" role="status" hidden></div>
+        <div id="owner-note" class="connection-note owner-note" hidden></div>
 
         <form id="search-form" class="search-panel">
           <div class="panel-heading"><div><div class="eyebrow muted">ВАШ МАРШРУТ</div><h2>Рига <span class="route-arrow">→</span> куда угодно</h2></div><button id="filters-toggle" class="icon-button" type="button" aria-expanded="true" aria-controls="filter-fields" aria-label="Свернуть параметры поиска"><svg class="icon"><use href="#i-tune"/></svg></button></div>
@@ -95,10 +106,10 @@
         <div id="watchlist-content" hidden><div class="results-heading"><div><h2>Мои поиски</h2><p id="saved-caption" class="muted"></p></div><button id="new-watchlist" class="button button-small" type="button">+ Сохранить поиск</button></div><div id="subscriptions-list" class="saved-list" aria-live="polite"></div><div class="results-heading"><div><h2>Новые совпадения</h2><p class="muted">Непрочитанные сигналы</p></div><button id="refresh-saved" class="text-button" type="button">Обновить</button></div><div id="alerts-list" class="saved-list" aria-live="polite"></div></div>
       </section>
     </main>
-    <footer class="app-footer">Рига — только отправная точка.<span>Наличие и итоговую стоимость подтвердит продавец.</span></footer>
+    <footer id="app-footer" class="app-footer" hidden>Рига — только отправная точка.<span>Наличие и итоговую стоимость подтвердит продавец.</span></footer>
   </div>
 
-  <nav class="bottom-nav" aria-label="Основная навигация"><div class="nav-inner"><button class="nav-button active" type="button" data-view="search" aria-current="page"><svg class="icon"><use href="#i-search"/></svg><span>Поиск</span></button><button class="nav-button" type="button" data-view="deals"><svg class="icon"><use href="#i-trend"/></svg><span>Падения</span></button><button class="nav-button" type="button" data-view="saved"><svg class="icon"><use href="#i-bookmark"/></svg><span>Мои поиски</span><span id="saved-nav-count" class="nav-count" hidden></span></button></div></nav>
+  <nav id="app-nav" class="bottom-nav" aria-label="Основная навигация" hidden><div class="nav-inner"><button class="nav-button active" type="button" data-view="search" aria-current="page"><svg class="icon"><use href="#i-search"/></svg><span>Поиск</span></button><button class="nav-button" type="button" data-view="deals"><svg class="icon"><use href="#i-trend"/></svg><span>Падения</span></button><button class="nav-button" type="button" data-view="saved"><svg class="icon"><use href="#i-bookmark"/></svg><span>Мои поиски</span><span id="saved-nav-count" class="nav-count" hidden></span></button></div></nav>
 
   <dialog id="save-dialog" class="sheet" aria-labelledby="save-title"><form id="save-form"><div class="sheet-header"><div><div class="eyebrow">НЕ ПРОПУСТИТЬ СВОЮ ЦЕНУ</div><h2 id="save-title">Следить за поиском</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Закрыть"><svg class="icon"><use href="#i-close"/></svg></button></div><p id="save-filters-summary" class="sheet-summary"></p><label class="field">Название<input name="name" type="text" maxlength="100" required placeholder="Например, неделя у моря"></label>
       <fieldset class="notification-modes"><legend>О чём сообщать</legend><label><input type="radio" name="notify_mode" value="deal" checked><span><strong>О заметной выгоде</strong><small>Снижение по нашей истории + хорошие отзывы</small></span></label><label><input type="radio" name="notify_mode" value="budget"><span><strong>О турах в бюджете</strong><small>Новое совпадение с вашими параметрами</small></span></label><label><input type="radio" name="notify_mode" value="both"><span><strong>Об обоих вариантах</strong><small>Выгодные предложения и совпадения по бюджету</small></span></label></fieldset>

@@ -73,6 +73,7 @@ class PostgreSQLMigrationConnection:
                 "price_snapshots": ["offer_id", "fetched_at", "id"],
                 "subscriptions": ["owner_id", "enabled"],
                 "telegram_deliveries": ["owner_id", "sent_at"],
+                "telegram_access_requests": ["status", "requested_at"],
             }[table]
             if name in self.created:
                 value = valid_index(columns) if self.built is None else self.built
@@ -99,7 +100,7 @@ def test_postgresql_builds_indexes_in_autocommit_and_verifies_catalog(monkeypatc
     connection = PostgreSQLMigrationConnection()
     postgres_engine(monkeypatch, connection)
     migrate.main()
-    assert connection.created == ["idx_snapshots_latest", "idx_subscriptions_owner", "idx_telegram_delivery_owner"]
+    assert connection.created == ["idx_snapshots_latest", "idx_subscriptions_owner", "idx_telegram_delivery_owner", "idx_telegram_access_status"]
     assert "ready" in capsys.readouterr().out
 
 

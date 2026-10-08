@@ -48,6 +48,7 @@ def main():
         ("idx_snapshots_latest", "price_snapshots", "offer_id,fetched_at,id"),
         ("idx_subscriptions_owner", "subscriptions", "owner_id,enabled"),
         ("idx_telegram_delivery_owner", "telegram_deliveries", "owner_id,sent_at"),
+        ("idx_telegram_access_status", "telegram_access_requests", "status,requested_at"),
     ]
     if engine.dialect.name == "postgresql":
         with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:

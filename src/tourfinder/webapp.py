@@ -1,4 +1,4 @@
-"""Public tour browsing and authenticated personal Telegram Mini App APIs."""
+"""Tour browsing and personal APIs for owner-approved Telegram accounts."""
 import hmac
 import json
 import os
@@ -12,7 +12,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from . import db, meals, queries, reviews
-from .telegram_bot import (InitDataError, allowed_user_ids, bot_token, now_iso,
+from .telegram_bot import (InitDataError, access_state, allowed_user_ids, bot_token, now_iso,
                            validate_init_data, webhook_response)
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -27,14 +27,38 @@ def get_conn():
 
 def require_user(request: Request) -> dict:
     if not bot_token() or not allowed_user_ids():
-        raise HTTPException(503, "Telegram ещё не настроен. Поиск доступен без входа.")
+        raise HTTPException(503, "Telegram ещё не настроен.")
     try:
         user = validate_init_data(request.headers.get("X-Telegram-Init-Data", ""), bot_token())
     except InitDataError:
         raise HTTPException(401, "Открой приложение заново через Telegram.") from None
-    if str(user["id"]) not in allowed_user_ids():
-        raise HTTPException(403, "Это личный бот. Доступ этому аккаунту не выдан.")
+    if str(user["id"]) in allowed_user_ids():
+        return user
+    conn = None
+    try:
+        conn = get_conn()
+        state = access_state(conn, user["id"])
+    except Exception:
+        raise HTTPException(503, "Не удалось проверить доступ. Попробуй позже.") from None
+    finally:
+        if conn is not None:
+            conn.close()
+    if state != "approved":
+        raise HTTPException(403, {"code": "access_required", "access_state": state,
+                                 "message": "Доступ к боту выдаёт владелец. Нажми /start в боте."})
     return user
+
+
+def demo_browsing() -> bool:
+    url = os.environ.get("DATABASE_URL", "")
+    return (os.environ.get("TOURFINDER_DEMO") == "1" and not bot_token()
+            and not os.environ.get("VERCEL") and (not url or url.startswith("sqlite:")))
+
+
+def require_browsing_user(request: Request):
+    if demo_browsing():
+        return None
+    return require_user(request)
 
 
 class SearchFilters(BaseModel):
@@ -99,23 +123,27 @@ def index():
 
 @app.get("/app")
 def miniapp(request: Request):
-    conn = get_conn()
+    conn = None
     try:
+        conn = get_conn()
         countries = [dict(r) for r in conn.execute(
             "SELECT DISTINCT country_id,country_name FROM hotels WHERE country_id IS NOT NULL ORDER BY country_name")]
         boards = [dict(r) for r in conn.execute(
             "SELECT board_code,max(board_name) AS board_name FROM offers GROUP BY board_code ORDER BY board_code")]
+    except Exception:
+        countries, boards = [], []
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
     return templates.TemplateResponse(request, "miniapp.html", {
         "countries": countries, "boards": boards,
         "telegram_bot_username": os.environ.get("TELEGRAM_BOT_USERNAME", "").lstrip("@"),
         "telegram_enabled": bool(bot_token() and allowed_user_ids()),
-        "demo_mode": os.environ.get("TOURFINDER_DEMO") == "1",
+        "demo_mode": demo_browsing(),
     })
 
 
-@app.get("/api/search")
+@app.get("/api/search", dependencies=[Depends(require_browsing_user)])
 def search(request: Request, date_from: date, date_till: date,
            adults: int = 2, children_ages: str | None = None,
            nights_min: int = 1, nights_max: int = 30, budget_max: int | None = None,
@@ -147,7 +175,7 @@ def search(request: Request, date_from: date, date_till: date,
     return {"count": len(rows), "results": rows, "available_compositions": compositions, "queued_spec": None}
 
 
-@app.get("/api/drops")
+@app.get("/api/drops", dependencies=[Depends(require_browsing_user)])
 def drops(adults: int = Query(2, ge=1, le=6), children_ages: str | None = Query(None, max_length=20),
           hours: int = Query(72, ge=1, le=72), limit: int = Query(100, ge=1, le=100)):
     try:
@@ -168,7 +196,7 @@ def drops(adults: int = Query(2, ge=1, le=6), children_ages: str | None = Query(
         conn.close()
 
 
-@app.get("/api/compositions")
+@app.get("/api/compositions", dependencies=[Depends(require_browsing_user)])
 def compositions():
     conn = get_conn()
     try:
@@ -177,7 +205,7 @@ def compositions():
         conn.close()
 
 
-@app.get("/api/offers/{offer_id}/history")
+@app.get("/api/offers/{offer_id}/history", dependencies=[Depends(require_browsing_user)])
 def offer_history(offer_id: int):
     conn = get_conn()
     try:
@@ -193,7 +221,7 @@ def offer_history(offer_id: int):
         conn.close()
 
 
-@app.get("/api/offers/{offer_id}")
+@app.get("/api/offers/{offer_id}", dependencies=[Depends(require_browsing_user)])
 def get_offer_detail(offer_id: int):
     conn = get_conn()
     try:
@@ -228,13 +256,20 @@ def request_pax(payload: dict = Body(...), user: dict = Depends(require_user)):
 
 @app.get("/api/telegram/session")
 def session(user: dict = Depends(require_user)):
-    conn = get_conn()
+    owner = str(user["id"]) in allowed_user_ids()
+    conn, can_notify = None, False
     try:
+        conn = get_conn()
         row = conn.execute("SELECT can_notify FROM telegram_users WHERE user_id=:id", {"id": str(user["id"])}).fetchone()
-        return {"user": user, "can_notify": bool(row and row["can_notify"]),
-                "bot_username": os.environ.get("TELEGRAM_BOT_USERNAME", "").lstrip("@")}
+        can_notify = bool(row and row["can_notify"])
+    except Exception:
+        if not owner:
+            raise HTTPException(503, "Не удалось проверить уведомления. Попробуй позже.") from None
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
+    return {"user": user, "can_notify": can_notify, "is_owner": owner, "is_admin": owner,
+            "bot_username": os.environ.get("TELEGRAM_BOT_USERNAME", "").lstrip("@")}
 
 
 @app.post("/api/telegram/webhook")

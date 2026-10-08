@@ -64,3 +64,22 @@ body[data-theme=dark]{color-scheme:dark;--bg:#172029;--surface:#202c36;--text:#e
 .offer-sheet .offer-booking .button{flex:1;width:auto;margin:0;font-size:11px;min-height:46px;padding:10px}
 @media(min-width:700px){.meal-chips{grid-template-columns:repeat(4,minmax(0,1fr))}.meal-chip span{min-height:65px}.offer-sheet{padding:0;max-height:90dvh}.offer-body{padding:24px}.offer-sheet-header{padding:18px 24px}.offer-photo{aspect-ratio:2}.offer-booking{padding:14px 24px}.offer-hotel-title{font-size:29px}}
 @media(max-width:360px){.offer-body{padding:16px}.offer-booking{gap:8px;padding-left:14px;padding-right:14px}.offer-booking-price strong{font-size:20px}.offer-sheet .offer-booking .button{font-size:10px}.offer-specs{column-gap:12px;padding-left:10px;padding-right:10px}.meal-chip span{padding:9px}}
+
+/* Access is closed until the server confirms an approved Telegram session. */
+.access-restricted .app-shell{padding-bottom:32px}
+.access-gate{max-width:540px;margin:clamp(24px,6vh,65px) auto 24px;padding:0 8px;text-align:center}
+.access-gate>.eyebrow{justify-content:center;font-size:9px;letter-spacing:.15em;margin:25px 0 13px}
+.access-gate h1{font-size:clamp(33px,8.5vw,48px);line-height:1.1;margin:0 0 22px;overflow-wrap:anywhere}
+.access-gate>p{font-size:13px;color:var(--muted);max-width:425px;margin:0 auto;line-height:1.8}
+.gate-mark{width:74px;height:74px;border:1px solid var(--line);border-radius:24px;background:var(--surface);box-shadow:var(--shadow);display:grid;place-items:center;margin:0 auto;transform:rotate(-5deg);color:var(--accent)}
+.gate-mark>.icon{width:29px;height:29px;transform:rotate(5deg)}
+.gate-mark>.spinner{margin:0}
+.gate-actions{display:flex;flex-direction:column;gap:10px;max-width:330px;margin:27px auto 19px}
+.gate-actions .button{min-height:48px;font-size:12px}
+.access-gate>.gate-footnote{font-size:10px;max-width:330px;line-height:1.7}
+.gate-decoration{display:flex;align-items:center;justify-content:center;gap:15px;margin:44px auto 0;color:var(--accent);opacity:.55}
+.gate-decoration .icon{width:19px;height:19px}
+.gate-decoration>span{width:90px;border-top:1px dashed var(--muted)}
+.gate-decoration .icon:last-child{color:#b89049;width:23px;height:23px}
+.owner-note{background:var(--accent-soft);border-color:transparent}
+@media(max-width:360px){.access-gate{padding:0;margin-top:24px}.access-gate>p{font-size:12px}.gate-mark{width:64px;height:64px;border-radius:20px}.gate-decoration{margin-top:30px}}

@@ -311,3 +311,26 @@ def test_dry_run_connection_does_not_create_or_migrate_schema(conn, tmp_path, mo
     with pytest.raises(ValueError, match="does not exist"):
         delivery._readonly_connection(f"sqlite:///{missing.as_posix()}")
     assert not missing.exists()
+
+
+def test_persisted_approval_enables_delivery_without_expanding_admin_environment(conn):
+    pending(conn, owner="789")
+    conn.execute("""INSERT INTO telegram_access_requests(user_id,status,first_name,requested_at)
+        VALUES ('789','approved','Approved fixture',:now)""", {"now": delivery._iso(NOW)})
+    conn.commit()
+    bot = client()
+    result = delivery.run_worker(conn, client=bot, now=NOW)
+    assert result["sent"] == 1
+    assert bot.call.call_args.kwargs["chat_id"] == "789"
+    assert delivery.allowed_user_ids() == {"123", "456"}
+
+
+def test_claim_rechecks_revoked_access_even_when_worker_cached_approval(conn):
+    pending(conn, owner="789")
+    conn.execute("""INSERT INTO telegram_access_requests(user_id,status,first_name,requested_at)
+        VALUES ('789','denied','Revoked fixture',:now)""", {"now": delivery._iso(NOW)})
+    conn.commit()
+    row, reason = delivery._claim(conn, 1, {"123", "456", "789"}, NOW)
+    assert row is None and reason == "owner_not_allowed"
+    assert state(conn)["status"] == "discarded"
+    assert state(conn)["attempts"] == 0

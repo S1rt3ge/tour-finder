@@ -176,6 +176,17 @@ Table(
 )
 
 Table(
+    "telegram_access_requests", metadata,
+    Column("user_id", Text, primary_key=True),
+    Column("status", Text, nullable=False, server_default="pending"),
+    Column("first_name", Text, nullable=False, server_default=""),
+    Column("requested_at", Text, nullable=False),
+    Column("decided_at", Text),
+    Column("decided_by", Text),
+    Index("idx_telegram_access_status", "status", "requested_at"),
+)
+
+Table(
     "telegram_updates", metadata,
     Column("update_id", Text, primary_key=True),
     Column("processed_at", Text, nullable=False),
