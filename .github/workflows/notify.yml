@@ -19,11 +19,13 @@ concurrency:
 
 jobs:
   notify:
-    # workflow_run can carry secrets: accept only this repository's successful
-    # main collector. Scheduled and explicitly dispatched runs remain allowed.
+    # workflow_run can carry secrets: accept only this repository's completed
+    # main collector. A freshness/backlog failure must not hide completed tasks;
+    # the worker independently verifies every candidate's freshness and quality.
+    # Scheduled and explicitly dispatched runs remain allowed.
     if: >-
       github.event_name != 'workflow_run' ||
-      (github.event.workflow_run.conclusion == 'success' &&
+      ((github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure') &&
        github.event.workflow_run.head_branch == 'main' &&
        github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest

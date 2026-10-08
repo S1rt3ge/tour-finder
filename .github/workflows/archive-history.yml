@@ -9,6 +9,10 @@ on:
         options: [export, prune]
         default: export
         required: true
+      maintenance:
+        description: One-time larger prune budget (requires mode prune and explicit pruning opt-in)
+        type: boolean
+        default: false
   schedule:
     - cron: '17 4 * * *'
 
@@ -16,7 +20,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: archive-history
+  group: collect
   cancel-in-progress: false
 
 jobs:
@@ -30,6 +34,7 @@ jobs:
       ARCHIVE_ROTATION_ENABLED: ${{ vars.ARCHIVE_ROTATION_ENABLED }}
       ARCHIVE_PRUNE_ENABLED: ${{ vars.ARCHIVE_PRUNE_ENABLED }}
       REQUESTED_MODE: ${{ inputs.mode || 'prune' }}
+      MAINTENANCE: ${{ inputs.maintenance && 'true' || 'false' }}
     steps:
       - name: Check configuration and explicit schedule opt-in
         id: configuration
@@ -46,6 +51,10 @@ jobs:
           if [[ "$REQUESTED_MODE" == prune && "$ARCHIVE_PRUNE_ENABLED" != true ]]; then
             echo 'Pruning is not enabled; select export for a read-only source export.'
             exit 0
+          fi
+          if [[ "$MAINTENANCE" == true && ( "$GITHUB_EVENT_NAME" != workflow_dispatch || "$REQUESTED_MODE" != prune ) ]]; then
+            echo 'Maintenance requires an explicit manual prune run.'
+            exit 1
           fi
           echo 'ready=true' >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -65,5 +74,9 @@ jobs:
         if: steps.configuration.outputs.ready == 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python -m tourfinder.archive_rotation --mode "$REQUESTED_MODE"
+        shell: bash
+        run: |
+          args=(--mode "$REQUESTED_MODE")
+          if [[ "$MAINTENANCE" == true ]]; then args+=(--maintenance); fi
+          python -m tourfinder.archive_rotation "${args[@]}"
       # Plaintext databases and deletion plans are never uploaded as artifacts.

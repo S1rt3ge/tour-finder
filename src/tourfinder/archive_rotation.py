@@ -36,6 +36,10 @@ TRIGGER_BYTES = 350 * fmt.MIB
 TARGET_BYTES = 300 * fmt.MIB
 CHUNK_ROWS = 1000
 PROGRESS_ROWS = 250_000
+PRUNE_BATCH_OFFERS = 250
+PRUNE_BATCH_ROWS = 5_000
+PRUNE_SINGLE_OFFER_ROWS = 10_000
+RUN_BUDGET_SECONDS = 42 * 60
 
 HOTEL_COLUMNS = tuple("source source_hotel_id name category country_id country_name city_name latitude longitude photo_url".split())
 OFFER_COLUMNS = tuple("source source_hotel_id origin_id origin_name date_start date_end nights board_code board_name room_code room_name room_placement pax_adl pax_chd children_ages operator link first_seen_at last_seen_at".split())
@@ -472,16 +476,139 @@ def _same_public_row(actual, expected, columns):
     return all(actual.get(name) == expected.get(name) for name in columns)
 
 
-def _write_transaction(conn):
+class _PruneDeadline(Exception):
+    """Roll back a batch when its client-side deadline expires."""
+
+
+def _require_prune_time(deadline):
+    if time.monotonic() >= deadline:
+        raise _PruneDeadline()
+
+
+def _write_transaction(conn, deadline):
+    _require_prune_time(deadline)
     conn.execute("SET TRANSACTION READ WRITE")
     conn.execute("SET LOCAL lock_timeout='3s'")
-    conn.execute("SET LOCAL statement_timeout='30s'")
+    milliseconds = max(1, min(30_000, int((deadline - time.monotonic()) * 1000)))
+    conn.execute(f"SET LOCAL statement_timeout='{milliseconds}ms'")
+
+
+def _prune_batches(plan, stats):
+    """Stream the plan once; missing/protected offers never consume delete caps."""
+    candidates = plan.execute("""SELECT o.* FROM offers o WHERE o.expired=1 OR EXISTS
+        (SELECT 1 FROM snapshots s WHERE s.offer_id=o.source_id AND s.eligible=1)
+        ORDER BY o.expired DESC,o.source_id""")
+    batch, rows = [], 0
+    for item in candidates:
+        if item["snapshots"] > PRUNE_SINGLE_OFFER_ROWS:
+            stats["oversized_offers"] += 1
+            continue
+        if batch and (len(batch) >= PRUNE_BATCH_OFFERS or rows + item["snapshots"] > PRUNE_BATCH_ROWS):
+            yield batch
+            batch, rows = [], 0
+        batch.append(item)
+        rows += item["snapshots"]
+    if batch:
+        yield batch
+
+
+def _prune_batch(conn, plan, items, *, available_snapshots, available_offers, deadline):
+    """One bounded transaction; return counts only after its commit succeeds.
+
+    The table locks protect expired-offer deletion even without foreign keys.
+    Every candidate's complete rowset is compared with its verified export;
+    changed, newly polled, reused-ID, or alert-referenced offers are skipped.
+    """
+    expected = {}
+    for item in items:
+        if item["expired"] and available_offers <= 0:
+            continue
+        if item["expired"] and item["snapshots"] > available_snapshots:
+            continue
+        _require_prune_time(deadline)
+        rows = {r["source_id"]: (json.loads(r["payload"]), r["eligible"], r["observation_key"])
+                for r in plan.execute("SELECT * FROM snapshots WHERE offer_id=?", (item["source_id"],))}
+        expected[item["source_id"]] = (item, json.loads(item["payload"]), rows)
+    result = {"deleted_snapshots": 0, "deleted_offers": 0, "changed_or_protected": 0, "already_absent": 0}
+    if not expected:
+        return result
+    ids = sorted(expected)
+    with conn.transaction():
+        _write_transaction(conn, deadline)
+        actual = conn.execute(f'SELECT id,{",".join(OFFER_COLUMNS)} FROM public.offers WHERE id = ANY(%s) ORDER BY id FOR UPDATE',
+                              (ids,)).fetchall()
+        actual = {row["id"]: row for row in actual}
+        valid = []
+        for offer_id in ids:
+            if offer_id not in actual:
+                result["already_absent"] += 1
+            elif not _same_public_row(actual[offer_id], expected[offer_id][1], OFFER_COLUMNS):
+                result["changed_or_protected"] += 1
+            else:
+                valid.append(offer_id)
+        expired = [offer_id for offer_id in valid if expected[offer_id][0]["expired"]]
+        if expired:
+            _require_prune_time(deadline)
+            conn.execute("LOCK TABLE public.alerts IN SHARE MODE")
+            conn.execute("LOCK TABLE public.price_snapshots IN SHARE ROW EXCLUSIVE MODE")
+            protected = {row["offer_id"] for row in conn.execute(
+                "SELECT DISTINCT offer_id FROM public.alerts WHERE offer_id = ANY(%s)", (expired,)).fetchall()}
+            result["changed_or_protected"] += len(protected)
+            valid = [offer_id for offer_id in valid if offer_id not in protected]
+        if not valid:
+            _require_prune_time(deadline)
+            return result
+        _require_prune_time(deadline)
+        # One extra row detects growth without loading an unbounded rowset.
+        expected_count = sum(len(expected[offer_id][2]) for offer_id in valid)
+        current_rows = conn.execute(
+            f'SELECT id,{",".join(SNAPSHOT_COLUMNS)} FROM public.price_snapshots WHERE offer_id = ANY(%s) ORDER BY offer_id,id LIMIT %s FOR UPDATE',
+            (valid, expected_count + 1)).fetchall()
+        if len(current_rows) > expected_count:
+            result["changed_or_protected"] += len(valid)
+            _require_prune_time(deadline)
+            return result
+        by_offer = {offer_id: [] for offer_id in valid}
+        for row in current_rows:
+            by_offer[row["offer_id"]].append(row)
+        snapshot_ids, offer_ids = [], []
+        for offer_id in valid:
+            item, _, expected_rows = expected[offer_id]
+            rows = by_offer[offer_id]
+            if (len(rows) != len(expected_rows) or any(r["id"] not in expected_rows
+                    or not _same_public_row(r, expected_rows[r["id"]][0], SNAPSHOT_COLUMNS)
+                    or fmt.observation_key(item["offer_key"], dict(r)) != expected_rows[r["id"]][2] for r in rows)):
+                result["changed_or_protected"] += 1
+                continue
+            remaining = available_snapshots - len(snapshot_ids)
+            eligible = [key for key, value in expected_rows.items() if item["expired"] or value[1]]
+            if item["expired"]:
+                if len(offer_ids) >= available_offers or len(eligible) > remaining:
+                    continue
+                offer_ids.append(offer_id)
+            snapshot_ids.extend(eligible[:remaining])
+        if snapshot_ids:
+            _require_prune_time(deadline)
+            deleted = conn.execute("DELETE FROM public.price_snapshots WHERE id = ANY(%s)", (snapshot_ids,))
+            if deleted.rowcount != len(snapshot_ids):
+                raise fmt.ArchiveError("archive_delete_count_mismatch")
+        if offer_ids:
+            _require_prune_time(deadline)
+            deleted = conn.execute("DELETE FROM public.offers WHERE id = ANY(%s)", (offer_ids,))
+            if deleted.rowcount != len(offer_ids):
+                raise fmt.ArchiveError("archive_delete_count_mismatch")
+        _require_prune_time(deadline)
+        result["deleted_snapshots"], result["deleted_offers"] = len(snapshot_ids), len(offer_ids)
+    return result
 
 
 def prune_verified(conn, export, receipt, *, max_snapshots=50_000, max_offers=5_000, budget_seconds=600):
     if (not isinstance(receipt, VerifiedPublication) or receipt.dataset_id != export.dataset_id
             or receipt.generation != export.generation or not fmt.HEX.fullmatch(receipt.manifest_sha256)):
         raise fmt.ArchiveError("archive_verified_publication_required")
+    if (not 0 <= max_snapshots <= 3_000_000 or not 0 <= max_offers <= 300_000
+            or not 0 <= budget_seconds <= 900):
+        raise fmt.ArchiveError("archive_prune_limit_invalid")
     plan = fmt.open_readonly(export.plan)
     metadata = dict(plan.execute("SELECT key,value FROM plan_metadata"))
     if metadata["dataset_id"] != receipt.dataset_id or metadata["generation"] != receipt.generation:
@@ -489,6 +616,7 @@ def prune_verified(conn, export, receipt, *, max_snapshots=50_000, max_offers=5_
         raise fmt.ArchiveError("archive_deletion_plan_mismatch")
     before = int(metadata["database_bytes"])
     stats = {"deleted_snapshots": 0, "deleted_offers": 0, "changed_or_protected": 0,
+             "already_absent": 0, "oversized_offers": 0, "batches": 0,
              "estimated_reusable_bytes": 0, "physical_reclaim_pending": True}
     remaining = max(0, before - TARGET_BYTES)
     snapshot_total = export.counts["snapshots"]
@@ -499,64 +627,26 @@ def prune_verified(conn, export, receipt, *, max_snapshots=50_000, max_offers=5_
     try:
         if before < TRIGGER_BYTES:
             return stats | {"skipped": "below_trigger"}
-        # One short transaction per offer keeps round trips bounded. Compare
-        # every exported observation before deleting any of that offer's rows:
-        # a concurrent new poll, backfill or changed state skips the whole offer.
-        offers = plan.execute("""SELECT o.* FROM offers o WHERE o.expired=1 OR EXISTS
-            (SELECT 1 FROM snapshots s WHERE s.offer_id=o.source_id AND s.eligible=1)
-            ORDER BY o.expired DESC,o.source_id""")
-        expired_attempts = 0
-        for item in offers:
+        for items in _prune_batches(plan, stats):
             available = max_snapshots - stats["deleted_snapshots"]
             if (available <= 0 or time.monotonic() >= deadline
                     or stats["estimated_reusable_bytes"] >= remaining):
                 break
-            if item["expired"]:
-                if expired_attempts >= max_offers:
+            if stats["deleted_offers"] >= max_offers:
+                items = [item for item in items if not item["expired"]]
+                if not items:
                     continue
-                expired_attempts += 1
-                if item["snapshots"] > available:
-                    continue
-            expected_offer = json.loads(item["payload"])
-            expected_rows = {r["source_id"]: (json.loads(r["payload"]), r["eligible"], r["observation_key"])
-                             for r in plan.execute("SELECT * FROM snapshots WHERE offer_id=?", (item["source_id"],))}
-            ids = [key for key, value in expected_rows.items() if item["expired"] or value[1]][:available]
-            if not ids:
-                continue
-            with conn.transaction():
-                _write_transaction(conn)
-                actual = conn.execute(f'SELECT id,{",".join(OFFER_COLUMNS)} FROM public.offers WHERE id=%s FOR UPDATE',
-                                      (item["source_id"],)).fetchone()
-                if actual is None or not _same_public_row(actual, expected_offer, OFFER_COLUMNS):
-                    stats["changed_or_protected"] += 1
-                    continue
-                if item["expired"]:
-                    # These bounded locks cover writers without a foreign key,
-                    # too: no new alert or snapshot can race the final delete.
-                    # A busy collector causes a 3s lock timeout and rolls back.
-                    conn.execute("LOCK TABLE public.alerts IN SHARE MODE")
-                    conn.execute("LOCK TABLE public.price_snapshots IN SHARE ROW EXCLUSIVE MODE")
-                    if conn.execute("SELECT 1 FROM public.alerts WHERE offer_id=%s LIMIT 1", (item["source_id"],)).fetchone():
-                        stats["changed_or_protected"] += 1
-                        continue
-                rows = conn.execute(f'SELECT id,{",".join(SNAPSHOT_COLUMNS)} FROM public.price_snapshots WHERE offer_id=%s ORDER BY id FOR UPDATE',
-                                    (item["source_id"],)).fetchall()
-                if (len(rows) != len(expected_rows) or any(r["id"] not in expected_rows
-                        or not _same_public_row(r, expected_rows[r["id"]][0], SNAPSHOT_COLUMNS)
-                        or fmt.observation_key(item["offer_key"], dict(r)) != expected_rows[r["id"]][2] for r in rows)):
-                    stats["changed_or_protected"] += 1
-                    continue
-                deleted = conn.execute("DELETE FROM public.price_snapshots WHERE id = ANY(%s)", (ids,))
-                if deleted.rowcount != len(ids):
-                    raise fmt.ArchiveError("archive_delete_count_mismatch")
-                if item["expired"]:
-                    deleted = conn.execute("DELETE FROM public.offers WHERE id=%s", (item["source_id"],))
-                    if deleted.rowcount != 1:
-                        raise fmt.ArchiveError("archive_delete_count_mismatch")
-            # Counts are reported only after the write transaction commits.
-            stats["deleted_snapshots"] += len(ids)
-            stats["deleted_offers"] += int(item["expired"])
-            stats["estimated_reusable_bytes"] += round(per_snapshot * len(ids) + per_offer * int(item["expired"]))
+            started = time.monotonic()
+            try:
+                result = _prune_batch(conn, plan, items, available_snapshots=available,
+                    available_offers=max_offers - stats["deleted_offers"], deadline=deadline)
+            except _PruneDeadline:
+                break
+            for key, value in result.items():
+                stats[key] += value
+            stats["batches"] += 1
+            stats["estimated_reusable_bytes"] += round(per_snapshot * result["deleted_snapshots"] + per_offer * result["deleted_offers"])
+            emit("prune_progress", **stats, batch_seconds=round(time.monotonic() - started, 3))
         return stats | {"time_budget_reached": time.monotonic() >= deadline}
     finally:
         plan.close()
@@ -565,12 +655,21 @@ def prune_verified(conn, export, receipt, *, max_snapshots=50_000, max_offers=5_
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("export", "prune"), default="export")
-    parser.add_argument("--max-snapshots", type=int, default=50_000)
-    parser.add_argument("--max-offers", type=int, default=5_000)
+    parser.add_argument("--maintenance", action="store_true", help="Explicit one-time larger prune budget; never scheduled")
+    parser.add_argument("--max-snapshots", type=int)
+    parser.add_argument("--max-offers", type=int)
+    parser.add_argument("--prune-budget-seconds", type=int)
     args = parser.parse_args(argv)
     stage = "configuration"
+    run_deadline = time.monotonic() + RUN_BUDGET_SECONDS
     try:
-        if not 0 <= args.max_snapshots <= 100_000 or not 0 <= args.max_offers <= 20_000:
+        if args.maintenance and (args.mode != "prune" or os.environ.get("GITHUB_EVENT_NAME") == "schedule"):
+            raise fmt.ArchiveError("archive_maintenance_requires_manual_prune")
+        snapshot_cap, offer_cap, time_cap = (3_000_000, 300_000, 900) if args.maintenance else (100_000, 20_000, 600)
+        max_snapshots = args.max_snapshots if args.max_snapshots is not None else (3_000_000 if args.maintenance else 50_000)
+        max_offers = args.max_offers if args.max_offers is not None else (300_000 if args.maintenance else 5_000)
+        prune_budget = args.prune_budget_seconds if args.prune_budget_seconds is not None else time_cap
+        if not 0 <= max_snapshots <= snapshot_cap or not 0 <= max_offers <= offer_cap or not 0 <= prune_budget <= time_cap:
             raise fmt.ArchiveError("archive_prune_limit_invalid")
         if args.mode == "prune" and os.environ.get("ARCHIVE_PRUNE_ENABLED") != "true":
             raise fmt.ArchiveError("archive_prune_not_enabled")
@@ -620,7 +719,8 @@ def main(argv=None):
             if args.mode == "prune":
                 stage = "prune"
                 with connect_source(url) as conn:
-                    result = prune_verified(conn, export, receipt, max_snapshots=args.max_snapshots, max_offers=args.max_offers)
+                    result = prune_verified(conn, export, receipt, max_snapshots=max_snapshots, max_offers=max_offers,
+                        budget_seconds=min(prune_budget, max(0, run_deadline - time.monotonic())))
                 emit("prune", **result)
             emit("complete", mode=args.mode, verified=True)
         return 0
