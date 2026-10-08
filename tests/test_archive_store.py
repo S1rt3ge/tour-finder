@@ -124,6 +124,60 @@ def test_stable_identity_ignores_numeric_ids_labels_and_sorted_child_order():
     assert fmt.history_shard(fmt.offer_key(value)) == int(fmt.offer_key(value), 16) % 64
 
 
+@pytest.mark.parametrize("field,value", [
+    ("source", "waavo"), ("source_hotel_id", "other-hotel"), ("origin_id", "VNO"),
+    ("date_start", "2026-10-21"), ("nights", 8), ("board_code", "HB"),
+    ("room_code", "suite"), ("room_placement", "family"), ("pax_adl", 3),
+    ("pax_chd", 1), ("children_ages", "7"),
+])
+def test_narrow_tuple_validation_still_checks_every_identity_field(tmp_path, field, value):
+    catalog = tmp_path / "identity.sqlite"
+    make_catalog(catalog)
+    with sqlite3.connect(catalog) as conn:
+        conn.execute(f"UPDATE offers SET {field}=?", (value,))
+        if field in {"source", "source_hotel_id"}:
+            conn.execute(f"UPDATE hotels SET {field}=?", (value,))
+        if field in {"pax_chd", "children_ages"}:
+            conn.execute("UPDATE offers SET pax_chd=1,children_ages='7'")
+    with pytest.raises(fmt.ArchiveError, match="identity_mismatch"):
+        fmt.validate_sqlite(catalog, dataset_id=DATASET, kind="catalog")
+
+
+def test_validation_cache_and_narrow_query_do_not_change_normal_read_connections(tmp_path, monkeypatch):
+    catalog = tmp_path / "catalog.sqlite"
+    make_catalog(catalog)
+    traced = []
+    original = fmt.open_readonly
+    def observed(path):
+        conn = original(path)
+        conn.set_trace_callback(traced.append)
+        return conn
+    monkeypatch.setattr(fmt, "open_readonly", observed)
+    assert fmt.validate_sqlite(catalog, dataset_id=DATASET, kind="catalog")["row_counts"]["offers"] == 1
+    key_query = next(sql for sql in traced if "k.offer_key FROM offers" in sql)
+    assert "o.*" not in key_query and "o.room_name" not in key_query
+    assert "PRAGMA integrity_check" in traced and "PRAGMA cache_size=-65536" in traced
+    with original(catalog) as conn:
+        assert conn.execute("PRAGMA cache_size").fetchone()[0] == -8192
+        assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
+
+
+def test_validation_keeps_original_thirty_second_interrupt(tmp_path, monkeypatch):
+    catalog = tmp_path / "deadline.sqlite"
+    make_catalog(catalog)
+    original = fmt.open_readonly
+    ticks = iter((0, 31))
+    monkeypatch.setattr(fmt.time, "monotonic", lambda: next(ticks, 31))
+    class FrequentProgress:
+        def __init__(self, path): self.conn = original(path)
+        def execute(self, *args): return self.conn.execute(*args)
+        def set_progress_handler(self, callback, interval): self.conn.set_progress_handler(callback, 1)
+        def close(self): self.conn.close()
+    monkeypatch.setattr(fmt, "open_readonly", FrequentProgress)
+    with pytest.raises(fmt.ArchiveError, match="archive_sqlite_invalid"):
+        fmt.validate_sqlite(catalog, dataset_id=DATASET, kind="catalog")
+
+
 def test_observation_dedup_keeps_changed_observation_despite_reused_id():
     key = fmt.offer_key(OFFER)
     assert fmt.observation_key(key, OBSERVATION) == fmt.observation_key(key, OBSERVATION | {"snapshot_id": 999, "run_id": 10})
