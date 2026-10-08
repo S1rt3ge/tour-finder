@@ -1,0 +1,78 @@
+name: Recover legacy fetch run 1589
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Read-only preflight, or close the one verified abandoned run
+        type: choice
+        options: [preflight, apply]
+        default: preflight
+        required: true
+      expected_fingerprint:
+        description: Exact fingerprint from reviewed preflight (apply only)
+        type: string
+      expected_started_at:
+        description: Exact started_at from reviewed preflight (apply only)
+        type: string
+      expected_source:
+        description: Exact source from reviewed preflight (apply only)
+        type: string
+      expected_tier:
+        description: Exact tier from reviewed preflight (apply only)
+        type: string
+      expected_pax:
+        description: Exact pax from reviewed preflight (apply only)
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+# Shares the collector's lock; it never cancels a running collection.
+concurrency:
+  group: collect
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Install standalone database driver
+        run: python -m pip install 'psycopg[binary]>=3.2,<4'
+      - name: Check or recover the exact legacy run
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GITHUB_TOKEN: ${{ github.token }}
+          RECOVERY_MODE: ${{ inputs.mode }}
+          EXPECTED_FINGERPRINT: ${{ inputs.expected_fingerprint }}
+          EXPECTED_STARTED_AT: ${{ inputs.expected_started_at }}
+          EXPECTED_SOURCE: ${{ inputs.expected_source }}
+          EXPECTED_TIER: ${{ inputs.expected_tier }}
+          EXPECTED_PAX: ${{ inputs.expected_pax }}
+        shell: bash
+        run: |
+          python scripts/recover_legacy_fetch_run.py \
+            --mode "$RECOVERY_MODE" \
+            --expected-fingerprint "$EXPECTED_FINGERPRINT" \
+            --expected-started-at "$EXPECTED_STARTED_AT" \
+            --expected-source "$EXPECTED_SOURCE" \
+            --expected-tier "$EXPECTED_TIER" \
+            --expected-pax "$EXPECTED_PAX"
+      # The separate private-legacy-recovery-1589.json stays on this runner.
+      # Never upload work/ wholesale: it contains raw before/after row images.
+      - name: Retain only the public recovery summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: legacy-fetch-run-1589-${{ github.run_id }}-${{ github.run_attempt }}
+          path: work/legacy-recovery-1589.json
+          if-no-files-found: warn
+          retention-days: 30

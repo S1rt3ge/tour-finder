@@ -51,7 +51,7 @@ class Source:
                        "hotel_reviews": [], "price_snapshots": observations or [observation(i) for i in range(1, 6)]}
         if empty:
             self.tables = {key: [] for key in self.tables}
-        self.sql, self.alerts, self.rollbacks = [], False, 0
+        self.sql, self.alerts, self.rollbacks, self.commits = [], set(), 0, 0
 
     @contextmanager
     def transaction(self):
@@ -62,6 +62,8 @@ class Source:
             self.tables = original
             self.rollbacks += 1
             raise
+        else:
+            self.commits += 1
 
     def cursor(self, name):
         source = self
@@ -85,11 +87,12 @@ class Source:
         if "pg_export_snapshot" in sql:
             return Result([META])
         if "FROM public.alerts" in sql:
-            return Result([{"protected": 1}] if self.alerts else [])
+            return Result([{"offer_id": value} for value in params[0] if self.alerts is True or value in self.alerts])
         if sql.startswith("SELECT") and "FROM public.offers" in sql:
-            return Result([r for r in self.tables["offers"] if r["id"] == params[0]])
+            return Result(sorted([r for r in self.tables["offers"] if r["id"] in params[0]], key=lambda r: r["id"]))
         if sql.startswith("SELECT") and "FROM public.price_snapshots" in sql:
-            return Result([r for r in self.tables["price_snapshots"] if r["offer_id"] == params[0]])
+            return Result(sorted([r for r in self.tables["price_snapshots"] if r["offer_id"] in params[0]],
+                                 key=lambda r: (r["offer_id"], r["id"]))[:params[1]])
         if sql.startswith("DELETE FROM public.price_snapshots WHERE id = ANY"):
             ids = params[0]
             before = len(self.tables["price_snapshots"])
@@ -97,7 +100,7 @@ class Source:
             return Result(rowcount=before - len(self.tables["price_snapshots"]))
         if sql.startswith("DELETE FROM public.offers"):
             before = len(self.tables["offers"])
-            self.tables["offers"] = [r for r in self.tables["offers"] if r["id"] != params[0]]
+            self.tables["offers"] = [r for r in self.tables["offers"] if r["id"] not in params[0]]
             return Result(rowcount=before - len(self.tables["offers"]))
         raise AssertionError(sql)
 
@@ -281,6 +284,171 @@ def test_no_pruning_without_matching_verified_publication(tmp_path):
     assert source.sql == []
 
 
+def multiple_offers(tmp_path, count=4):
+    source = Source(empty=True)
+    source.tables["hotels"] = [dict(HOTEL)]
+    for index in range(1, count + 1):
+        source.tables["offers"].append(OFFER | {"id": index, "room_code": f"room-{index}", "date_start": "2026-09-01"})
+        source.tables["price_snapshots"].extend(observation(j, id=100 * index + j, offer_id=index) for j in range(1, 6))
+    export = rotation.export_projection(source, tmp_path, dataset_id=DATASET, generation="batch-fixture",
+        metadata=META | {"database_bytes": 2_000 * fmt.MIB}, now=NOW)
+    source.sql.clear()
+    return source, export
+
+
+def test_one_batch_verifies_and_deletes_multiple_offers_in_one_commit(tmp_path, capsys):
+    source, export = multiple_offers(tmp_path)
+    capsys.readouterr()
+    result = rotation.prune_verified(source, export, receipt(export))
+    assert result["deleted_offers"] == 4 and result["deleted_snapshots"] == 20
+    assert source.commits == result["batches"] == 1
+    assert not source.tables["offers"] and not source.tables["price_snapshots"]
+    assert sum(sql.startswith("SELECT") and "FROM public.price_snapshots" in sql for sql in source.sql) == 1
+    assert sum(sql.startswith("DELETE") for sql in source.sql) == 2
+    progress = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert len(progress) == 1 and progress[0]["stage"] == "prune_progress"
+    assert set(progress[0]) <= {"stage", "deleted_offers", "deleted_snapshots", "changed_or_protected",
+        "already_absent", "oversized_offers", "batches", "estimated_reusable_bytes", "physical_reclaim_pending", "batch_seconds"}
+
+
+def test_committed_delete_caps_ignore_absent_changed_and_alert_protected_offers(tmp_path, monkeypatch):
+    source, export = multiple_offers(tmp_path, 6)
+    monkeypatch.setattr(rotation, "PRUNE_BATCH_OFFERS", 2)
+    source.tables["offers"] = [row for row in source.tables["offers"] if row["id"] != 1]
+    source.tables["price_snapshots"] = [row for row in source.tables["price_snapshots"] if row["offer_id"] != 1]
+    source.tables["offers"][0]["room_code"] = "new-identity-reusing-id"
+    source.alerts = {3}
+    first = rotation.prune_verified(source, export, receipt(export), max_offers=1, max_snapshots=5)
+    assert first["deleted_offers"] == 1 and first["deleted_snapshots"] == 5
+    assert first["already_absent"] == 1 and first["changed_or_protected"] == 2
+    assert {row["id"] for row in source.tables["offers"]} == {2, 3, 5, 6}
+    # The same verified plan can continue in this process: already gone IDs do
+    # not exhaust a new committed-delete cap or reset traversal at a prefix.
+    second = rotation.prune_verified(source, export, receipt(export), max_offers=1, max_snapshots=5)
+    assert second["deleted_offers"] == 1 and second["deleted_snapshots"] == 5
+    assert {row["id"] for row in source.tables["offers"]} == {2, 3, 6}
+
+
+def test_expired_batch_never_partially_deletes_offer_when_snapshot_cap_small(tmp_path):
+    source, export = multiple_offers(tmp_path)
+    result = rotation.prune_verified(source, export, receipt(export), max_offers=4, max_snapshots=7)
+    assert result["deleted_offers"] == 1 and result["deleted_snapshots"] == 5
+    assert len(source.tables["offers"]) == 3 and len(source.tables["price_snapshots"]) == 15
+
+
+@pytest.mark.parametrize("race", ["new_poll", "reused_snapshot_id", "alert"])
+def test_batch_checks_concurrent_changes_after_offer_row_locks(tmp_path, race):
+    source, export = multiple_offers(tmp_path)
+    execute = source.execute
+    injected = False
+    def raced(sql, params=()):
+        nonlocal injected
+        if sql.startswith("LOCK TABLE public.price_snapshots") and not injected:
+            injected = True
+            if race == "new_poll":
+                source.tables["price_snapshots"].append(observation(6, id=999, offer_id=1))
+            elif race == "reused_snapshot_id":
+                source.tables["price_snapshots"][0]["price_cents"] = 77777
+            else:
+                source.alerts = {1}
+        return execute(sql, params)
+    source.execute = raced
+    result = rotation.prune_verified(source, export, receipt(export))
+    assert any(row["id"] == 1 for row in source.tables["offers"])
+    assert sum(row["offer_id"] == 1 for row in source.tables["price_snapshots"]) == (6 if race == "new_poll" else 5)
+    assert result["changed_or_protected"] >= 1
+    if race != "new_poll":
+        assert result["deleted_offers"] == 3
+    reads = [i for i, sql in enumerate(source.sql) if sql.startswith("SELECT") and "FROM public.price_snapshots" in sql]
+    assert source.sql.index("LOCK TABLE public.price_snapshots IN SHARE ROW EXCLUSIVE MODE") < reads[0]
+
+
+def test_batch_offer_delete_count_failure_rolls_back_snapshot_deletes_too(tmp_path):
+    source, export = multiple_offers(tmp_path)
+    execute = source.execute
+    def inconsistent(sql, params=()):
+        result = execute(sql, params)
+        if sql.startswith("DELETE FROM public.offers"):
+            result.rowcount -= 1
+        return result
+    source.execute = inconsistent
+    with pytest.raises(fmt.ArchiveError, match="delete_count_mismatch"):
+        rotation.prune_verified(source, export, receipt(export))
+    assert len(source.tables["offers"]) == 4 and len(source.tables["price_snapshots"]) == 20
+    assert source.rollbacks == 1 and source.commits == 0
+
+
+def test_conflicting_writer_lock_fails_closed_before_any_delete(tmp_path):
+    source, export = multiple_offers(tmp_path)
+    execute = source.execute
+    def busy(sql, params=()):
+        if sql.startswith("LOCK TABLE public.price_snapshots"):
+            raise rotation.psycopg.errors.LockNotAvailable("fixture lock conflict")
+        return execute(sql, params)
+    source.execute = busy
+    with pytest.raises(rotation.psycopg.errors.LockNotAvailable):
+        rotation.prune_verified(source, export, receipt(export))
+    assert source.rollbacks == 1 and source.commits == 0
+    assert not any(sql.startswith("DELETE") for sql in source.sql)
+    assert len(source.tables["offers"]) == 4 and len(source.tables["price_snapshots"]) == 20
+
+
+def test_deadline_after_snapshot_delete_rolls_back_entire_batch(tmp_path, monkeypatch):
+    source, export = multiple_offers(tmp_path)
+    clock = [0]
+    monkeypatch.setattr(rotation.time, "monotonic", lambda: clock[0])
+    execute = source.execute
+    def elapsed(sql, params=()):
+        result = execute(sql, params)
+        if sql.startswith("DELETE FROM public.price_snapshots"):
+            clock[0] = 2
+        return result
+    source.execute = elapsed
+    result = rotation.prune_verified(source, export, receipt(export), budget_seconds=1)
+    assert result["time_budget_reached"] and result["deleted_offers"] == result["deleted_snapshots"] == 0
+    assert source.rollbacks == 1 and len(source.tables["price_snapshots"]) == 20
+
+
+def test_deadline_between_batches_retains_only_committed_progress(tmp_path, monkeypatch):
+    source, export = multiple_offers(tmp_path)
+    monkeypatch.setattr(rotation, "PRUNE_BATCH_OFFERS", 2)
+    clock = [0]
+    monkeypatch.setattr(rotation.time, "monotonic", lambda: clock[0])
+    transaction = source.transaction
+    @contextmanager
+    def elapsed():
+        with transaction():
+            yield
+        clock[0] = 2
+    source.transaction = elapsed
+    result = rotation.prune_verified(source, export, receipt(export), budget_seconds=1)
+    assert result["time_budget_reached"] and result["deleted_offers"] == 2 and result["deleted_snapshots"] == 10
+    assert source.commits == 1 and source.rollbacks == 0
+    assert len(source.tables["offers"]) == 2
+
+
+def test_batch_snapshot_bound_splits_work_and_skips_oversized_offer(tmp_path, monkeypatch):
+    source, export = multiple_offers(tmp_path)
+    monkeypatch.setattr(rotation, "PRUNE_BATCH_ROWS", 9)
+    monkeypatch.setattr(rotation, "PRUNE_SINGLE_OFFER_ROWS", 5)
+    with sqlite3.connect(export.plan) as plan:
+        plan.execute("UPDATE offers SET snapshots=6 WHERE source_id=1")
+    result = rotation.prune_verified(source, export, receipt(export))
+    assert result["oversized_offers"] == 1 and result["deleted_offers"] == 3
+    assert source.commits == 3 and [row["id"] for row in source.tables["offers"]] == [1]
+
+
+@pytest.mark.parametrize("options", [
+    {"max_snapshots": 3_000_001}, {"max_offers": 300_001}, {"budget_seconds": 901},
+    {"max_snapshots": -1}, {"max_offers": -1}, {"budget_seconds": -1},
+])
+def test_prune_hard_limits_fail_before_source_transaction(tmp_path, options):
+    source, export = multiple_offers(tmp_path, 1)
+    with pytest.raises(fmt.ArchiveError, match="prune_limit_invalid"):
+        rotation.prune_verified(source, export, receipt(export), **options)
+    assert source.sql == []
+
+
 class Response:
     def __init__(self, body=b"", status=200):
         self.body, self.status_code = body, status
@@ -379,6 +547,64 @@ def test_main_requires_explicit_prune_flag_before_any_network(monkeypatch, capsy
     monkeypatch.setattr(rotation, "connect_source", lambda *_: pytest.fail("must not connect"))
     assert rotation.main(["--mode", "prune"]) == 1
     assert "archive_prune_not_enabled" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("arguments,event,code", [
+    (["--maintenance"], "workflow_dispatch", "maintenance_requires_manual_prune"),
+    (["--mode", "prune", "--maintenance"], "schedule", "maintenance_requires_manual_prune"),
+    (["--mode", "prune", "--max-offers", "300000"], "workflow_dispatch", "prune_limit_invalid"),
+    (["--mode", "prune", "--maintenance", "--max-snapshots", "3000001"], "workflow_dispatch", "prune_limit_invalid"),
+    (["--mode", "prune", "--maintenance", "--prune-budget-seconds", "901"], "workflow_dispatch", "prune_limit_invalid"),
+])
+def test_manual_maintenance_limits_are_validated_before_network(monkeypatch, capsys, arguments, event, code):
+    monkeypatch.setenv("GITHUB_EVENT_NAME", event)
+    monkeypatch.setattr(rotation, "connect_source", lambda *_: pytest.fail("must not connect"))
+    assert rotation.main(arguments) == 1
+    assert code in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("maintenance", [False, True])
+def test_main_exports_once_and_bounds_prune_to_remaining_job_time(tmp_path, monkeypatch, maintenance):
+    from types import SimpleNamespace
+    clock, calls = [0], []
+    monkeypatch.setattr(rotation.time, "monotonic", lambda: clock[0])
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("ARCHIVE_PRUNE_ENABLED", "true")
+    monkeypatch.setenv("TOUR_ARCHIVE_MANIFEST_URL", DEFAULT_MANIFEST_URL)
+    monkeypatch.setenv("APP_ARCHIVE_KEY", base64.b64encode(KEY).decode())
+    monkeypatch.setattr(rotation, "source_url", lambda: "unused-fixture")
+    @contextmanager
+    def connect(_url):
+        yield object()
+    @contextmanager
+    def snapshot(_conn):
+        yield META
+    monkeypatch.setattr(rotation, "connect_source", connect)
+    monkeypatch.setattr(rotation, "source_snapshot", snapshot)
+    monkeypatch.setattr(rotation, "Publisher", lambda _token: SimpleNamespace(current_pointer=lambda **_kwargs: None))
+    monkeypatch.setattr(rotation, "prepare_projection", lambda *_args, **_kwargs: None)
+    catalog = tmp_path / "fake-catalog"
+    catalog.write_bytes(b"fixture")
+    export = SimpleNamespace(counts={}, catalog=catalog)
+    def build(*_args, **_kwargs):
+        calls.append("export")
+        return export
+    def publish(actual, _publisher, **_kwargs):
+        assert actual is export
+        calls.append("publish")
+        clock[0] = rotation.RUN_BUDGET_SECONDS - 120
+        return "verified-fixture"
+    def prune(_conn, actual, verified, **kwargs):
+        assert actual is export and verified == "verified-fixture"
+        calls.append("prune")
+        assert kwargs == {"max_snapshots": 3_000_000 if maintenance else 50_000,
+            "max_offers": 300_000 if maintenance else 5_000, "budget_seconds": 120}
+        return {"deleted_snapshots": 0, "deleted_offers": 0}
+    monkeypatch.setattr(rotation, "export_projection", build)
+    monkeypatch.setattr(rotation, "publish_verified", publish)
+    monkeypatch.setattr(rotation, "prune_verified", prune)
+    assert rotation.main(["--mode", "prune"] + (["--maintenance"] if maintenance else [])) == 0
+    assert calls == ["export", "publish", "prune"]
 
 
 def test_public_pointer_has_strict_stream_limit():
