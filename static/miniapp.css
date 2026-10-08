@@ -5,3 +5,62 @@ body[data-theme=dark]{color-scheme:dark;--bg:#172029;--surface:#202c36;--text:#e
 @media(min-width:700px){.app-shell{padding-left:36px;padding-right:36px;padding-top:28px}.topbar{margin-bottom:40px}.hero{padding:10px 0 30px}.hero-orbit{right:65px;top:5px;width:210px;height:210px}.hero-orbit .icon{width:50px;height:50px}.hero p{font-size:15px}.mobile-break{display:none}.search-panel{padding:26px;max-width:none}.field-grid{gap:16px}.panel-heading{margin-bottom:24px}.panel-heading h2{font-size:22px}#filter-fields{display:grid;grid-template-columns:1fr 1fr;gap:0 20px}.party-grid{order:0}.age-fields,.more-filters{grid-column:1/-1}.nights-budget{grid-column:1/-1}.more-filters .field-grid{max-width:500px}.search-submit{max-width:340px;margin:5px 0 0 auto;display:flex}.panel-footnote{text-align:right;margin-right:3px}.results-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.hotel-photo{aspect-ratio:1.8}.page-heading h1{font-size:48px}.saved-list{grid-template-columns:repeat(2,minmax(0,1fr))}.saved-list>.empty-state,.saved-list>.loading-state{grid-column:1/-1}.sheet{border-radius:25px;margin:auto;max-height:85dvh;padding-bottom:26px}.results-heading{margin-top:35px}}
 @media(max-width:360px){.app-shell{padding-left:14px;padding-right:14px}.search-panel{padding:16px}.field-grid{gap:9px}.stepper button{min-width:34px}.field input[type=date]{font-size:12px}.panel-heading h2{font-size:17px}.button-small{font-size:9px}.results-heading h2{font-size:18px}.age-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+
+/* Meal categories and in-app offer preview. */
+.meal-field{grid-column:1/-1;margin-top:3px;margin-bottom:20px}
+.meal-field legend{font-size:12px;color:var(--text)}
+.meal-presets{display:flex;gap:8px;margin-bottom:10px}
+.meal-presets .text-button{font-size:11px;padding:7px 10px;min-height:35px;border:1px solid var(--line);border-radius:9px;color:var(--muted)}
+.meal-presets .text-button[aria-pressed=true]{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+.meal-chips{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-bottom:9px}
+.meal-chip span{height:100%;padding:10px;min-height:60px;display:flex;flex-direction:column;justify-content:center;gap:4px}
+.meal-chip strong{font-size:11px;font-weight:750;line-height:1.25}
+.meal-chip small{font-size:9px;font-weight:400;line-height:1.35}
+.meal-chip input:checked+span strong:before{content:'✓ ';font-weight:800}
+.raw-meals{margin-bottom:18px;font-size:11px}
+.raw-meals>summary{cursor:pointer;color:var(--accent);font-weight:700;padding:5px 0 12px}
+.raw-meals .chip-field legend{font-size:10px}
+.raw-meals .filter-chips{max-height:200px;overflow:auto;padding:3px}
+.photo-open{position:absolute;inset:0;z-index:2;width:100%;height:100%;padding:0;border:0;background:transparent;border-radius:inherit}
+.photo-open:hover{background:#ffffff0a}
+.photo-open:focus-visible{outline-offset:-5px}
+.hotel-title-button{font:inherit;letter-spacing:inherit;text-align:left;color:inherit;background:none;border:0;padding:0}
+.hotel-title-button:hover{color:var(--accent)}
+.offer-sheet{max-width:620px;width:100%;padding:0;max-height:calc(94dvh - var(--safe-top));overflow:hidden}
+.offer-sheet[open]{display:flex;flex-direction:column}
+.offer-sheet-header{padding:17px 18px;margin:0;border-bottom:1px solid var(--line);flex:none;align-items:center}
+.offer-sheet-header h2{font-size:20px}
+.offer-sheet-header .eyebrow{font-size:8px;margin-bottom:6px}
+.offer-sheet-header .icon-button{flex:none}
+.offer-content{overflow:auto;overscroll-behavior:contain;min-height:0;flex:1}
+.offer-content>.loading-state,.offer-content>.empty-state{margin:20px;border:0}
+.offer-photo{aspect-ratio:1.85}
+.offer-body{padding:20px}
+.offer-hotel-title{font-size:26px;line-height:1.15;overflow-wrap:anywhere}
+.offer-price{display:flex;flex-direction:column;gap:5px;margin:20px 0}
+.offer-price strong{font-size:32px;letter-spacing:-.055em;line-height:1.1}
+.offer-price>span{font-size:11px;color:var(--muted)}
+.offer-specs{margin:0;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));border:1px solid var(--line);border-radius:15px;padding:2px 13px;column-gap:16px}
+.offer-specs>div{padding:12px 0;min-width:0;border-bottom:1px solid var(--line)}
+.offer-specs>div:nth-last-child(-n+2){border-bottom:0}
+.offer-specs dt{font-size:9px;color:var(--muted);margin-bottom:5px}
+.offer-specs dd{margin:0;font-size:12px;font-weight:650;overflow-wrap:anywhere;line-height:1.5}
+.meal-original{margin-top:10px;overflow-wrap:anywhere}
+.offer-note{font-size:10px;color:var(--muted);line-height:1.6;margin:13px 0 21px}
+.detail-section{border-top:1px solid var(--line)}
+.detail-section>summary{display:flex;align-items:center;gap:9px;list-style:none;cursor:pointer;font-size:13px;font-weight:750;padding:17px 0;min-height:54px}
+.detail-section>summary::-webkit-details-marker{display:none}
+.detail-section>summary>.icon{width:18px;height:18px;color:var(--accent)}
+.detail-section>summary>.icon:last-child{margin-left:auto;width:15px;height:15px;transition:transform .15s}
+.detail-section[open]>summary>.icon:last-child{transform:rotate(180deg)}
+.detail-section-content{padding-bottom:18px}
+.detail-section-content .empty-state{padding:18px 10px;border-radius:14px}
+.detail-section-content .loading-state{padding:20px 10px;border-radius:14px}
+.detail-variants{margin-top:10px}
+.offer-booking{flex:none;display:flex;align-items:center;gap:12px;padding:13px 18px calc(13px + max(env(safe-area-inset-bottom),var(--safe-bottom)));border-top:1px solid var(--line);background:var(--surface)}
+.offer-booking-price{display:flex;flex-direction:column;flex-shrink:0}
+.offer-booking-price strong{font-size:22px;line-height:1.2;letter-spacing:-.04em}
+.offer-booking-price span{font-size:9px;color:var(--muted);margin-top:4px}
+.offer-sheet .offer-booking .button{flex:1;width:auto;margin:0;font-size:11px;min-height:46px;padding:10px}
+@media(min-width:700px){.meal-chips{grid-template-columns:repeat(4,minmax(0,1fr))}.meal-chip span{min-height:65px}.offer-sheet{padding:0;max-height:90dvh}.offer-body{padding:24px}.offer-sheet-header{padding:18px 24px}.offer-photo{aspect-ratio:2}.offer-booking{padding:14px 24px}.offer-hotel-title{font-size:29px}}
+@media(max-width:360px){.offer-body{padding:16px}.offer-booking{gap:8px;padding-left:14px;padding-right:14px}.offer-booking-price strong{font-size:20px}.offer-sheet .offer-booking .button{font-size:10px}.offer-specs{column-gap:12px;padding-left:10px;padding-right:10px}.meal-chip span{padding:9px}}

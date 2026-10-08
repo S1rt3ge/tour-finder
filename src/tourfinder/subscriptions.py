@@ -8,7 +8,7 @@ from .queries import search_offers
 from .telegram_bot import allowed_user_ids
 
 _ALLOWED = {"date_from", "date_till", "adults", "children_ages", "nights_min",
-            "nights_max", "budget_max", "boards", "countries", "only_hot", "stars_min"}
+            "nights_max", "budget_max", "boards", "board_categories", "countries", "only_hot", "stars_min"}
 
 
 def evaluate(conn, sub) -> int:

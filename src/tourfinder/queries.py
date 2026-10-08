@@ -5,6 +5,8 @@ PostgreSQL 12+ or SQLite 3.35+, supported by the application's runtimes.
 """
 from datetime import datetime, timedelta, timezone
 
+from . import meals
+
 
 FRESH_HOURS = 48
 
@@ -44,6 +46,7 @@ def _build_filters(*, date_from: str, date_till: str, adults: int,
                    budget_max: int | None, boards: str | None,
                    countries: str | None, only_hot: bool,
                    stars_min: int | None = None,
+                   board_categories: str | None = None,
                    hotel_id: str | None = None,
                    source: str | None = None,
                    limit: int = 100) -> tuple[list[str], list[str], dict]:
@@ -72,6 +75,12 @@ def _build_filters(*, date_from: str, date_till: str, adults: int,
             marks = ",".join(f":b{i}" for i in range(len(codes)))
             params.update({f"b{i}": c for i, c in enumerate(codes)})
             where.append(f"o.board_code IN ({marks})")
+    categories = meals.normalize_categories(board_categories)
+    if categories:
+        codes = categories.split(",")
+        marks = ",".join(f":meal{i}" for i in range(len(codes)))
+        params.update({f"meal{i}": value for i, value in enumerate(codes)})
+        where.append(f"({meals.category_sql()}) IN ({marks})")
     if countries:
         ids = [c.strip() for c in countries.split(",") if c.strip()]
         if ids:
@@ -98,7 +107,7 @@ def _build_filters(*, date_from: str, date_till: str, adults: int,
 def _candidates_sql(where: list[str]) -> str:
     return f"""candidates AS MATERIALIZED (
         SELECT o.*, h.name AS hotel_name, h.category, h.country_name,
-               h.city_name, h.photo_url
+               h.city_name, h.photo_url, {meals.category_sql()} AS board_category
         FROM offers o
         JOIN hotels h ON h.source = o.source AND h.source_hotel_id = o.source_hotel_id
         WHERE {' AND '.join(where)}
@@ -110,7 +119,8 @@ def _matched_sql(snapshot_where: list[str], sort_expr: str) -> str:
     # id resolves ties between observations recorded in the same second.
     return f"""
         SELECT o.id AS offer_id, o.source, o.source_hotel_id, o.date_start,
-               o.date_end, o.nights, o.board_code, o.board_name, o.room_name,
+               o.date_end, o.nights, o.board_code, o.board_name, o.board_category,
+               o.room_name, o.room_placement, o.last_seen_at,
                o.link, o.origin_name, o.pax_adl, o.pax_chd, o.children_ages,
                o.operator, o.hotel_name, o.category, o.country_name,
                o.city_name, o.photo_url,
@@ -147,6 +157,7 @@ def search_offers(conn, *, date_from: str, date_till: str,
                   adults: int = 2, children_ages: str | None = None,
                   nights_min: int = 1, nights_max: int = 30,
                   budget_max: int | None = None, boards: str | None = None,
+                  board_categories: str | None = None,
                   countries: str | None = None, only_hot: bool = False,
                   stars_min: int | None = None, hotel_id: str | None = None,
                   source: str | None = None,
@@ -160,7 +171,7 @@ def search_offers(conn, *, date_from: str, date_till: str,
     where, snapshot_where, params = _build_filters(
         date_from=date_from, date_till=date_till, adults=adults,
         children_ages=children_ages, nights_min=nights_min,
-        nights_max=nights_max, budget_max=budget_max, boards=boards,
+        nights_max=nights_max, budget_max=budget_max, boards=boards, board_categories=board_categories,
         countries=countries, only_hot=only_hot, stars_min=stars_min,
         hotel_id=hotel_id, source=source, limit=limit)
     sort_expr = SORTS.get(sort, SORTS["price"])
@@ -182,7 +193,7 @@ def search_offers(conn, *, date_from: str, date_till: str,
     rows = [dict(r) for r in conn.execute(query, params).fetchall()]
     for row in rows:
         row.pop("sort_key")
-    return rows
+    return meals.add_labels(rows)
 
 
 def search_hotels_grouped(conn, *, sort: str = "price", **filters) -> list[dict]:
@@ -220,7 +231,30 @@ def search_hotels_grouped(conn, *, sort: str = "price", **filters) -> list[dict]
     for row in rows:
         row.pop("hrn")
         row.pop("sort_key")
-    return rows
+    return meals.add_labels(rows)
+
+
+def offer_detail(conn, offer_id: int) -> dict | None:
+    """Read one exact variant, even when a previously saved offer is stale."""
+    query = f"""
+        WITH {_candidates_sql(['o.id = :offer_id'])},
+        selected AS ({_matched_sql([], SORTS['price'])})
+        SELECT m.*, {_REVIEW_COLUMNS},
+               (SELECT count(*) FROM price_snapshots ps WHERE ps.offer_id=m.offer_id) AS snapshots_count,
+               (SELECT CAST(avg(price_cents) AS REAL) FROM price_snapshots ps WHERE ps.offer_id=m.offer_id) AS avg_seen_cents,
+               (SELECT min(price_cents) FROM price_snapshots ps WHERE ps.offer_id=m.offer_id) AS min_seen_cents,
+               (SELECT max(price_cents) FROM price_snapshots ps WHERE ps.offer_id=m.offer_id) AS max_seen_cents
+        FROM selected m {_REVIEW_JOIN}
+    """
+    result = conn.execute(query, {"offer_id": offer_id}).fetchone()
+    if result is None:
+        return None
+    row = dict(result)
+    row.pop("sort_key", None)
+    row["stale"] = (not row.get("last_seen_at") or row["last_seen_at"] < _fresh_cutoff()
+                    or not row.get("fetched_at") or row["fetched_at"] < _fresh_cutoff()
+                    or row["date_start"] < datetime.now(timezone.utc).date().isoformat())
+    return meals.add_labels([row])[0]
 
 
 def price_drops(conn, *, adults: int = 2, children_ages: str | None = None,
@@ -264,7 +298,7 @@ def price_drops(conn, *, adults: int = 2, children_ages: str | None = None,
         selected AS MATERIALIZED (
             SELECT o.id AS offer_id, o.source, o.source_hotel_id,
                    o.date_start, o.date_end, o.nights, o.board_code,
-                   o.board_name, o.room_name, o.link, o.pax_adl, o.pax_chd,
+                   o.board_name, o.board_category, o.room_name, o.link, o.pax_adl, o.pax_chd,
                    o.children_ages, o.hotel_name, o.category, o.country_name,
                    o.city_name, o.photo_url, o.price_cents, o.currency,
                    o.is_hot, o.fetched_at, o.stop_sale,
@@ -299,4 +333,4 @@ def price_drops(conn, *, adults: int = 2, children_ages: str | None = None,
     rows = [dict(r) for r in conn.execute(query, params).fetchall()]
     for row in rows:
         row.pop("drop_fraction")
-    return rows
+    return meals.add_labels(rows)

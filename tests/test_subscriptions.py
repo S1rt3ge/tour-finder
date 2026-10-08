@@ -174,6 +174,23 @@ class SubscriptionTests(unittest.TestCase):
         self.assertEqual(self.conn.execute("SELECT evaluation_offset FROM subscriptions WHERE id=:id", {"id": sub["id"]}).scalar(), 0)
         self.assertEqual(self.count("telegram_deliveries"), 1)
 
+    def test_meal_category_is_applied_during_saved_search_evaluation(self):
+        breakfast = self.offer(price=50_000)
+        selected = self.offer(price=80_000)
+        ultra = self.offer(price=70_000)
+        self.conn.execute("UPDATE offers SET board_code='BB',board_name='Breakfast' WHERE id=:id", {"id": breakfast})
+        self.conn.execute("UPDATE offers SET board_code='SOFTAI',board_name='Soft all inclusive' WHERE id=:id", {"id": selected})
+        self.conn.execute("UPDATE offers SET board_code='UAI',board_name='Ultra all inclusive' WHERE id=:id", {"id": ultra})
+        sub = self.subscription(mode="budget", budget=1000)
+        filters = json.loads(sub["filters"])
+        filters.update(board_categories="AI", boards="SOFTAI,UAI")
+        self.conn.execute("UPDATE subscriptions SET filters=:filters WHERE id=:id",
+                          {"id": sub["id"], "filters": json.dumps(filters)})
+        self.conn.commit()
+        self.assertEqual(subscriptions.evaluate(self.conn, sub), 1)
+        self.assertEqual([row["offer_id"] for row in self.conn.execute("SELECT offer_id FROM alerts")], [selected])
+        self.assertEqual(self.count("telegram_deliveries"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
