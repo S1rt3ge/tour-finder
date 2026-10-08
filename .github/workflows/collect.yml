@@ -14,7 +14,9 @@ concurrency:
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 350  # cold start with every tier due takes hours; jobs cap at 6h
+    # Leave time for an in-flight upstream request/retry to unwind and persist
+    # an incomplete run after the cooperative 50-minute collector deadline.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -24,11 +26,10 @@ jobs:
       - name: run collector
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python -m tourfinder.cli collect
+        run: python -m tourfinder.cli collect --max-tasks 6 --max-minutes 50
       - name: assert data is fresh
-        # Dead-man's switch: if nothing was snapshotted in the last 26h the
-        # pipeline is broken (source changed, blocked, secret expired...) —
-        # fail the run so GitHub emails the owner.
+        if: always()
+        # Check every source/tier/party, not merely one recent snapshot.
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python -m tourfinder.cli assert-fresh --hours 26

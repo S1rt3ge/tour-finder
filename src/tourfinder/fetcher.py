@@ -6,6 +6,8 @@ pass filtered to hot tours that only flips is_hot on this run's snapshots.
 """
 import json
 import logging
+import os
+import time
 from datetime import date, datetime, timedelta, timezone
 
 from .sources import joinup, waavo
@@ -17,20 +19,24 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def run_fetch(conn, client: joinup.JoinUpClient,
-              origin: str = joinup.RIGA_ORIGIN_ID,
-              days_from: int = 1, days_till: int = 30,
-              adults: int = 2, children_ages: list[int] | None = None,
-              only_destinations: list[str] | None = None,
-              max_pages: int | None = None, tier: str | None = None,
-              pax_spec: str | None = None) -> dict:
-    date_from = date.today() + timedelta(days=days_from)
-    date_till = date.today() + timedelta(days=days_till)
-    dates = f"{date_from.isoformat()}:{date_till.isoformat()}"
+class CollectionBudgetExceeded(RuntimeError):
+    """Partial work remains stored, but must not count as fresh coverage."""
 
-    params = dict(origin=origin, dates=dates, adults=adults,
-                  children_ages=children_ages,
-                  destinations=only_destinations, max_pages=max_pages, tier=tier)
+
+def _check_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise CollectionBudgetExceeded("partial: collection time budget exhausted")
+
+
+def collector_owner() -> dict:
+    """GitHub concurrency makes earlier runs of this same workflow inactive."""
+    return {key: os.environ[key] for key in
+            ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_WORKFLOW", "GITHUB_REPOSITORY")
+            if os.environ.get(key)}
+
+
+def _start_run(conn, source, tier, pax_spec, params):
+    params = {**params, "source": source, "collector_owner": collector_owner()}
     run_id = conn.execute(
         "INSERT INTO fetch_runs(started_at, tier, pax_spec, params) "
         "VALUES (:now, :tier, :pax, :params) RETURNING id",
@@ -38,16 +44,48 @@ def run_fetch(conn, client: joinup.JoinUpClient,
          "params": json.dumps(params)},
     ).fetchone()["id"]
     conn.commit()
+    return run_id
 
-    offers_seen = 0
+
+def _finish_run(conn, run_id, client, offers_seen, errors):
+    conn.execute(
+        "UPDATE fetch_runs SET finished_at=:now, requests_made=:req, "
+        "offers_seen=:seen, errors=:errors WHERE id=:id",
+        {"now": utcnow(), "req": client.requests_made, "seen": offers_seen,
+         "errors": json.dumps(errors) if errors else None, "id": run_id},
+    )
+    conn.commit()
+    return {"run_id": run_id, "offers_seen": offers_seen,
+            "requests_made": client.requests_made, "errors": errors,
+            "completed": not errors}
+
+
+def run_fetch(conn, client: joinup.JoinUpClient,
+              origin: str = joinup.RIGA_ORIGIN_ID,
+              days_from: int = 1, days_till: int = 30,
+              adults: int = 2, children_ages: list[int] | None = None,
+              only_destinations: list[str] | None = None,
+              max_pages: int | None = None, tier: str | None = None,
+              pax_spec: str | None = None, deadline: float | None = None) -> dict:
+    date_from = date.today() + timedelta(days=days_from)
+    date_till = date.today() + timedelta(days=days_till)
+    dates = f"{date_from.isoformat()}:{date_till.isoformat()}"
+
+    params = dict(origin=origin, dates=dates, adults=adults,
+                  children_ages=children_ages,
+                  destinations=only_destinations, max_pages=max_pages, tier=tier)
+    run_id = _start_run(conn, "joinup", tier, pax_spec, params)
+    writer = _BatchWriter(conn, run_id)
     errors: list[str] = []
     try:
+        _check_deadline(deadline)
         destinations = client.destinations(origin)
         if only_destinations:
             destinations = [d for d in destinations if d["id"] in only_destinations]
         log.info("run %s: %s destinations, window %s", run_id, len(destinations), dates)
 
         for dest in destinations:
+            _check_deadline(deadline)
             dest_id = dest["id"]
             try:
                 stays = client.stays(origin, dest_id, dates)
@@ -59,61 +97,77 @@ def run_fetch(conn, client: joinup.JoinUpClient,
                 # value with zero results silently empties the whole response.
                 # One query per stay value is the only safe shape.
                 for stay in stays:
+                    _check_deadline(deadline)
                     stays_param = str(stay)
 
-                    # Commit per tour so the write lock is held for
-                    # milliseconds, not across the paginated HTTP fetches —
-                    # otherwise a concurrent writer (web UI) is locked out for
-                    # the whole destination.
+                    # Network pagination happens outside write transactions;
+                    # each small normalized batch is committed independently.
                     found = 0
                     for tour in client.search_pages(origin, dest_id, dates,
                                                     stays_param, adults,
                                                     children_ages=children_ages,
                                                     max_pages=max_pages):
-                        offers_seen += _store_tour(conn, tour, run_id, adults,
-                                                   children_ages, client.lang,
-                                                   is_hot=False)
-                        conn.commit()
+                        _check_deadline(deadline)
+                        hotel, offers = joinup.normalize(tour, adults, children_ages,
+                                                         client.lang)
+                        for offer in offers:
+                            _check_deadline(deadline)
+                            offer.setdefault("operator", "joinup")
+                            writer.add(hotel, offer)
                         found += 1
+                    writer.flush()
                     if not found:
                         log.info("%s stays=%s: no tours", dest_id, stays_param)
                         continue
 
+                    _check_deadline(deadline)
                     for tour in client.search_pages(origin, dest_id, dates,
                                                     stays_param, adults,
                                                     children_ages=children_ages,
                                                     tour_types=joinup.HOT_TOUR_TYPE,
                                                     max_pages=max_pages):
-                        _store_tour(conn, tour, run_id, adults, children_ages,
-                                    client.lang, is_hot=True)
-                        conn.commit()
+                        _check_deadline(deadline)
+                        hotel, offers = joinup.normalize(tour, adults, children_ages,
+                                                         client.lang)
+                        for offer in offers:
+                            _check_deadline(deadline)
+                            offer.setdefault("operator", "joinup")
+                            writer.add(hotel, offer, is_hot=True)
+                    writer.flush()
                 log.info("%s done, offers so far: %s, requests: %s",
-                         dest_id, offers_seen, client.requests_made)
-            except joinup.JoinUpBlockedError:
+                         dest_id, writer.offers_seen, client.requests_made)
+            except (joinup.JoinUpBlockedError, CollectionBudgetExceeded):
                 raise
             except Exception as exc:  # one bad destination must not kill the run
-                log.exception("destination %s failed", dest_id)
-                errors.append(f"{dest_id}: {exc}")
-    except joinup.JoinUpBlockedError as exc:
+                conn.rollback()
+                log.error("destination %s failed: %s", dest_id, type(exc).__name__)
+                errors.append(f"{dest_id}: {type(exc).__name__}")
+    except (joinup.JoinUpBlockedError, CollectionBudgetExceeded) as exc:
         errors.append(str(exc))
-        log.error("source blocked us, aborting run: %s", exc)
-
-    conn.execute(
-        "UPDATE fetch_runs SET finished_at=:now, requests_made=:req, "
-        "offers_seen=:seen, errors=:errors WHERE id=:id",
-        {"now": utcnow(), "req": client.requests_made, "seen": offers_seen,
-         "errors": json.dumps(errors) if errors else None, "id": run_id},
-    )
-    conn.commit()
-    return {"run_id": run_id, "offers_seen": offers_seen,
-            "requests_made": client.requests_made, "errors": errors}
+        log.error("run stopped: %s", exc)
+    except Exception as exc:
+        conn.rollback()
+        errors.append(type(exc).__name__)
+        log.error("joinup run failed: %s", type(exc).__name__)
+    except BaseException:
+        conn.rollback()
+        _finish_run(conn, run_id, client, writer.offers_seen, ["interrupted"])
+        raise
+    try:
+        writer.flush()
+    except Exception as exc:
+        errors.append(type(exc).__name__)
+    if max_pages:
+        errors.append("partial: max_pages limits source coverage")
+    return _finish_run(conn, run_id, client, writer.offers_seen, errors)
 
 
 def run_waavo_fetch(conn, client: waavo.WaavoClient,
                     days_from: int = 1, days_till: int = 30,
                     adults: int = 2, children_ages: list[int] | None = None,
                     tier: str | None = None, pax_spec: str | None = None,
-                    max_pages: int | None = None) -> dict:
+                    max_pages: int | None = None,
+                    deadline: float | None = None) -> dict:
     """One Waavo run: paginate the aggregator search over a date window,
     skip Join Up (collected directly), store offers + TripAdvisor reviews."""
     date_from = (date.today() + timedelta(days=days_from)).isoformat()
@@ -121,48 +175,39 @@ def run_waavo_fetch(conn, client: waavo.WaavoClient,
 
     params = dict(source="waavo", dateFrom=date_from, dateTo=date_till,
                   adults=adults, children_ages=children_ages, tier=tier)
-    run_id = conn.execute(
-        "INSERT INTO fetch_runs(started_at, tier, pax_spec, params) "
-        "VALUES (:now, :tier, :pax, :params) RETURNING id",
-        {"now": utcnow(), "tier": tier, "pax": pax_spec,
-         "params": json.dumps(params)},
-    ).fetchone()["id"]
-    conn.commit()
-
-    offers_seen = 0
+    run_id = _start_run(conn, "waavo", tier, pax_spec, params)
+    writer = _BatchWriter(conn, run_id)
     errors: list[str] = []
-    now = utcnow()
     try:
+        _check_deadline(deadline)
         for raw in client.search_pages(date_from, date_till, adults,
                                        children_ages=children_ages,
                                        max_pages=max_pages):
+            _check_deadline(deadline)
             if waavo.should_skip(raw):
                 continue
             hotel, offer, review = waavo.normalize(raw, adults, children_ages)
             if not offer["source_hotel_id"] or not offer["date_start"]:
                 continue
-            _upsert_hotel(conn, hotel)
-            if _store_offer(conn, offer, run_id, now, is_hot=False):
-                offers_seen += 1
-            if review:
-                _upsert_review(conn, review, now)
-            conn.commit()
-    except waavo.WaavoBlockedError as exc:
+            writer.add(hotel, offer, review=review)
+    except (waavo.WaavoBlockedError, CollectionBudgetExceeded) as exc:
         errors.append(str(exc))
-        log.error("waavo blocked us, aborting run: %s", exc)
+        log.error("waavo run stopped: %s", exc)
     except Exception as exc:
-        log.exception("waavo run failed")
-        errors.append(str(exc))
-
-    conn.execute(
-        "UPDATE fetch_runs SET finished_at=:f, requests_made=:r, offers_seen=:o, "
-        "errors=:e WHERE id=:id",
-        {"f": utcnow(), "r": client.requests_made, "o": offers_seen,
-         "e": json.dumps(errors) if errors else None, "id": run_id},
-    )
-    conn.commit()
-    return {"run_id": run_id, "offers_seen": offers_seen,
-            "requests_made": client.requests_made, "errors": errors}
+        conn.rollback()
+        log.error("waavo run failed: %s", type(exc).__name__)
+        errors.append(type(exc).__name__)
+    except BaseException:
+        conn.rollback()
+        _finish_run(conn, run_id, client, writer.offers_seen, ["interrupted"])
+        raise
+    try:
+        writer.flush()
+    except Exception as exc:
+        errors.append(type(exc).__name__)
+    if max_pages:
+        errors.append("partial: max_pages limits source coverage")
+    return _finish_run(conn, run_id, client, writer.offers_seen, errors)
 
 
 def prune_snapshots(conn) -> int:
@@ -204,6 +249,129 @@ _OFFER_COLS = ("source", "source_hotel_id", "origin_id", "origin_name",
                "date_start", "date_end", "nights", "board_code", "board_name",
                "room_code", "room_name", "room_placement",
                "pax_adl", "pax_chd", "children_ages", "operator", "link")
+
+_IDENTITY_COLS = ("source", "source_hotel_id", "origin_id", "date_start",
+                  "nights", "board_code", "room_code", "room_placement",
+                  "pax_adl", "pax_chd", "children_ages")
+_HOTEL_COLS = ("source", "source_hotel_id", "name", "category", "country_id",
+               "country_name", "city_name", "latitude", "longitude", "photo_url")
+_REVIEW_COLS = ("source", "source_hotel_id", "platform", "rating", "rating_scale",
+                "reviews_count", "summary", "external_id", "url", "matched_name",
+                "match_status", "fetched_at")
+_SNAPSHOT_COLS = ("offer_id", "run_id", "fetched_at", "price_cents", "currency",
+                  "is_hot", "availability", "stop_sale", "operator_avg_price_cents")
+
+
+def _identity(offer):
+    # API fields sometimes contain numeric codes; TEXT columns return strings.
+    return tuple("" if offer.get(key) is None else str(offer[key])
+                 for key in _IDENTITY_COLS)
+
+
+def _insert_many(conn, table, columns, rows, *, conflict=(), update=(), returning=()):
+    """Small portable multi-VALUES writes. Identifiers are internal constants."""
+    if not rows:
+        return []
+    params = {}
+    values = []
+    for index, row in enumerate(rows):
+        marks = []
+        for column in columns:
+            key = f"r{index}_{column}"
+            params[key] = row.get(column)
+            marks.append(":" + key)
+        values.append("(" + ",".join(marks) + ")")
+    statement = f"INSERT INTO {table} ({','.join(columns)}) VALUES {','.join(values)}"
+    if conflict:
+        statement += (f" ON CONFLICT ({','.join(conflict)}) DO UPDATE SET " +
+                      ",".join(f"{column}=excluded.{column}" for column in update))
+    if returning:
+        statement += " RETURNING " + ",".join(returning)
+    result = conn.execute(statement, params)
+    return result.fetchall() if returning else []
+
+
+def _store_batch(conn, entries, run_id):
+    """Preserve one snapshot per offer/run and the existing offer identity.
+
+    The first observed price wins, as in _store_offer; repeated rows update the
+    link and last_seen_at, and the hot pass may set the existing snapshot's flag.
+    Chunk deduplication is required by PostgreSQL ON CONFLICT multi-row writes.
+    """
+    hotels, offers, first_prices, hot_keys, reviews = {}, {}, {}, set(), {}
+    for hotel, offer, review, is_hot, observed_at in entries:
+        hotels[(hotel["source"], hotel["source_hotel_id"])] = hotel
+        if review:
+            reviews[(review["source"], review["source_hotel_id"], review["platform"])] = {
+                **review, "fetched_at": observed_at}
+        if not offer.get("nights") or not offer.get("origin_id") or offer.get("price_cents") is None:
+            continue
+        key = _identity(offer)
+        first_prices.setdefault(key, (offer, observed_at))
+        offers[key] = {**offer, "first_seen_at": first_prices[key][1],
+                       "last_seen_at": observed_at}
+        if is_hot:
+            hot_keys.add(key)
+    _insert_many(conn, "hotels", _HOTEL_COLS, list(hotels.values()),
+                 conflict=("source", "source_hotel_id"), update=_HOTEL_COLS[2:])
+    stored = _insert_many(
+        conn, "offers", _OFFER_COLS + ("first_seen_at", "last_seen_at"),
+        list(offers.values()), conflict=_IDENTITY_COLS,
+        update=("last_seen_at", "link", "operator"), returning=("id",) + _IDENTITY_COLS)
+    snapshots = []
+    if stored:
+        id_params = {f"o{index}": row["id"] for index, row in enumerate(stored)}
+        marks = ",".join(":" + key for key in id_params)
+        existing = {row["offer_id"] for row in conn.execute(
+            f"SELECT offer_id FROM price_snapshots WHERE run_id=:run AND offer_id IN ({marks})",
+            {**id_params, "run": run_id}).fetchall()}
+        hot_ids = []
+        for row in stored:
+            key = _identity(row)
+            offer, observed_at = first_prices[key]
+            if row["id"] in existing:
+                if key in hot_keys:
+                    hot_ids.append(row["id"])
+                continue
+            snapshots.append({**offer, "offer_id": row["id"], "run_id": run_id,
+                              "fetched_at": observed_at, "is_hot": int(key in hot_keys)})
+        if hot_ids:
+            hot_params = {f"h{index}": value for index, value in enumerate(hot_ids)}
+            hot_marks = ",".join(":" + key for key in hot_params)
+            conn.execute(f"UPDATE price_snapshots SET is_hot=1 WHERE run_id=:run "
+                         f"AND offer_id IN ({hot_marks})", {**hot_params, "run": run_id})
+        _insert_many(conn, "price_snapshots", _SNAPSHOT_COLS, snapshots)
+    _insert_many(conn, "hotel_reviews", _REVIEW_COLS, list(reviews.values()),
+                 conflict=("source", "source_hotel_id", "platform"),
+                 update=("rating", "reviews_count", "matched_name", "fetched_at"))
+    return len(snapshots)
+
+
+class _BatchWriter:
+    # 40 * 19 offer columns stays below SQLite's legacy 999 parameter limit.
+    BATCH_SIZE = 40
+
+    def __init__(self, conn, run_id):
+        self.conn, self.run_id = conn, run_id
+        self.entries = []
+        self.offers_seen = 0
+
+    def add(self, hotel, offer, *, review=None, is_hot=False):
+        self.entries.append((hotel, offer, review, is_hot, utcnow()))
+        if len(self.entries) >= self.BATCH_SIZE:
+            self.flush()
+
+    def flush(self):
+        if not self.entries:
+            return
+        entries, self.entries = self.entries, []
+        try:
+            count = _store_batch(self.conn, entries, self.run_id)
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        self.offers_seen += count
 
 
 def _upsert_hotel(conn, hotel: dict) -> None:

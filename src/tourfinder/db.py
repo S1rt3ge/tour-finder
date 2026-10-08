@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 
 from sqlalchemy import (Column, Float, Index, Integer, MetaData, Table, Text,
-                        UniqueConstraint, create_engine, text)
+                        UniqueConstraint, create_engine, inspect, text)
 from sqlalchemy.pool import NullPool
 
 DEFAULT_DB = Path("data/tourfinder.db")
@@ -78,6 +78,7 @@ Table(
     Column("stop_sale", Text),
     Column("operator_avg_price_cents", Integer),
     Index("idx_snapshots_offer", "offer_id", "fetched_at"),
+    Index("idx_snapshots_latest", "offer_id", "fetched_at", "id"),
     Index("idx_snapshots_run", "run_id"),
 )
 
@@ -113,6 +114,15 @@ Table(
     Column("filters", Text, nullable=False),
     Column("enabled", Integer, nullable=False, server_default="1"),
     Column("created_at", Text, nullable=False),
+    Column("owner_id", Text),
+    Column("notify_mode", Text, nullable=False, server_default="budget"),
+    Column("min_drop_pct", Float, nullable=False, server_default="10"),
+    Column("min_saving_cents", Integer, nullable=False, server_default="10000"),
+    Column("min_review_rating", Float, nullable=False, server_default="4"),
+    Column("min_review_count", Integer, nullable=False, server_default="20"),
+    Column("evaluation_offset", Integer, nullable=False, server_default="0"),
+    Index("idx_subscriptions_owner", "owner_id", "enabled"),
+    sqlite_autoincrement=True,
 )
 
 # One firing: this offer matched this subscription for this reason.
@@ -125,8 +135,50 @@ Table(
     Column("price_cents", Integer, nullable=False),
     Column("created_at", Text, nullable=False),
     Column("seen", Integer, nullable=False, server_default="0"),
+    Column("evidence", Text, nullable=False, server_default="{}"),
     Index("idx_alerts_sub", "subscription_id", "offer_id", "created_at"),
     Index("idx_alerts_unseen", "seen", "created_at"),
+    sqlite_autoincrement=True,
+)
+
+Table(
+    "id_counters", metadata,
+    Column("name", Text, primary_key=True),
+    Column("last_id", Integer, nullable=False),
+)
+
+Table(
+    "telegram_users", metadata,
+    Column("user_id", Text, primary_key=True),
+    Column("chat_id", Text, nullable=False),
+    Column("first_name", Text, nullable=False, server_default=""),
+    Column("can_notify", Integer, nullable=False, server_default="0"),
+    Column("created_at", Text, nullable=False),
+    Column("updated_at", Text, nullable=False),
+)
+
+Table(
+    "telegram_deliveries", metadata,
+    Column("alert_id", Integer, primary_key=True),
+    Column("status", Text, nullable=False, server_default="pending"),
+    Column("attempts", Integer, nullable=False, server_default="0"),
+    Column("claimed_at", Text),
+    Column("next_attempt_at", Text),
+    Column("sent_at", Text),
+    Column("message_id", Text),
+    Column("last_error", Text),
+    Column("owner_id", Text),
+    Column("subscription_id", Integer),
+    Column("source", Text),
+    Column("source_hotel_id", Text),
+    Index("idx_telegram_delivery_queue", "status", "next_attempt_at"),
+    Index("idx_telegram_delivery_owner", "owner_id", "sent_at"),
+)
+
+Table(
+    "telegram_updates", metadata,
+    Column("update_id", Text, primary_key=True),
+    Column("processed_at", Text, nullable=False),
 )
 
 # Guest reviews per hotel x platform (v3).
@@ -198,14 +250,25 @@ def get_engine(path: str | Path | None = None):
 def _ensure_new_columns(engine):
     """create_all doesn't ALTER existing tables — add columns introduced
     after the first deployment (no-op when already present)."""
-    added = {"fetch_runs": ["pax_spec TEXT"], "offers": ["operator TEXT"]}
+    added = {
+        "fetch_runs": ["pax_spec TEXT"], "offers": ["operator TEXT"],
+        "subscriptions": ["owner_id TEXT", "notify_mode TEXT NOT NULL DEFAULT 'budget'",
+                          "min_drop_pct FLOAT NOT NULL DEFAULT 10",
+                          "min_saving_cents INTEGER NOT NULL DEFAULT 10000",
+                          "min_review_rating FLOAT NOT NULL DEFAULT 4",
+                          "min_review_count INTEGER NOT NULL DEFAULT 20",
+                          "evaluation_offset INTEGER NOT NULL DEFAULT 0"],
+        "alerts": ["evidence TEXT NOT NULL DEFAULT '{}'"],
+        "telegram_deliveries": ["owner_id TEXT", "subscription_id INTEGER", "source TEXT", "source_hotel_id TEXT"],
+    }
+    inspector = inspect(engine)
     for table, cols in added.items():
+        existing = {column["name"] for column in inspector.get_columns(table)}
         for col in cols:
-            try:
-                with engine.begin() as c:
-                    c.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {col}")
-            except Exception:
-                continue  # column already exists
+            if col.split()[0] in existing:
+                continue
+            with engine.begin() as c:
+                c.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {col}")
             if table == "fetch_runs" and col.startswith("pax_spec"):
                 _backfill_pax_spec(engine)
 
@@ -249,6 +312,28 @@ class DB:
 
     def commit(self):
         self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def next_retained_id(self, table: str) -> int | None:
+        """Legacy SQLite tables can reuse deleted IDs despite autoincrement=True.
+
+        Preserve identifiers referenced by the delivery audit. Acquire SQLite's
+        write lock first; PostgreSQL uses its existing sequence instead.
+        """
+        if self.dialect != "sqlite":
+            return None
+        floors = {
+            "alerts": "SELECT id AS value FROM alerts UNION ALL SELECT alert_id FROM telegram_deliveries",
+            "subscriptions": "SELECT id AS value FROM subscriptions UNION ALL SELECT subscription_id FROM alerts UNION ALL SELECT subscription_id FROM telegram_deliveries",
+        }
+        if table not in floors:
+            raise ValueError("Unsupported ID table")
+        return self.execute(f"""INSERT INTO id_counters(name,last_id)
+            SELECT :name,coalesce(max(value),0)+1 FROM ({floors[table]}) retained WHERE 1=1
+            ON CONFLICT(name) DO UPDATE SET last_id=max(id_counters.last_id+1,excluded.last_id)
+            RETURNING last_id""", {"name": table}).scalar()
 
     def close(self):
         self._conn.close()
