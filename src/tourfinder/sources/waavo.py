@@ -7,9 +7,14 @@ We take Waavo for every operator EXCEPT Join Up — Join Up we collect
 directly (`sources/joinup.py`), where coverage is complete; the aggregator
 demonstrably drops some Join Up offers.
 """
+import hashlib
+import json
 import logging
+import math
 import random
+import re
 import time
+from datetime import date
 from decimal import Decimal, InvalidOperation
 
 import requests
@@ -20,6 +25,7 @@ SOURCE_NAME = "waavo"
 BASE_URL = "https://joinastra.waavo.com/api/v1/travels/search"
 RIGA_AIRPORT = "RIX"
 PAGE_SIZE = 100
+MAX_PRICE_CENTS = 2_147_483_647  # PostgreSQL INTEGER, also used by snapshots.
 # Join Up is collected directly (fuller), so skip it here to avoid a worse
 # duplicate. Everything else is only reachable through the aggregator.
 EXCLUDE_OPERATORS = {"joinup"}
@@ -102,34 +108,142 @@ def to_cents(value) -> int | None:
     if value is None:
         return None
     try:
-        return int(Decimal(str(value)) * 100)
-    except (InvalidOperation, ValueError):
+        amount = Decimal(str(value))
+        if not amount.is_finite() or amount <= 0 or amount > Decimal(MAX_PRICE_CENTS) / 100:
+            return None
+        cents = int(amount * 100)
+        return cents if cents > 0 else None
+    except (InvalidOperation, TypeError, ValueError, OverflowError):
         return None
 
 
 def _f(value) -> float | None:
     try:
-        return float(value) if value not in (None, "") else None
-    except (TypeError, ValueError):
+        if value in (None, "") or isinstance(value, bool):
+            return None
+        number = float(value)
+        return number if math.isfinite(number) else None
+    except (TypeError, ValueError, OverflowError):
         return None
+
+
+def _integer(value) -> int | None:
+    if isinstance(value, bool) or value in (None, ""):
+        return None
+    try:
+        number = Decimal(str(value))
+        if (not number.is_finite() or number != number.to_integral_value()
+                or abs(number) > MAX_PRICE_CENTS):
+            return None
+        return int(number)
+    except (InvalidOperation, TypeError, ValueError, OverflowError):
+        return None
+
+
+def _mapping(value) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _validate_pax(offer: dict, adults: int, children_ages: list[int]) -> bool:
+    """Reject explicit conflicting/malformed echoes; missing echoes are unverified."""
+    if type(adults) is not int or not 1 <= adults <= 6:
+        raise ValueError("waavo_invalid_party")
+    if (len(children_ages) > 4 or any(type(age) is not int or not 0 <= age <= 17
+                                     for age in children_ages)):
+        raise ValueError("waavo_invalid_party")
+    for field, expected in (("adults", adults), ("children", len(children_ages))):
+        if field in offer and _integer(offer[field]) != expected:
+            raise ValueError("waavo_pax_echo_mismatch")
+    age_fields = [key for key in ("childrenAge", "childrenAges") if key in offer]
+    for field in age_fields:
+        echoed = offer[field]
+        if isinstance(echoed, str):
+            echoed = echoed.split(",") if echoed.strip() else []
+        if not isinstance(echoed, (list, tuple)):
+            raise ValueError("waavo_pax_echo_mismatch")
+        values = [_integer(value) for value in echoed]
+        if any(value is None for value in values) or sorted(values) != sorted(children_ages):
+            raise ValueError("waavo_pax_echo_mismatch")
+    return "adults" in offer and "children" in offer and bool(age_fields)
+
+
+def _room_identity(offer: dict, adults: int, children_ages: list[int],
+                   *, verified_pax: bool) -> str:
+    """Versioned terms fingerprint, never interchangeable with legacy room_code=''.
+
+    wv2 requires the observed opaque provider key AND complete visible terms.
+    wu2 keeps incomplete source rows usable for browsing, not deal evidence.
+    Price-bearing URLs, pricing and observation age must not affect identity.
+    If Waavo rotates offerKey with price, a missed comparison is safer than a
+    guessed match. Unknown room/meal fields are retained conservatively.
+    """
+    room = _mapping(offer.get("room"))
+    meal = _mapping(room.get("meal"))
+    group = _mapping(meal.get("group"))
+    departure = _mapping(offer.get("departureAirport"))
+    arrival = _mapping(offer.get("arrivalAirport"))
+    operator = _mapping(offer.get("operator"))
+    provider_key = offer.get("offerKey")
+    valid_key = isinstance(provider_key, str) and re.fullmatch(r"[0-9a-fA-F]{32}", provider_key) is not None
+    terms = {
+        "version": 2, "provider_key": provider_key,
+        "hotel_id": _mapping(offer.get("hotel")).get("id"), "operator": operator,
+        "room": room, "departure": departure, "arrival": arrival,
+        "date": offer.get("date"), "duration": offer.get("duration"),
+        "trip_duration": offer.get("tripDuration"),
+        "transfer_included": offer.get("transferIncluded"),
+        "adults": adults, "children_ages": children_ages,
+        "currency": _mapping(offer.get("pricing")).get("currency"),
+        "advance": offer.get("advance"), "warnings": offer.get("warnings"),
+    }
+    valid_date = False
+    try:
+        valid_date = date.fromisoformat(terms["date"]).isoformat() == terms["date"]
+    except (TypeError, ValueError):
+        pass
+    known_text = lambda value: isinstance(value, str) and bool(value.strip())
+    known_hotel = ((type(terms["hotel_id"]) is int and terms["hotel_id"] >= 0)
+                   or known_text(terms["hotel_id"]))
+    reliable = bool(valid_key and known_text(room.get("name")) and verified_pax
+                    and known_hotel and known_text(operator.get("code"))
+                    and known_text(departure.get("code")) and known_text(arrival.get("code"))
+                    and (known_text(group.get("code")) or known_text(meal.get("translation")))
+                    and valid_date and (_integer(terms["duration"]) or 0) > 0
+                    and (_integer(terms["trip_duration"]) or 0) > 0
+                    and isinstance(terms["transfer_included"], bool)
+                    and known_text(terms["currency"]))
+    try:
+        canonical = json.dumps(terms, sort_keys=True, ensure_ascii=True,
+                               separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError):
+        # Malformed non-JSON/non-finite terms can never become trusted evidence.
+        reliable = False
+        canonical = json.dumps(terms, sort_keys=True, ensure_ascii=True,
+                               separators=(",", ":"), default=str)
+    return ("wv2:" if reliable else "wu2:") + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def normalize(offer: dict, adults: int, children_ages: list[int] | None = None):
     """Waavo offer -> (hotel row, offer row + snapshot fields, review row).
 
-    Returns (hotel, offer, review) where review may be None. pax comes from
-    the query for consistency with the joinup source; Waavo echoes it too.
+    Returns (hotel, offer, review) where review may be None. The requested pax
+    is accepted only when any explicit source echoes agree with it.
     """
-    h = offer.get("hotel") or {}
-    room = offer.get("room") or {}
-    meal = room.get("meal") or {}
-    board = (meal.get("group") or {})
-    region = offer.get("region") or {}
-    country = region.get("country") or {}
-    dep = offer.get("departureAirport") or {}
-    operator = (offer.get("operator") or {}).get("code")
-    pricing = offer.get("pricing") or {}
-    ta = h.get("tripadvisor") or {}
+    if children_ages is not None and not isinstance(children_ages, (list, tuple)):
+        raise ValueError("waavo_invalid_party")
+    children_ages = list(children_ages or [])
+    verified_pax = _validate_pax(offer, adults, children_ages)
+    children_ages.sort()
+    h = _mapping(offer.get("hotel"))
+    room = _mapping(offer.get("room"))
+    meal = _mapping(room.get("meal"))
+    board = _mapping(meal.get("group"))
+    region = _mapping(offer.get("region"))
+    country = _mapping(region.get("country"))
+    dep = _mapping(offer.get("departureAirport"))
+    operator = _mapping(offer.get("operator")).get("code")
+    pricing = _mapping(offer.get("pricing"))
+    ta = _mapping(h.get("tripadvisor"))
     images = h.get("images") or []
     ages = ",".join(str(a) for a in sorted(children_ages)) if children_ages else ""
 
@@ -137,7 +251,9 @@ def normalize(offer: dict, adults: int, children_ages: list[int] | None = None):
     # namespacing the id by operator keeps those as distinct offers without
     # touching the offer-identity unique key. Cross-operator grouping of the
     # same hotel is a later enhancement (needs fuzzy hotel matching, SPEC §9).
-    hotel_id = f"{operator}:{h.get('id')}" if operator else str(h.get("id") or "")
+    hotel_id = str(h["id"]) if h.get("id") is not None else ""
+    if operator and hotel_id:
+        hotel_id = f"{operator}:{hotel_id}"
 
     hotel = {
         "source": SOURCE_NAME,
@@ -163,7 +279,7 @@ def normalize(offer: dict, adults: int, children_ages: list[int] | None = None):
         "nights": offer.get("duration") or offer.get("tripDuration"),
         "board_code": board.get("code") or "",
         "board_name": meal.get("translation"),
-        "room_code": "",
+        "room_code": _room_identity(offer, adults, children_ages, verified_pax=verified_pax),
         "room_name": room.get("name"),
         "room_placement": "",
         "pax_adl": adults,
@@ -182,14 +298,16 @@ def normalize(offer: dict, adults: int, children_ages: list[int] | None = None):
     }
 
     review = None
-    if ta.get("rating") is not None:
+    rating = _f(ta.get("rating"))
+    if rating is not None and 0 <= rating <= 5:
+        review_count = _integer(ta.get("ratingsCount"))
         review = {
             "source": SOURCE_NAME,
             "source_hotel_id": hotel["source_hotel_id"],
             "platform": "tripadvisor",
-            "rating": _f(ta.get("rating")),
+            "rating": rating,
             "rating_scale": 5,
-            "reviews_count": ta.get("ratingsCount"),
+            "reviews_count": review_count if review_count is not None and review_count >= 0 else None,
             "summary": None,
             "external_id": None,
             "url": None,

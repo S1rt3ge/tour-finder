@@ -30,8 +30,8 @@ from .archive_format import (
 
 DEFAULT_MANIFEST_URL = "https://raw.githubusercontent.com/S1rt3ge/tour-finder/archive-index/latest.json"
 MANIFEST_LIMIT = 256 * 1024
-CACHE_LIMIT = 256 * MIB
-TEMP_LIMIT = 384 * MIB
+CACHE_LIMIT = 384 * MIB
+TEMP_LIMIT = 480 * MIB
 _LOCK = threading.RLock()
 _PINS = Counter()
 _CDN_HOSTS = {"release-assets.githubusercontent.com", "objects.githubusercontent.com"}
@@ -66,6 +66,26 @@ def _integer(value, *, minimum=0, maximum):
     return value
 
 
+def validate_asset_capacity(descriptor, *, cache_limit=CACHE_LIMIT, temp_limit=TEMP_LIMIT):
+    """Publisher preflight: an asset must fit even before any upload occurs.
+
+    GCM authentication retains the downloaded ciphertext and authenticated
+    gzip until the SQLite output is complete. Count all three simultaneously.
+    Existing unpinned cache files can be evicted by the reader afterwards.
+    """
+    if not isinstance(descriptor, dict) or descriptor.get("kind") not in SCHEMAS:
+        raise ArchiveError("archive_manifest_invalid")
+    limit = CATALOG_LIMIT if descriptor["kind"] == "catalog" else SHARD_LIMIT
+    plain = _integer(descriptor.get("plaintext_bytes"), minimum=1, maximum=limit)
+    encrypted = _integer(descriptor.get("bytes"), minimum=1, maximum=limit + MIB)
+    if any(type(value) is not int or value < 0 for value in (cache_limit, temp_limit)):
+        raise ArchiveError("archive_cache_capacity_invalid")
+    staged = 2 * encrypted + plain
+    if plain > min(cache_limit, CACHE_LIMIT) or staged > min(temp_limit, TEMP_LIMIT):
+        raise ArchiveError("archive_cache_capacity_exceeded")
+    return staged
+
+
 def validate_descriptor(value, *, dataset_id, kind, shard):
     if not isinstance(value, dict):
         raise ArchiveError("archive_manifest_invalid")
@@ -85,6 +105,7 @@ def validate_descriptor(value, *, dataset_id, kind, shard):
     for number in counts.values():
         _integer(number, maximum=100_000_000)
     validate_url(value.get("url"))
+    validate_asset_capacity(value)
 
 
 def validate_manifest(value):
@@ -244,6 +265,13 @@ class ArchiveStore:
         files.sort(key=lambda p: p.stat().st_mtime)
         cached = sum(p.stat().st_size for p in files)
         total = self._usage()
+        # Fail without deleting useful files if even evicting every unpinned
+        # cache entry cannot satisfy both caps (for example a pinned catalog).
+        required = max(cached + plaintext_bytes - self._cache_limit,
+                       total + staged_bytes - self._temp_limit, 0)
+        reclaimable = sum(p.stat().st_size for p in files if _PINS[str(p)] <= 0)
+        if required > reclaimable:
+            raise ArchiveError("archive_cache_capacity_exceeded")
         for path in files:
             if cached + plaintext_bytes <= self._cache_limit and total + staged_bytes <= self._temp_limit:
                 break
@@ -260,6 +288,8 @@ class ArchiveStore:
     def _asset(self, descriptor):
         # Caller holds _LOCK until the returned file is pinned/opened. The
         # reservation includes ciphertext, authenticated gzip and SQLite output.
+        staged_bytes = validate_asset_capacity(descriptor, cache_limit=self._cache_limit,
+                                               temp_limit=self._temp_limit)
         self._dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         path = self._dir / (descriptor["sha256"] + ".sqlite")
         descriptor_hash = hashlib.sha256(canonical_json(descriptor)).hexdigest()
@@ -282,7 +312,7 @@ class ArchiveStore:
                 if _PINS[str(path)]:
                     raise
                 path.unlink()
-        self._reserve(staged_bytes=2 * descriptor["bytes"] + descriptor["plaintext_bytes"],
+        self._reserve(staged_bytes=staged_bytes,
                       plaintext_bytes=descriptor["plaintext_bytes"])
         stage = Path(tempfile.mkdtemp(prefix="stage-", dir=self._dir))
         try:

@@ -9,9 +9,10 @@
 import argparse
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from . import db
@@ -32,21 +33,71 @@ DEFAULT_PAX = ["2", "2+1:7", "3"]  # couple; couple + child aged 7; three adults
 SOURCES = ("joinup", "waavo")
 
 
-def active_pax_specs(conn) -> list[str]:
-    """DEFAULT_PAX plus UI-requested compositions. Each extra spec is a full
-    crawl, so cap at 4 and age requests out after 21 days."""
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=21)).strftime(
-        "%Y-%m-%dT%H:%M:%SZ")
-    rows = conn.execute(
-        """SELECT spec FROM pax_requests WHERE created_at >= :cutoff
-           ORDER BY created_at DESC LIMIT 4""",
-        {"cutoff": cutoff},
-    ).fetchall()
-    specs = list(DEFAULT_PAX)
-    for r in rows:
-        if r["spec"] not in specs:
-            specs.append(r["spec"])
-    return specs
+def _party_spec(adults, children_ages=None) -> str:
+    """Validate persisted party data without coercing bools/floats into ages."""
+    def number(value, low, high):
+        if type(value) is not int and not (isinstance(value, str) and re.fullmatch(r"[0-9]{1,2}", value.strip())):
+            raise ValueError("invalid party")
+        value = int(value)
+        if not low <= value <= high:
+            raise ValueError("invalid party")
+        return value
+
+    adults = number(adults, 1, 6)
+    if children_ages is None or children_ages == "":
+        children_ages = []
+    elif isinstance(children_ages, str):
+        children_ages = children_ages.split(",")
+    if not isinstance(children_ages, (list, tuple)) or len(children_ages) > 4:
+        raise ValueError("invalid party")
+    ages = sorted(number(age, 0, 17) for age in children_ages)
+    return str(adults) + (f"+{len(ages)}:" + ",".join(map(str, ages)) if ages else "")
+
+
+def _canonical_pax_spec(spec) -> str:
+    if (not isinstance(spec, str) or len(spec) > 128
+            or not re.fullmatch(r"[0-9]{1,2}(?:\+[0-4]:(?:[0-9]{1,2}(?: *, *[0-9]{1,2})*)?)?", spec.strip())):
+        raise ValueError("invalid party")
+    adults, ages = parse_pax(spec)
+    return _party_spec(adults, ages)
+
+
+def active_pax_specs(conn, now=None) -> list[str]:
+    """All recent requests and active approved subscriptions, deduplicated.
+
+    The task/time budget bounds each invocation. Keeping every active party in
+    the fair planner prevents a newer request from displacing an older one.
+    Explicit requests expire after 21 days; a live saved search keeps its party
+    active until the search expires or its owner loses access.
+    """
+    from .telegram_bot import approved_user_ids
+
+    now = now or datetime.now(timezone.utc)
+    cutoff = (now - timedelta(days=21)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    specs = dict.fromkeys(DEFAULT_PAX)
+    for row in conn.execute("""SELECT spec FROM pax_requests WHERE created_at >= :cutoff
+            ORDER BY created_at,spec""", {"cutoff": cutoff}):
+        try:
+            specs[_canonical_pax_spec(row["spec"])] = None
+        except (ValueError, TypeError):
+            continue
+    approved = approved_user_ids(conn)
+    if approved:
+        params = {f"owner{i}": owner for i, owner in enumerate(sorted(approved))}
+        marks = ",".join(f":{name}" for name in params)
+        for row in conn.execute(f"""SELECT filters FROM subscriptions
+                WHERE enabled=1 AND owner_id IN ({marks}) ORDER BY id""", params):
+            try:
+                filters = json.loads(row["filters"])
+                if not isinstance(filters, dict):
+                    continue
+                first, last = date.fromisoformat(filters["date_from"]), date.fromisoformat(filters["date_till"])
+                if last < now.date() or first > last:
+                    continue
+                specs[_party_spec(filters["adults"], filters.get("children_ages"))] = None
+            except (ValueError, TypeError, KeyError):
+                continue  # malformed legacy personal data never schedules work
+    return list(specs)
 
 
 def parse_pax(spec: str) -> tuple[int, list[int]]:
@@ -107,15 +158,20 @@ def _run_history(conn):
             source = params.get("source", "joinup")
             started = datetime.fromisoformat(row["started_at"].replace("Z", "+00:00"))
             errors = json.loads(row["errors"]) if row["errors"] else []
+            pax = _canonical_pax_spec(row["pax_spec"])
+            if source not in SOURCES or started.utcoffset() is None:
+                continue
         except (ValueError, TypeError, AttributeError):
             continue  # malformed metadata is never evidence of fresh coverage
-        key = (source, row["tier"], row["pax_spec"])
+        key = (source, row["tier"], pax)
         item = history.setdefault(key, {"attempted": None, "succeeded": None})
         if item["attempted"] is None or started > item["attempted"]:
             item["attempted"] = started
         if row["finished_at"] and errors == [] and not params.get("max_pages"):
             try:
                 finished = datetime.fromisoformat(row["finished_at"].replace("Z", "+00:00"))
+                if finished.utcoffset() is None:
+                    continue
             except (ValueError, AttributeError):
                 continue
             if item["succeeded"] is None or finished > item["succeeded"]:
@@ -169,6 +225,8 @@ def _prepare_collection(conn, now):
             params = json.loads(row["params"] or "{}")
             old_owner = params.get("collector_owner") or {}
             old_time = datetime.fromisoformat(row["started_at"].replace("Z", "+00:00"))
+            if not isinstance(old_owner, dict) or old_time.utcoffset() is None:
+                raise ValueError("unknown collection lease")
         except (ValueError, TypeError, AttributeError):
             blocking.append(row["id"])
             continue
