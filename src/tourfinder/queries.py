@@ -120,7 +120,7 @@ def _matched_sql(snapshot_where: list[str], sort_expr: str) -> str:
     return f"""
         SELECT o.id AS offer_id, o.source, o.source_hotel_id, o.date_start,
                o.date_end, o.nights, o.board_code, o.board_name, o.board_category,
-               o.room_name, o.room_placement, o.last_seen_at,
+               o.room_code, o.room_name, o.room_placement, o.last_seen_at,
                o.link, o.origin_name, o.pax_adl, o.pax_chd, o.children_ages,
                o.operator, o.hotel_name, o.category, o.country_name,
                o.city_name, o.photo_url,

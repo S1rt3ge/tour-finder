@@ -12,7 +12,8 @@ import pytest
 import requests
 
 from tourfinder import archive_format as fmt
-from tourfinder.archive_store import ArchiveStore, DEFAULT_MANIFEST_URL, validate_manifest, validate_url
+from tourfinder.archive_store import (ArchiveStore, CACHE_LIMIT, TEMP_LIMIT, DEFAULT_MANIFEST_URL,
+                                      validate_asset_capacity, validate_manifest, validate_url)
 
 KEY = bytes(range(32))
 DATASET = "test-dataset-1"
@@ -352,3 +353,90 @@ def test_exporter_copies_verified_shard_to_new_database_without_source_mutation(
             target.execute("DELETE FROM archive_history")
         assert source.execute("SELECT count(*) FROM archive_history").fetchone()[0] == 2
     assert len(reader.history(bundle["key"])) == 2
+
+
+def _mock_cache(reader, monkeypatch, sizes, *, pinned=()):
+    """Synthetic stat values test MiB limits without allocating giant files."""
+    from collections import Counter
+    from types import SimpleNamespace
+    import tourfinder.archive_store as module
+
+    class Entry:
+        def __init__(self, index, size):
+            self.stem, self.size, self.index = f"{index:064x}", size, index
+            self.name, self.deleted = self.stem + ".sqlite", False
+
+        def __str__(self):
+            return "mock/" + self.name
+
+        def is_symlink(self):
+            return False
+
+        def stat(self):
+            return SimpleNamespace(st_size=self.size, st_mtime=self.index)
+
+        def unlink(self):
+            self.deleted = True
+
+    files = [Entry(index, size) for index, size in enumerate(sizes)]
+    reader._dir = SimpleNamespace(glob=lambda _pattern: [item for item in files if not item.deleted])
+    monkeypatch.setattr(reader, "_usage", lambda: sum(item.size for item in files if not item.deleted))
+    monkeypatch.setattr(module, "_PINS", Counter({str(files[index]): 1 for index in pinned}))
+    return files
+
+
+def test_capacity_caps_allow_measured_catalog_and_history_without_large_files(bundle, tmp_path, monkeypatch):
+    assert fmt.CATALOG_LIMIT == 320 * fmt.MIB
+    assert CACHE_LIMIT == 384 * fmt.MIB and TEMP_LIMIT == 480 * fmt.MIB
+    catalog_bytes, shard_bytes = 264282112, 22970368
+    reader, _ = store(bundle, tmp_path)
+    assert validate_asset_capacity(dict(kind="catalog", plaintext_bytes=catalog_bytes, bytes=40 * fmt.MIB)) == catalog_bytes + 80 * fmt.MIB
+    files = _mock_cache(reader, monkeypatch, [catalog_bytes], pinned=(0,))
+    reader._reserve(staged_bytes=shard_bytes + 20 * fmt.MIB, plaintext_bytes=shard_bytes)
+    assert not files[0].deleted
+    assert catalog_bytes + shard_bytes < CACHE_LIMIT
+
+
+def test_staging_boundary_cannot_exceed_480_mib_even_with_custom_huge_caps():
+    descriptor = dict(kind="catalog", plaintext_bytes=320 * fmt.MIB, bytes=80 * fmt.MIB)
+    assert validate_asset_capacity(descriptor) == TEMP_LIMIT
+    for changes in ({}, dict(cache_limit=10**12, temp_limit=10**12)):
+        with pytest.raises(fmt.ArchiveError, match="capacity_exceeded"):
+            validate_asset_capacity(descriptor | {"bytes": descriptor["bytes"] + 1}, **changes)
+
+
+def test_unpinned_old_catalog_is_evicted_before_staging_new_generation(bundle, tmp_path, monkeypatch):
+    reader, _ = store(bundle, tmp_path)
+    catalog_bytes, shard_bytes = 264282112, 22970368
+    files = _mock_cache(reader, monkeypatch, [catalog_bytes, shard_bytes])
+    reader._reserve(staged_bytes=catalog_bytes + 80 * fmt.MIB, plaintext_bytes=catalog_bytes)
+    assert files[0].deleted and not files[1].deleted
+    assert reader._usage() + catalog_bytes + 80 * fmt.MIB <= TEMP_LIMIT
+    assert reader._usage() + catalog_bytes <= CACHE_LIMIT
+
+
+def test_impossible_pinned_reservation_does_not_delete_other_cached_files(bundle, tmp_path, monkeypatch):
+    reader, _ = store(bundle, tmp_path)
+    files = _mock_cache(reader, monkeypatch, [320 * fmt.MIB, 16 * fmt.MIB], pinned=(0,))
+    with pytest.raises(fmt.ArchiveError, match="capacity_exceeded"):
+        reader._reserve(staged_bytes=400 * fmt.MIB, plaintext_bytes=320 * fmt.MIB)
+    assert not any(item.deleted for item in files)
+
+
+def test_manifest_rejects_asset_that_cannot_be_staged_before_download(bundle, tmp_path):
+    reader, session = store(bundle, tmp_path)
+    manifest = deepcopy(bundle["manifest"])
+    manifest["catalog"].update(plaintext_bytes=320 * fmt.MIB, bytes=81 * fmt.MIB)
+    session.objects[DEFAULT_MANIFEST_URL] = fmt.canonical_json(manifest)
+    with pytest.raises(fmt.ArchiveError, match="capacity_exceeded"):
+        reader.load_catalog()
+    assert session.calls == [DEFAULT_MANIFEST_URL]
+    assert not (tmp_path / "cache").exists()
+
+
+def test_unconfigured_store_clamps_custom_maxima_without_touching_storage(tmp_path, monkeypatch):
+    monkeypatch.delenv("APP_ARCHIVE_KEY", raising=False)
+    monkeypatch.delenv("TOUR_ARCHIVE_MANIFEST_URL", raising=False)
+    reader = ArchiveStore(cache_dir=tmp_path / "absent", cache_limit=10**12, temp_limit=10**12)
+    assert not reader.configured() and not (tmp_path / "absent").exists()
+    assert reader._cache_limit == CACHE_LIMIT and reader._temp_limit == TEMP_LIMIT

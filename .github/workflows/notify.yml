@@ -2,8 +2,13 @@ name: Telegram notifications
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    # Avoid the busiest start-of-hour interval; GitHub schedules remain best-effort.
+    - cron: '7,22,37,52 * * * *'
   workflow_dispatch: {}
+  workflow_run:
+    workflows: [collect]
+    types: [completed]
+    branches: [main]
 
 permissions:
   contents: read
@@ -14,6 +19,13 @@ concurrency:
 
 jobs:
   notify:
+    # workflow_run can carry secrets: accept only this repository's successful
+    # main collector. Scheduled and explicitly dispatched runs remain allowed.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 8
     env:
@@ -28,6 +40,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         if: env.DATABASE_URL != '' && env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_ALLOWED_USER_IDS != ''
         with:
+          # For workflow_run, github.sha is the default-branch commit, not an
+          # untrusted upstream head. Do not download upstream run artifacts.
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         if: env.DATABASE_URL != '' && env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_ALLOWED_USER_IDS != ''

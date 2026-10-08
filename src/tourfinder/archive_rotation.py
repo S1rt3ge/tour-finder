@@ -25,7 +25,8 @@ from psycopg.rows import dict_row
 import requests
 
 from . import archive_format as fmt
-from .archive_store import ArchiveStore, DEFAULT_MANIFEST_URL, MANIFEST_LIMIT, validate_manifest
+from .archive_store import (ArchiveStore, DEFAULT_MANIFEST_URL, MANIFEST_LIMIT,
+                            validate_asset_capacity, validate_manifest)
 
 REPOSITORY = "S1rt3ge/tour-finder"
 API = f"https://api.github.com/repos/{REPOSITORY}"
@@ -34,6 +35,7 @@ KEEP_DAYS = 14
 TRIGGER_BYTES = 350 * fmt.MIB
 TARGET_BYTES = 300 * fmt.MIB
 CHUNK_ROWS = 1000
+PROGRESS_ROWS = 250_000
 
 HOTEL_COLUMNS = tuple("source source_hotel_id name category country_id country_name city_name latitude longitude photo_url".split())
 OFFER_COLUMNS = tuple("source source_hotel_id origin_id origin_name date_start date_end nights board_code board_name room_code room_name room_placement pax_adl pax_chd children_ages operator link first_seen_at last_seen_at".split())
@@ -191,6 +193,7 @@ def export_projection(conn, directory, *, dataset_id, generation, metadata, prev
             insert_sqlite(catalog, "hotels", dict(row), conflict=("source", "source_hotel_id"))
             counts["hotels"] += 1
         next_id = catalog.execute("SELECT coalesce(max(id),0)+1 FROM offers").fetchone()[0]
+        emit("export_progress", phase="offers", rows=0)
         for raw in stream(conn, f'SELECT id,{",".join(OFFER_COLUMNS)} FROM public.offers ORDER BY id'):
             row = dict(raw)
             original = row.pop("id")
@@ -208,6 +211,9 @@ def export_projection(conn, directory, *, dataset_id, generation, metadata, prev
                          (original, key, target, fmt.canonical_json(row).decode(), expired))
             counts["offers"] += 1
             counts["expired_offers"] += expired
+            if counts["offers"] % PROGRESS_ROWS == 0:
+                emit("export_progress", phase="offers", rows=counts["offers"])
+        emit("export_progress", phase="offers", rows=counts["offers"], complete=True)
         # Reviews use their natural hotel/platform identity, never recycled IDs.
         for raw in stream(conn, f'SELECT {",".join(REVIEW_COLUMNS)} FROM public.hotel_reviews ORDER BY id'):
             row = dict(raw)
@@ -239,6 +245,8 @@ def export_projection(conn, directory, *, dataset_id, generation, metadata, prev
                              (original, offer_id, fingerprint, fmt.canonical_json(dict(raw)).decode(), eligible))
                 counts["eligible_snapshots"] += eligible
                 counts["snapshots"] += 1
+                if counts["snapshots"] % PROGRESS_ROWS == 0:
+                    emit("export_progress", phase="history", rows=counts["snapshots"])
             last = dict(rows[-1])
             last.pop("id")
             last["offer_id"] = target
@@ -248,6 +256,7 @@ def export_projection(conn, directory, *, dataset_id, generation, metadata, prev
             plan.execute("UPDATE offers SET snapshots=? WHERE source_id=?", (len(rows), offer_id))
 
         buffered, offer_id = [], None
+        emit("export_progress", phase="history", rows=0)
         for row in stream(conn, f'SELECT id,{",".join(SNAPSHOT_COLUMNS)} FROM public.price_snapshots ORDER BY offer_id,fetched_at,id'):
             if offer_id is not None and row["offer_id"] != offer_id:
                 observations(offer_id, buffered)
@@ -258,6 +267,7 @@ def export_projection(conn, directory, *, dataset_id, generation, metadata, prev
                 raise fmt.ArchiveError("archive_single_offer_history_too_large")
         if buffered:
             observations(offer_id, buffered)
+        emit("export_progress", phase="history", rows=counts["snapshots"], complete=True)
         if plan.execute("SELECT 1 FROM offers WHERE snapshots=0 LIMIT 1").fetchone():
             raise fmt.ArchiveError("archive_source_offer_without_history")
         catalog.commit()
@@ -401,6 +411,22 @@ class Publisher:
 
 
 def publish_verified(export, publisher, *, key):
+    # Validate EVERY asset's reader capacity before creating a release or
+    # uploading anything. The reader stages ciphertext + authenticated gzip +
+    # plaintext together, so a compressed-byte check alone is insufficient.
+    entries = [("catalog", export.catalog, None)] + [("history", path, i) for i, path in enumerate(export.histories)]
+    prepared = []
+    for kind, path, shard in entries:
+        name = "catalog.tfarc" if kind == "catalog" else f"history-{shard:02}.tfarc"
+        encrypted = export.directory / name
+        descriptor = fmt.encrypt_sqlite(path, encrypted, key=key, dataset_id=export.dataset_id, kind=kind, shard=shard)
+        if shard is None:
+            emit("publication_preflight", catalog_plaintext_bytes=descriptor["plaintext_bytes"],
+                 catalog_ciphertext_bytes=descriptor["bytes"],
+                 catalog_staged_bytes=2 * descriptor["bytes"] + descriptor["plaintext_bytes"])
+        validate_asset_capacity(descriptor)
+        prepared.append((name, encrypted, descriptor, shard))
+    emit("publication_preflight", assets=len(prepared), capacity_verified=True)
     release = publisher.request("POST", "/releases", payload={
         "tag_name": "archive-history-" + export.generation, "name": "Tour history " + export.generation,
         "body": "Encrypted tour-only read archive. No Telegram users or subscriptions.",
@@ -411,11 +437,7 @@ def publish_verified(export, publisher, *, key):
                 "generation": export.generation, "created_at": export.created_at, "history": {}}
     checker = ArchiveStore(manifest_url=DEFAULT_MANIFEST_URL, key=key, session=publisher.public,
                            cache_dir=export.directory / "verify-cache")
-    entries = [("catalog", export.catalog, None)] + [("history", path, i) for i, path in enumerate(export.histories)]
-    for kind, path, shard in entries:
-        name = "catalog.tfarc" if kind == "catalog" else f"history-{shard:02}.tfarc"
-        encrypted = export.directory / name
-        descriptor = fmt.encrypt_sqlite(path, encrypted, key=key, dataset_id=export.dataset_id, kind=kind, shard=shard)
+    for name, encrypted, descriptor, shard in prepared:
         descriptor["url"] = publisher.upload(release_id, name, encrypted)
         # Download every published ciphertext and verify SHA, GCM, exact schema,
         # identities, SQLite integrity and every table count BEFORE manifest.

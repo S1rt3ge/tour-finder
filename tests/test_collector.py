@@ -277,3 +277,151 @@ def test_watchdog_checks_every_source_not_just_latest_snapshot(conn, monkeypatch
     monkeypatch.setattr(conn, "close", Mock())
     with pytest.raises(RuntimeError, match="waavo/far/2"):
         cli.cmd_assert_fresh(SimpleNamespace(db="unused", pax=["2"], hours=26))
+
+
+def request_party(conn, spec, *, age_days=0):
+    conn.execute("INSERT INTO pax_requests(spec,created_at) VALUES (:spec,:now)",
+                 {"spec": spec, "now": (NOW - timedelta(days=age_days)).strftime("%Y-%m-%dT%H:%M:%SZ")})
+    conn.commit()
+
+
+def saved_party(conn, owner, adults, children_ages="", *, enabled=1, changes=None, raw=None):
+    filters = {"date_from": "2026-10-09", "date_till": "2026-10-29",
+               "adults": adults, "children_ages": children_ages, **(changes or {})}
+    conn.execute("""INSERT INTO subscriptions(name,filters,enabled,created_at,owner_id)
+        VALUES ('Fixture',:filters,:enabled,:now,:owner)""",
+        {"filters": raw if raw is not None else json.dumps(filters), "enabled": enabled,
+         "now": NOW.isoformat(), "owner": owner})
+    conn.commit()
+
+
+def test_all_recent_requested_parties_survive_newer_requests(conn, monkeypatch):
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USER_IDS", raising=False)
+    requested = ["1", "1+1:3", "1+1:4", "2+1:4", "2+1:5", "2+1:6"]
+    for index, spec in enumerate(requested):
+        request_party(conn, spec, age_days=6 - index)
+    request_party(conn, "4", age_days=22)
+    request_party(conn, "5", age_days=21)
+    active = cli.active_pax_specs(conn, NOW)
+    assert set(requested) <= set(active)
+    assert "4" not in active and "5" in active
+    assert active.index(requested[0]) < active.index(requested[-1])
+
+
+def test_canonical_party_dedup_preserves_children_count_and_ignores_malformed_requests(conn, monkeypatch):
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USER_IDS", raising=False)
+    for spec in ["02+2:08,6", "2+2:6,8", "2+2:6,6", "2+0:", "7", "0", "2+2:7", "2+1:18", "2+2:6,,8", "bad"]:
+        request_party(conn, spec)
+    assert set(cli.active_pax_specs(conn, NOW)) == set(cli.DEFAULT_PAX) | {"2+2:6,8", "2+2:6,6"}
+
+
+def test_only_active_unexpired_approved_owned_subscriptions_add_parties(conn, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "100")
+    for uid, status in [("200", "approved"), ("300", "denied"), ("400", "pending")]:
+        conn.execute("""INSERT INTO telegram_access_requests(user_id,status,first_name,requested_at)
+            VALUES (:id,:status,'Fixture',:now)""", {"id": uid, "status": status, "now": NOW.isoformat()})
+    saved_party(conn, "100", 1)
+    saved_party(conn, "200", 4, "8,6")
+    saved_party(conn, "200", 4, [6, 8])
+    for owner in ("300", "400", "500", None):
+        saved_party(conn, owner, 5, "2")
+    saved_party(conn, "200", 6, enabled=0)
+    saved_party(conn, "100", 6, changes={"date_from": "2026-09-01", "date_till": "2026-10-07"})
+    saved_party(conn, "200", 6, changes={"date_from": "2026-10-30", "date_till": "2026-10-20"})
+    active = cli.active_pax_specs(conn, NOW)
+    assert set(active) == set(cli.DEFAULT_PAX) | {"1", "4+2:6,8"}
+    assert active.count("4+2:6,8") == 1
+    conn.execute("UPDATE telegram_access_requests SET status='denied' WHERE user_id='200'")
+    conn.commit()
+    assert "4+2:6,8" not in cli.active_pax_specs(conn, NOW)
+
+
+def test_malformed_legacy_filters_never_schedule_a_different_party(conn, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "100")
+    for raw in ["{bad", "[]", "null", "42", "{}"]:
+        saved_party(conn, "100", 1, raw=raw)
+    for adults, ages, changes in [(True, "", {}), (2.5, "", {}), (1, [False], {}),
+                                  (1, "6,,8", {}), (1, "18", {}), (1, [1, 2, 3, 4, 5], {}),
+                                  (1, "", {"date_till": "not-a-date"})]:
+        saved_party(conn, "100", adults, ages, changes=changes)
+    assert cli.active_pax_specs(conn, NOW) == cli.DEFAULT_PAX
+
+
+def test_many_requested_parties_rotate_through_all_tasks_despite_failures(conn, monkeypatch):
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USER_IDS", raising=False)
+    for age in range(1, 7):
+        request_party(conn, f"1+1:{age}")
+    active = cli.active_pax_specs(conn, NOW)
+    expected = {task.key for task in cli._collect_tasks(active)}
+    attempted = set()
+    for invocation in range((len(expected) + 5) // 6):
+        planned = cli.plan_collection(conn, active, NOW + timedelta(minutes=invocation))[:6]
+        for task in planned:
+            assert task.key not in attempted
+            attempted.add(task.key)
+            add_run(conn, *task.key, started=NOW + timedelta(minutes=invocation), errors=["fixture upstream retry"])
+    assert attempted == expected
+
+
+def test_freshness_recognizes_canonical_legacy_child_order(conn):
+    add_run(conn, pax="2+2:8,6")
+    due = {task.key for task in cli.plan_collection(conn, ["2+2:6,8"], NOW)}
+    assert ("joinup", "near", "2+2:6,8") not in due
+    assert ("waavo", "near", "2+2:6,8") in due
+
+
+def test_many_parties_still_obey_invocation_time_budget(conn, monkeypatch):
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USER_IDS", raising=False)
+    for age in range(1, 7):
+        request_party(conn, f"1+1:{age}")
+    monkeypatch.setattr(db, "connect", lambda path: conn)
+    monkeypatch.setattr(conn, "close", Mock())
+    clock = [0]
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock[0])
+    evaluated = Mock(return_value=0)
+    monkeypatch.setattr(subscriptions, "evaluate_all", evaluated)
+
+    def completed_at_deadline(connection, client, **kwargs):
+        assert kwargs["deadline"] == 3000
+        clock[0] = 3001
+        run_id = add_run(connection, tier=kwargs["tier"], pax=kwargs["pax_spec"],
+                         started=datetime.now(timezone.utc))
+        return {"run_id": run_id, "offers_seen": 1, "requests_made": 1, "errors": []}
+
+    fetch = Mock(side_effect=completed_at_deadline)
+    monkeypatch.setattr(fetcher, "run_fetch", fetch)
+    monkeypatch.setattr(fetcher, "run_waavo_fetch", fetch)
+    result = cli.cmd_collect(SimpleNamespace(db="unused", pax=None, delay=0,
+                                             max_tasks=6, max_minutes=50))
+    assert result["attempted"] == result["completed"] == fetch.call_count == 1
+    assert result["pending"] > 6
+    evaluated.assert_called_once_with(conn, deadline=3000)
+
+
+@pytest.mark.parametrize("malformed", ["source_list", "source_dict", "source_unknown", "naive_start", "naive_finish", "params_list"])
+def test_malformed_history_does_not_crash_or_claim_fresh_coverage(conn, malformed):
+    run_id = add_run(conn)
+    if malformed.startswith("source_"):
+        value = {"source_list": [], "source_dict": {}, "source_unknown": "unsupported"}[malformed]
+        conn.execute("UPDATE fetch_runs SET params=:value WHERE id=:id", {"value": json.dumps({"source": value}), "id": run_id})
+    elif malformed == "params_list":
+        conn.execute("UPDATE fetch_runs SET params='[]' WHERE id=:id", {"id": run_id})
+    else:
+        column = "started_at" if malformed == "naive_start" else "finished_at"
+        conn.execute(f"UPDATE fetch_runs SET {column}=:value WHERE id=:id", {"value": "2026-10-08T11:50:00", "id": run_id})
+    conn.commit()
+    assert len(cli.plan_collection(conn, ["2"], NOW)) == 6
+
+
+@pytest.mark.parametrize("malformed", ["naive_start", "owner_list"])
+def test_malformed_unfinished_lease_stays_protected(conn, malformed):
+    run_id = add_run(conn, finished=False)
+    if malformed == "naive_start":
+        conn.execute("UPDATE fetch_runs SET started_at='2026-10-01T00:00:00' WHERE id=:id", {"id": run_id})
+    else:
+        conn.execute("UPDATE fetch_runs SET params=:value WHERE id=:id",
+                     {"value": json.dumps({"collector_owner": ["malformed"]}), "id": run_id})
+    conn.commit()
+    with pytest.raises(RuntimeError, match="blocked by unfinished"):
+        cli._prepare_collection(conn, NOW)
+    assert conn.execute("SELECT finished_at FROM fetch_runs WHERE id=:id", {"id": run_id}).scalar() is None

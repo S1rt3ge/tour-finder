@@ -1,5 +1,6 @@
 """Explainable deal rules using observations of an identical offer."""
 from datetime import datetime, timedelta, timezone
+import re
 
 
 def parse_time(value: str) -> datetime:
@@ -24,8 +25,13 @@ def assess(offer: dict, history: list[dict], policy: dict, *,
         return None
     mode = policy.get("notify_mode", "deal")
     evidence = None
-    # Waavo does not yet distinguish rooms reliably in the stored identity.
-    if mode in {"deal", "both"} and offer.get("source") != "waavo":
+    # Only new fingerprints with verified visible terms may use Waavo history.
+    # Legacy and incomplete identities must never inherit repaired comparisons.
+    room_code = offer.get("room_code")
+    identity_ok = (offer.get("source") != "waavo"
+                   or (isinstance(room_code, str)
+                       and re.fullmatch(r"wv2:[0-9a-f]{64}", room_code) is not None))
+    if mode in {"deal", "both"} and identity_ok:
         try:
             rating = float(offer.get("review_rating") or 0) * 5 / float(offer.get("review_scale") or 5)
             quality_ok = (offer.get("review_match_status") == "ok"

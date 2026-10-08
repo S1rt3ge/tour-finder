@@ -25,6 +25,8 @@ def auth(user=123):
 def client(tmp_path, monkeypatch):
     monkeypatch.delenv("TOURFINDER_DEMO", raising=False)
     monkeypatch.delenv("VERCEL", raising=False)
+    monkeypatch.delenv("TOUR_ARCHIVE_MANIFEST_URL", raising=False)
+    monkeypatch.delenv("APP_ARCHIVE_KEY", raising=False)
     monkeypatch.setenv("DATABASE_URL", "sqlite:///" + (tmp_path / "api.sqlite").as_posix())
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", TOKEN)
     monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "123,456")
@@ -68,6 +70,50 @@ def seed_offer(*, board="AI", board_name="All inclusive", price=80_000,
         return offer_id
     finally:
         conn.close()
+
+
+def test_options_require_approval_and_return_known_meals(client):
+    seed_offer(board="HB", board_name="Half board")
+    assert client.get("/api/options").status_code == 401
+    assert client.get("/api/options", headers=auth(789)).status_code == 403
+    response = client.get("/api/options", headers=auth())
+    assert response.status_code == 200
+    assert response.json()["boards"] == [{"board_code": "HB", "board_name": "Half board"}]
+
+
+def test_saved_search_queues_exact_party_once(client):
+    item = payload()
+    item["filters"].update(adults=3, children_ages="12,5")
+    for _ in range(2):
+        response = client.post("/api/subscriptions", json=item, headers=auth())
+        assert response.status_code == 200 and response.json()["collection_requested"]
+    conn = db.connect()
+    try:
+        assert [row["spec"] for row in conn.execute("SELECT spec FROM pax_requests")] == ["3+2:5,12"]
+    finally:
+        conn.close()
+
+
+def test_browsing_outage_does_not_become_empty_success(client, monkeypatch):
+    from tourfinder import webapp
+
+    def unavailable():
+        raise RuntimeError("private connection diagnostics must stay server-side")
+
+    monkeypatch.setattr(webapp, "get_conn", unavailable)
+    assert client.get("/app").status_code == 200
+    for path in ("/api/search", "/api/compositions", "/api/options", "/api/offers/1", "/api/offers/1/history"):
+        response = client.get(path, params=payload()["filters"] if path == "/api/search" else None, headers=auth())
+        assert response.status_code == 503
+        assert "private connection" not in response.text
+
+
+@pytest.mark.parametrize("identifier", ["a_bad", "0", "-1", "9223372036854775808"])
+def test_invalid_archive_identifier_is_rejected_after_auth(client, identifier):
+    for suffix in ("", "/history"):
+        path = "/api/offers/" + identifier + suffix
+        assert client.get(path).status_code == 401
+        assert client.get(path, headers=auth()).status_code == 400
 
 
 def test_preview_and_readonly_search_without_bot(client, monkeypatch):

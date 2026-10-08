@@ -81,7 +81,7 @@ class DealTests(unittest.TestCase):
                 with self.subTest(changes=changes, mode=mode):
                     self.assertIsNone(self.assess(offer=changes, policy={"notify_mode": mode, "budget_max": 1000}))
 
-    def test_waavo_is_budget_only_until_room_identity_is_repaired(self):
+    def test_unversioned_waavo_remains_budget_only(self):
         self.assertIsNone(self.assess(offer={"source": "waavo"}))
         for mode in ("budget", "both"):
             evidence = self.assess(offer={"source": "waavo"}, history=[],
@@ -89,6 +89,50 @@ class DealTests(unittest.TestCase):
             self.assertEqual(evidence["kind"], "budget")
             self.assertNotIn("saving_cents", evidence)
         self.assertIsNone(self.assess(offer={"source": "waavo"}, policy={"notify_mode": "budget", "budget_max": 700}))
+
+    def test_verified_waavo_identity_allows_only_the_same_sustained_deal_rules(self):
+        offer = {"source": "waavo", "room_code": "wv2:" + "a1" * 32}
+        for mode in ("deal", "both"):
+            with self.subTest(mode=mode):
+                evidence = self.assess(offer=offer, policy={"notify_mode": mode})
+                self.assertEqual(evidence["kind"], "deal")
+                self.assertEqual(evidence["saving_cents"], 20_000)
+                self.assertEqual(evidence["drop_pct"], 20)
+                self.assertEqual(evidence["baseline_from"], "2026-10-07T00:00:00Z")
+                self.assertEqual(evidence["rating_5"], 4.5)
+
+    def test_waavo_history_rejects_legacy_uncertain_and_malformed_fingerprints(self):
+        keys = (None, "", "standard", "wu2:" + "a" * 64, "wv1:" + "a" * 64,
+                "wv2:" + "a" * 63, "wv2:" + "a" * 65, "wv2:" + "A" * 64,
+                "wv2:" + "g" * 64, "WV2:" + "a" * 64,
+                " wv2:" + "a" * 64, "wv2:" + "a" * 64 + "\n", 123, {})
+        for key in keys:
+            for mode in ("deal", "both"):
+                with self.subTest(key=key, mode=mode):
+                    self.assertIsNone(self.assess(offer={"source": "waavo", "room_code": key},
+                                                  policy={"notify_mode": mode}))
+            # Budget matching remains a budget signal, never a claimed saving.
+            for mode in ("budget", "both"):
+                with self.subTest(key=key, budget_mode=mode):
+                    evidence = self.assess(offer={"source": "waavo", "room_code": key},
+                                           policy={"notify_mode": mode, "budget_max": 1000})
+                    self.assertEqual(evidence["kind"], "budget")
+                    self.assertNotIn("drop_pct", evidence)
+
+    def test_verified_waavo_does_not_bypass_quality_freshness_or_baseline(self):
+        valid = {"source": "waavo", "room_code": "wv2:" + "a" * 64}
+        for changes in ({"review_match_status": "ambiguous"}, {"review_count": 19},
+                        {"review_rating": 3.9}, {"review_rating": None},
+                        {"fetched_at": "2026-10-08T05:59:59Z"},
+                        {"date_start": "2026-10-07"}, {"stop_sale": "true"}):
+            with self.subTest(changes=changes):
+                self.assertIsNone(self.assess(offer=valid | changes))
+        for history in ([], [self.history[0], self.history[-1]],
+                        [point("2026-10-07T00:00:00Z"), point("2026-10-07T05:59:59Z"), self.history[-1]],
+                        [point("2026-10-04T00:00:00Z"), point("2026-10-04T08:00:00Z"),
+                         point("2026-10-05T11:59:59Z", 80_000), self.history[-1]]):
+            with self.subTest(history=history):
+                self.assertIsNone(self.assess(offer=valid, history=history))
 
     def test_budget_fallback_never_claims_a_discount(self):
         result = self.assess(history=[], offer={"review_match_status": "ambiguous"},

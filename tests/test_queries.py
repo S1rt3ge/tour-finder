@@ -4,10 +4,11 @@ This module deliberately does not import tourfinder.db: DATABASE_URL and the
 user's data/tourfinder.db must never be consulted by these tests.
 """
 import sqlite3
+from datetime import datetime, timezone
 import unittest
 from unittest.mock import patch
 
-from tourfinder import queries
+from tourfinder import deals, queries
 
 
 SCHEMA = """
@@ -120,6 +121,33 @@ class QueryTests(unittest.TestCase):
                           result["stop_sale"]), ("joinup", 1, "7", "closed"))
         self.assertEqual(self.search(children_ages="7", budget_max=1000), [])
         self.assertEqual(self.search(children_ages="7", only_hot=True), [])
+
+    def test_verified_room_identity_reaches_search_grouping_detail_and_deal_assessment(self):
+        self.hotel("h1", source="waavo")
+        code = "wv2:" + "ab" * 32
+        offer = self.offer(source="waavo", room_code=code)
+        history = []
+        for when, price in (("2026-10-07T00:00:00Z", 100_000),
+                            ("2026-10-07T08:00:00Z", 100_000),
+                            ("2026-10-08T10:00:00Z", 80_000)):
+            self.snapshot(offer, price, when)
+            history.append({"fetched_at": when, "price_cents": price, "currency": "EUR"})
+        self.sqlite.execute("""INSERT INTO hotel_reviews(source,source_hotel_id,platform,
+                            rating,rating_scale,reviews_count,match_status)
+                            VALUES ('waavo','h1','tripadvisor',4.5,5,100,'ok')""")
+        for result in (self.search()[0], self.grouped()[0], queries.offer_detail(self.conn, offer)):
+            with self.subTest(query_result=result["offer_id"]):
+                self.assertEqual(result["room_code"], code)
+                evidence = deals.assess(result, history, {"notify_mode": "deal"},
+                                        now=datetime(2026, 10, 8, 12, tzinfo=timezone.utc))
+                self.assertEqual(evidence["kind"], "deal")
+                self.assertEqual(evidence["saving_cents"], 20_000)
+        # The query must return legacy identity as-is, never upgrade old rows.
+        self.sqlite.execute("UPDATE offers SET room_code='' WHERE id=?", (offer,))
+        legacy = self.search()[0]
+        self.assertEqual(legacy["room_code"], "")
+        self.assertIsNone(deals.assess(legacy, history, {"notify_mode": "deal"},
+                                      now=datetime(2026, 10, 8, 12, tzinfo=timezone.utc)))
 
     def test_every_offer_and_hotel_filter_is_preserved(self):
         self.hotel("low", category="3")

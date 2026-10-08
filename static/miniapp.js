@@ -11,7 +11,8 @@
     view: 'search', user: null, isOwner: false, canNotify: false, session: demoMode ? 'demo' : configured ? 'preview' : 'unconfigured', accessState: 'not_requested', accessVersion: 0, sessionSerial: 0,
     botUsername: document.body.dataset.botUsername || '', lastFilters: null, saveFilters: null,
     searchRequest: null, searchSerial: 0, dealsRequest: null, dealsSerial: 0,
-    savedSerial: 0, historySerial: 0, detailSerial: 0, detailRequest: null, toastTimer: null, subscriptions: [],
+    savedSerial: 0, historySerial: 0, detailSerial: 0, detailRequest: null, toastTimer: null, subscriptions: [], optionsLoaded: false, optionsLoading: false,
+    queuedPax: new Set(), pendingPax: new Set(), paxErrors: new Map(),
   };
   const OPERATORS = {joinup: 'Join Up', teztour: 'Tez Tour', novaturas: 'Novatours', coral: 'Coral', anextour: 'Anex', itaka: 'Itaka'};
   const BOARD_LABELS = {RO: 'Без питания', BB: 'Завтраки', HB: 'Двухразовое питание', FB: 'Трёхразовое питание', AI: 'Всё включено', UAI: 'Ультра всё включено', OTHER: 'Другое / не указано'};
@@ -82,6 +83,25 @@
       ? {day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit'}
       : {day: 'numeric', month: 'short'}).format(date);
   }
+  function isArchived(row) { return row.archived === true || row.data_source === 'archive'; }
+  function observationLabel(row) {
+    return (isArchived(row) ? 'Архивная цена, наблюдали ' : row.stale ? 'Последнее наблюдение ' : 'Проверено ') + dateLabel(row.fetched_at || row.last_seen_at, true);
+  }
+  function storageMessage(storage, context = 'search') {
+    if (!storage) return '';
+    const messages = [];
+    if (storage.live === 'unavailable') messages.push('Свежие данные сейчас недоступны. Показаны сохранённые наблюдения; актуальную цену и наличие уточняйте у продавца.');
+    else if (storage.archive === 'unavailable') messages.push(context === 'history' ? 'Архив сейчас недоступен. История показана не полностью.' : 'Архив сейчас недоступен. Показаны только доступные предложения из текущего сбора.');
+    else if (context !== 'history' && storage.mode === 'archive') messages.push('Это архивные предложения. Цены исторические и могут уже не действовать.');
+    else if (context !== 'history' && storage.mode === 'mixed') messages.push('Архивные цены отмечены отдельно. Их актуальность нужно проверить у продавца.');
+    if (storage.partial && storage.live !== 'unavailable' && storage.archive !== 'unavailable') messages.push(context === 'history' ? 'Часть истории недоступна.' : 'Показана часть совпадений. Сузьте даты или другие параметры поиска.');
+    if (storage.archive_as_of && storage.archive === 'ok') messages.push((context === 'history' ? 'История дополнена архивом от ' : 'Архив обновлён ') + dateLabel(storage.archive_as_of, true) + '.');
+    return messages.join(' ');
+  }
+  function appendStorageNotice(target, storage, context = 'search') {
+    const message = storageMessage(storage, context);
+    if (message) { const note = el('p', 'storage-notice', message); note.setAttribute('role', 'status'); target.prepend(note); }
+  }
   function localDate(offset = 0) {
     const date = new Date(); date.setDate(date.getDate() + offset);
     return [date.getFullYear(), String(date.getMonth() + 1).padStart(2, '0'), String(date.getDate()).padStart(2, '0')].join('-');
@@ -144,6 +164,9 @@
     state.accessVersion++; state.sessionSerial++; state.searchSerial++; state.dealsSerial++; state.savedSerial++; state.historySerial++; state.detailSerial++;
     for (const controller of activeRequests) controller.abort();
     state.lastFilters = null; state.saveFilters = null; state.subscriptions = [];
+    state.optionsLoaded = false; state.optionsLoading = false;
+    state.queuedPax.clear(); state.pendingPax.clear(); state.paxErrors.clear();
+    $('search-storage').hidden = true; $('search-storage').textContent = ''; $('options-note').hidden = true;
     clearTimeout(state.toastTimer); $('toast').hidden = true; $('toast').textContent = '';
     for (const dialog of document.querySelectorAll('dialog[open]')) closeDialog(dialog);
     for (const id of ['deals-results', 'subscriptions-list', 'alerts-list', 'history-content', 'offer-content', 'offer-booking']) $(id).replaceChildren();
@@ -179,6 +202,7 @@
         const descriptions = {401: 'Сессия истекла. Закройте приложение и откройте его снова через бота.', 403: 'Этот личный бот пока недоступен вашему Telegram-аккаунту.', 429: 'Слишком много запросов. Попробуйте через минуту.', 503: 'Сервис ещё не настроен или временно недоступен.'};
         const error = new Error(descriptions[response.status] || (response.status >= 500 ? 'Сервис не смог обработать запрос. Попробуйте чуть позже.' : 'Не удалось сохранить изменения. Проверьте параметры.'));
         error.status = response.status;
+        error.code = typeof data?.detail?.code === 'string' ? data.detail.code : null;
         if (data?.detail?.code === 'access_required') error.accessState = data.detail.access_state;
         if (!isSession && !demoMode && [401, 403].includes(response.status)) restrictAccess(error);
         throw error;
@@ -271,6 +295,38 @@
     syncMealPresets(); haptic();
   }
 
+  function mergeOptionChips(container, name, values, valueKey, label) {
+    const checked = new Set(Array.from(container.querySelectorAll('input:checked')).map(input => input.value));
+    const entries = new Map(Array.from(container.querySelectorAll('input')).map(input => [input.value, input.nextElementSibling?.textContent || input.value]));
+    for (const row of values) if (row && row[valueKey] !== null && row[valueKey] !== undefined && String(row[valueKey])) entries.set(String(row[valueKey]), label(row));
+    container.replaceChildren(...Array.from(entries).sort((a, b) => a[1].localeCompare(b[1], 'ru')).map(([value, text]) => {
+      const item = el('label', 'filter-chip'); const input = el('input');
+      input.type = 'checkbox'; input.name = name; input.value = value; input.checked = checked.has(value);
+      if (name === 'board') input.addEventListener('change', syncMealPresets);
+      item.append(input, el('span', '', text)); return item;
+    }));
+  }
+  async function loadOptions() {
+    if (!hasAccess() || state.optionsLoaded || state.optionsLoading) return;
+    state.optionsLoading = true;
+    try {
+      const data = await api('/api/options');
+      if (!Array.isArray(data.countries) || !Array.isArray(data.boards)) throw new Error('Не удалось прочитать справочники.');
+      mergeOptionChips($('country-options'), 'country', data.countries, 'country_id', row => row.country_name || String(row.country_id));
+      mergeOptionChips($('board-options'), 'board', data.boards, 'board_code', row => String(row.board_code) + (row.board_name && row.board_name !== row.board_code ? ' · ' + row.board_name : ''));
+      $('countries-empty').hidden = Boolean($('country-options').children.length);
+      $('boards-empty').hidden = Boolean($('board-options').children.length);
+      $('options-note').textContent = data.storage?.live === 'unavailable' ? 'Страны и питание загружены из архива. Свежие данные временно недоступны.' : '';
+      $('options-note').hidden = !$('options-note').textContent;
+      state.optionsLoaded = true; syncMealPresets();
+    } catch (error) {
+      if (hasAccess() && error.name !== 'AbortError') {
+        $('options-note').textContent = 'Не удалось обновить список стран и питания. Можно искать без этих уточнений и повторить загрузку при следующем открытии.';
+        $('options-note').hidden = false;
+      }
+    } finally { state.optionsLoading = false; }
+  }
+
   function updateBackButton() {
     try {
       if (!initData || !tg?.BackButton) return;
@@ -297,7 +353,8 @@
   function closeDialog(dialog) { dialog.close(); updateBackButton(); }
 
   async function verifySession() {
-    if (demoMode || !configured || !initData || state.session === 'checking') { renderAccess(); return; }
+    if (demoMode) { renderAccess(); loadOptions(); return; }
+    if (!configured || !initData || state.session === 'checking') { renderAccess(); return; }
     const serial = ++state.sessionSerial;
     state.session = 'checking'; renderAccess();
     try {
@@ -311,6 +368,7 @@
       restrictAccess(error); return;
     }
     renderAccess();
+    loadOptions();
     if (state.view === 'saved' && state.user) loadSaved();
   }
   function renderGate() {
@@ -385,6 +443,7 @@
     $('search-submit').disabled = true; $('search-submit').querySelector('span').textContent = 'Ищем подходящие туры…';
     $('search-results-title').textContent = 'Сверяем ваши параметры';
     $('search-results-caption').textContent = partyLabel(filters) + ' · цена за всех';
+    $('search-storage').hidden = true; $('search-storage').textContent = '';
     loading($('search-results'), 'Ищем среди собранных предложений…');
     try {
       const data = await api('/api/search?' + new URLSearchParams(filters), {signal: controller.signal});
@@ -393,17 +452,23 @@
       $('search-results').removeAttribute('aria-busy');
       $('search-results-title').textContent = data.results.length ? 'Варианты для вашего отпуска' : 'Пока без совпадений';
       $('search-results-caption').textContent = (data.results.length ? data.results.length + ' отелей · ' : '') + partyLabel(filters) + ' · цена за всех';
+      $('search-storage').textContent = storageMessage(data.storage);
+      $('search-storage').hidden = !$('search-storage').textContent;
       if (data.results.length) {
         $('search-results').replaceChildren(...data.results.map(row => hotelCard(row, filters)));
         if (data.results.length >= 100) $('search-results-caption').textContent += ' · первые 100';
       } else {
         const ages = filters.children_ages || '';
         const known = Array.isArray(data.available_compositions) && data.available_compositions.some(item => Number(item.pax_adl) === filters.adults && String(item.children_ages || '') === ages);
-        const message = data.queued_spec
-          ? 'Ваш состав добавлен в сбор. Цены появятся после успешного обновления источников; точное время пока неизвестно.'
-          : known ? 'Для этих дат и фильтров свежих предложений не нашлось. Попробуйте расширить даты, ночи или бюджет.'
+        if (data.queued_spec) { const spec = compositionSpec(filters); state.queuedPax.add(spec); state.paxErrors.delete(spec); }
+        const queued = Boolean(data.queued_spec) || state.queuedPax.has(compositionSpec(filters));
+        const message = queued
+          ? 'Запрос на этот состав сохранён. Предложения появятся, если следующий успешный сбор найдёт подходящие туры; точное время неизвестно.'
+          : data.storage?.partial ? 'Не все данные удалось проверить. Повторите поиск позже или уточните параметры.'
+          : known ? 'Для этих дат и фильтров предложений не нашлось. Попробуйте расширить даты, ночи или бюджет.'
           : 'Для этого точного состава пока нет собранных предложений. Цены другого состава могут отличаться — мы не будем их подменять.';
-        empty($('search-results'), data.queued_spec ? 'Собираем ваш состав' : 'Попробуем другие параметры?', message, () => { collapseFilters(false); form.elements.date_from.focus(); }, 'Изменить поиск');
+        empty($('search-results'), queued ? 'Состав добавлен в сбор' : 'Попробуем другие параметры?', message, () => { collapseFilters(false); form.elements.date_from.focus(); }, 'Изменить поиск');
+        if (!known && !demoMode && state.user) appendCompositionRequest($('search-results').querySelector('.empty-state'), filters);
       }
       if (window.matchMedia('(max-width: 699px)').matches) collapseFilters(true);
     } catch (error) {
@@ -426,6 +491,52 @@
     }
     return photo;
   }
+
+  function compositionPayload(filters) {
+    return {adults: Number(filters.adults), children_ages: String(filters.children_ages || '').split(',').filter(value => value.trim()).map(Number).sort((a, b) => a - b)};
+  }
+  function compositionSpec(filters) {
+    const payload = compositionPayload(filters);
+    return String(payload.adults) + (payload.children_ages.length ? '+' + payload.children_ages.length + ':' + payload.children_ages.join(',') : '');
+  }
+  function refreshCompositionRequests(spec) {
+    for (const panel of document.querySelectorAll('[data-pax-request]')) {
+      if (panel.dataset.paxRequest !== spec) continue;
+      const trigger = panel.querySelector('button'); const note = panel.querySelector('p');
+      const queued = state.queuedPax.has(spec); const pending = state.pendingPax.has(spec); const error = state.paxErrors.get(spec);
+      trigger.disabled = queued || pending;
+      trigger.querySelector('span').textContent = queued ? 'Состав добавлен в сбор' : pending ? 'Сохраняем запрос…' : 'Собрать предложения для этого состава';
+      note.className = error ? 'form-error' : 'field-hint';
+      note.setAttribute('role', error ? 'alert' : 'status');
+      note.textContent = error || (queued ? 'Запрос сохранён. Предложения появятся, если следующий успешный сбор найдёт подходящие туры. Срок пока неизвестен.' : 'После отправки состав попадёт в очередной сбор источников.');
+    }
+  }
+  function appendCompositionRequest(target, filters) {
+    const spec = compositionSpec(filters); const panel = el('div'); panel.dataset.paxRequest = spec;
+    const request = button('Собрать предложения для этого состава', 'button button-primary', () => requestComposition({...filters}));
+    panel.append(request, el('p', 'field-hint')); target.append(panel); refreshCompositionRequests(spec);
+  }
+  async function requestComposition(filters) {
+    if (demoMode || !state.user) { renderAccess(); return; }
+    const spec = compositionSpec(filters);
+    if (state.pendingPax.has(spec) || state.queuedPax.has(spec)) return;
+    const payload = compositionPayload(filters);
+    if (!Number.isInteger(payload.adults) || payload.adults < 1 || payload.adults > 6 || payload.children_ages.length > 4 || payload.children_ages.some(age => !Number.isInteger(age) || age < 0 || age > 17)) {
+      state.paxErrors.set(spec, 'Проверьте состав: 1–6 взрослых и не больше 4 детей с возрастом от 0 до 17 лет.');
+      refreshCompositionRequests(spec); return;
+    }
+    state.pendingPax.add(spec); state.paxErrors.delete(spec); refreshCompositionRequests(spec);
+    try {
+      const data = await api('/api/pax-requests', {method: 'POST', body: payload});
+      if (data.queued !== true) throw new Error('Сервис не подтвердил сохранение запроса. Повторите позже.');
+      state.queuedPax.add(spec); haptic();
+    } catch (error) {
+      if (!state.user || state.queuedPax.has(spec) || error.name === 'AbortError') return;
+      const message = [400, 422].includes(error.status) ? 'Проверьте состав: 1–6 взрослых и не больше 4 детей с возрастом от 0 до 17 лет.'
+        : error.status === 503 ? 'Не удалось подтвердить запрос на сбор: сервис временно недоступен. Повторите позже.' : error.message;
+      state.paxErrors.set(spec, message);
+    } finally { state.pendingPax.delete(spec); refreshCompositionRequests(spec); }
+  }
   function hotelCard(row, filters, isDrop = false) {
     const card = el('article', 'hotel-card');
     const photo = hotelPhoto(row);
@@ -435,7 +546,9 @@
     const badges = el('div', 'photo-badges');
     const operator = OPERATORS[row.operator] || row.operator;
     if (operator) badges.append(el('span', 'badge badge-photo', operator));
-    if (isDrop && Number(row.prev_price_cents) > Number(row.price_cents)) {
+    if (isArchived(row)) badges.append(el('span', 'badge badge-archive', 'Архивная цена'));
+    else if (row.stale) badges.append(el('span', 'badge badge-warm', 'Цена не обновлялась'));
+    else if (isDrop && Number(row.prev_price_cents) > Number(row.price_cents)) {
       const percent = (Number(row.prev_price_cents) - Number(row.price_cents)) / Number(row.prev_price_cents) * 100;
       badges.append(el('span', 'badge badge-deal', '↓ ' + percent.toFixed(1).replace('.', ',') + '% по истории'));
     } else if (row.is_hot) badges.append(el('span', 'badge badge-warm', 'Горящий у источника'));
@@ -466,11 +579,12 @@
     const amount = el('div', 'price-total');
     if (!isDrop && Number(row.variants) > 1) amount.append(el('span', 'price-prefix', 'от'));
     amount.append(document.createTextNode(money(row.price_cents, row.currency)));
-    priceMain.append(amount, el('p', 'price-caption', 'за всех · ' + partyLabel(filters)));
+    priceMain.append(amount, el('p', 'price-caption', (isArchived(row) ? 'историческая цена · ' : '') + 'за всех · ' + partyLabel(filters)));
     prices.append(priceMain);
     if (Number(row.nights) > 0) prices.append(el('p', 'price-night', money(Number(row.price_cents) / Number(row.nights), row.currency) + ' / ночь'));
     body.append(prices);
-    if (row.fetched_at) { const observed = el('p', 'observation-note'); observed.append(icon('clock'), document.createTextNode('Проверено ' + dateLabel(row.fetched_at, true))); body.append(observed); }
+    if (row.fetched_at) { const observed = el('p', 'observation-note'); observed.append(icon('clock'), document.createTextNode(observationLabel(row))); body.append(observed); }
+    if (Number(row.archived_variants) > 0) body.append(el('p', 'field-hint', 'Среди вариантов есть архивные цены: ' + row.archived_variants + '.'));
     if (isDrop) body.append(el('p', 'field-hint', 'Снижение к предыдущему уровню цены в нашей истории, не прогноз.'));
     const actions = el('div', 'card-actions');
     if (isDrop || Number(row.variants) <= 1) actions.append(button('История цены', 'button', () => showHistory(row), 'trend'));
@@ -497,6 +611,7 @@
       const data = await api('/api/search?' + new URLSearchParams(params));
       if (!Array.isArray(data.results)) throw new Error('Не удалось загрузить варианты.');
       box.removeAttribute('aria-busy'); box.replaceChildren(...data.results.map(offer => variantRow(offer, filters)));
+      appendStorageNotice(box, data.storage);
       box.dataset.loaded = 'true';
       if (!data.results.length) box.append(el('p', 'field-hint', 'Варианты больше не доступны по этим фильтрам.'));
       if (data.results.length >= 50) box.append(el('p', 'variant-count-note', 'Показаны первые 50 вариантов. Сузьте даты или число ночей.'));
@@ -508,6 +623,7 @@
     const row = el('div', 'variant-row'); const head = el('div', 'variant-head');
     head.append(el('span', 'variant-title', dateLabel(offer.date_start) + ' · ' + offer.nights + ' н. · ' + boardLabel(offer)), el('strong', 'variant-price', money(offer.price_cents, offer.currency)));
     row.append(head, el('p', 'room-name', offer.room_name || offer.board_name || ''));
+    if (isArchived(offer) || offer.stale) row.append(el('p', 'variant-archive-note', observationLabel(offer)));
     const actions = el('div', 'variant-actions');
     actions.append(button('Подробнее о варианте', 'text-button', () => showOffer(offer, filters)), externalLink(offer.link, 'У продавца ↗', 'text-link'));
     row.append(actions); return row;
@@ -530,13 +646,13 @@
       const data = await api('/api/offers/' + encodeURIComponent(seed.offer_id), {signal: controller.signal});
       if (serial !== state.detailSerial || !dialog.open) return;
       if (!data.offer || !data.offer.offer_id) throw new Error('Не удалось прочитать детали предложения.');
-      renderOffer(data.offer, selectedFilters, serial);
+      renderOffer(data.offer, selectedFilters, serial, data.storage);
     } catch (error) {
       if (serial !== state.detailSerial || !dialog.open || error.name === 'AbortError') return;
       empty(target, error.status === 404 ? 'Предложение не найдено' : 'Детали пока недоступны', error.status === 404 ? 'Возможно, оно уже удалено из базы. Обновите поиск или выберите другой вариант.' : error.message, () => showOffer(seed, selectedFilters));
     }
   }
-  function renderOffer(offer, filters, serial) {
+  function renderOffer(offer, filters, serial, storage) {
     const target = $('offer-content'); target.removeAttribute('aria-busy');
     const photo = hotelPhoto(offer, true); photo.classList.add('offer-photo');
     const body = el('div', 'offer-body');
@@ -557,11 +673,13 @@
       ? String(party.adults) + ' взрослых · ' + offer.pax_chd + ' детей (возраст не указан)'
       : partyLabel(party);
     const price = el('div', 'offer-price');
-    price.append(el('strong', '', money(offer.price_cents, offer.currency)), el('span', '', 'за весь тур · ' + partyText));
+    price.append(el('strong', '', money(offer.price_cents, offer.currency)), el('span', '', (isArchived(offer) ? 'историческая цена · ' : '') + 'за весь тур · ' + partyText));
     body.append(price);
     const stopped = !['', '0', 'false', 'no', 'n'].includes(String(offer.stop_sale || '').trim().toLowerCase());
     if (stopped) body.append(el('p', 'history-warning', 'По последней проверке источник отметил остановку продаж этого варианта. Уточните у продавца, доступно ли предложение сейчас.'));
-    if (offer.stale) body.append(el('p', 'history-warning', 'Предложение давно не встречалось в сборе. Последний раз: ' + dateLabel(offer.last_seen_at, true) + '. Наличие и цену нужно подтвердить у продавца.'));
+    if (isArchived(offer)) body.append(el('p', 'storage-notice', 'Архивное предложение. Эту цену наблюдали ' + dateLabel(offer.fetched_at || offer.last_seen_at, true) + '. Она может уже не действовать; подтвердите цену и наличие у продавца.' + (offer.archive_as_of ? ' Архив обновлён ' + dateLabel(offer.archive_as_of, true) + '.' : '')));
+    else if (offer.stale) body.append(el('p', 'history-warning', 'Предложение давно не встречалось в сборе. Последний раз: ' + dateLabel(offer.last_seen_at, true) + '. Наличие и цену нужно подтвердить у продавца.'));
+    if (storage?.partial) appendStorageNotice(body, storage);
     const specs = el('dl', 'offer-specs');
     const facts = [
       ['Даты тура', dateLabel(offer.date_start) + (offer.date_end ? ' — ' + dateLabel(offer.date_end) : '')],
@@ -578,7 +696,7 @@
     const originalMeal = offer.board_name || offer.board_code;
     if (originalMeal && originalMeal !== boardLabel(offer)) body.append(el('p', 'field-hint meal-original', 'Питание у источника: ' + originalMeal));
     const observed = offer.fetched_at || offer.last_seen_at;
-    if (observed) { const note = el('p', 'observation-note'); note.append(icon('clock'), document.createTextNode('Цена проверена ' + dateLabel(observed, true))); body.append(note); }
+    if (observed) { const note = el('p', 'observation-note'); note.append(icon('clock'), document.createTextNode(observationLabel(offer))); body.append(note); }
     body.append(el('p', 'offer-note', 'Это собранные данные предложения. Состав услуг, правила питания, наличие и окончательную стоимость подтвердит продавец.'));
 
     const history = el('details', 'detail-section'); const historySummary = el('summary');
@@ -606,6 +724,7 @@
           if (!Array.isArray(data.results)) throw new Error('Не удалось прочитать варианты.');
           const alternatives = data.results.filter(row => String(row.offer_id) !== String(offer.offer_id));
           list.removeAttribute('aria-busy'); list.replaceChildren(...alternatives.map(row => variantRow(row, filters)));
+          appendStorageNotice(list, data.storage);
           if (!alternatives.length) list.append(el('p', 'field-hint', 'Других вариантов по этим параметрам пока нет. Можно расширить даты или снять часть фильтров в поиске.'));
           if (data.results.length >= 50) list.append(el('p', 'variant-count-note', 'Показаны первые 50 совпадений.'));
         } catch (error) { if (serial === state.detailSerial && error.name !== 'AbortError' && variants.isConnected) empty(list, 'Варианты не загрузились', error.message, load); }
@@ -615,8 +734,8 @@
     }
     target.replaceChildren(photo, body); target.scrollTop = 0;
     const booking = $('offer-booking'); const summary = el('div', 'offer-booking-price');
-    summary.append(el('strong', '', money(offer.price_cents, offer.currency)), el('span', '', 'за всех'));
-    booking.replaceChildren(summary, externalLink(offer.link, stopped ? 'Проверить у продавца ↗' : 'Бронировать у продавца ↗'));
+    summary.append(el('strong', '', money(offer.price_cents, offer.currency)), el('span', '', isArchived(offer) ? 'архивная цена за всех' : 'за всех'));
+    booking.replaceChildren(summary, externalLink(offer.link, stopped || offer.stale || isArchived(offer) ? 'Проверить у продавца ↗' : 'Бронировать у продавца ↗'));
     booking.hidden = false;
   }
 
@@ -656,10 +775,12 @@
       const data = await api('/api/offers/' + encodeURIComponent(offer.offer_id) + '/history');
       if (!current()) return;
       const rows = (Array.isArray(data.history) ? data.history : []).filter(row => Number.isFinite(Number(row.price_cents)) && Number.isFinite(Date.parse(row.fetched_at))).sort((a, b) => Date.parse(a.fetched_at) - Date.parse(b.fetched_at));
-      const currency = rows.at(-1)?.currency || offer.currency || 'EUR';
+      const currency = data.statistics?.currency || offer.currency || rows.at(-1)?.currency || 'EUR';
       const history = rows.filter(row => (row.currency || currency) === currency);
       target.removeAttribute('aria-busy'); target.replaceChildren(el('h3', 'history-headline', offer.hotel_name || 'Выбранный вариант'), el('p', 'field-hint', dateLabel(offer.date_start) + ' · ' + offer.nights + ' ночей · ' + boardLabel(offer)));
-      if (data.gone) target.append(el('p', 'history-warning', 'Предложение давно не встречалось в сборе. Последний раз: ' + dateLabel(data.last_seen_at, true) + '. Это не подтверждение, что оно распродано.'));
+      appendStorageNotice(target, data.storage, 'history');
+      if (data.history_truncated) target.append(el('p', 'history-warning', 'На графике последние ' + rows.length + ' из ' + (data.history_total || rows.length) + ' наблюдений. Более ранние цены учтены в статистике, когда история доступна полностью.'));
+      if (data.gone) target.append(el('p', 'history-warning', isArchived(offer) ? 'Это история архивного предложения. Наличие и текущая цена не подтверждены.' : 'Предложение давно не встречалось в сборе. Последний раз: ' + dateLabel(data.last_seen_at, true) + '. Это не подтверждение, что оно распродано.'));
       if (!history.length) { target.append(el('p', 'history-warning', 'Для этого предложения пока нет доступных наблюдений.')); return; }
       const first = history[0]; const last = history.at(-1);
       if (history.length >= 2) target.append(priceChart(history));
@@ -667,11 +788,14 @@
       const labels = el('div', 'chart-labels'); labels.append(el('span', '', dateLabel(first.fetched_at, true)), el('span', '', history.length > 1 ? dateLabel(last.fetched_at, true) : '')); target.append(labels);
       const stats = el('div', 'history-stat-grid');
       let minimum = Infinity; for (const row of history) minimum = Math.min(minimum, Number(row.price_cents));
-      for (const [label, value] of [['Последнее наблюдение', last.price_cents], ['Минимум в нашей истории', minimum]]) { const stat = el('div', 'history-stat'); stat.append(el('strong', '', money(value, currency)), el('span', '', label)); stats.append(stat); }
+      const fullMinimum = data.statistics?.currency === currency && data.statistics.min_seen_cents !== null && Number.isFinite(Number(data.statistics.min_seen_cents));
+      if (fullMinimum) minimum = Number(data.statistics.min_seen_cents);
+      const minimumLabel = data.statistics?.complete === false ? 'Минимум в доступных наблюдениях' : data.history_truncated && !fullMinimum ? 'Минимум на показанном отрезке' : 'Минимум в нашей истории';
+      for (const [label, value] of [['Последнее наблюдение', last.price_cents], [minimumLabel, minimum]]) { const stat = el('div', 'history-stat'); stat.append(el('strong', '', money(value, currency)), el('span', '', label)); stats.append(stat); }
       target.append(stats);
       if (history.length > 1) {
         const difference = Number(last.price_cents) - Number(first.price_cents);
-        target.append(el('p', 'field-hint', 'От первого наблюдения: ' + (difference < 0 ? 'дешевле на ' : difference > 0 ? 'дороже на ' : 'цена не изменилась') + (difference ? money(Math.abs(difference), currency) : '') + '. Это история одного варианта, не прогноз.'));
+        target.append(el('p', 'field-hint', (data.history_truncated ? 'От первого показанного наблюдения: ' : 'От первого наблюдения: ') + (difference < 0 ? 'дешевле на ' : difference > 0 ? 'дороже на ' : 'цена не изменилась') + (difference ? money(Math.abs(difference), currency) : '') + '. Это история одного варианта, не прогноз.'));
       }
       target.append(el('p', 'field-hint', 'Точки — фактические наблюдения. Между ними цена могла меняться. Рекламная «старая цена» источника здесь не используется.'));
       const detail = el('details', 'history-observations'); detail.append(el('summary', '', 'Посмотреть наблюдения (' + history.length + ')'));
@@ -679,7 +803,7 @@
       const tbody = el('tbody');
       for (const row of history.slice(-50).reverse()) { const tr = el('tr'); tr.append(el('td', '', dateLabel(row.fetched_at, true)), el('td', '', money(row.price_cents, currency))); tbody.append(tr); }
       table.append(tbody); detail.append(table);
-      if (history.length > 50) detail.append(el('p', 'field-hint', 'В таблице последние 50 наблюдений; график учитывает всю доступную историю.'));
+      if (history.length > 50) detail.append(el('p', 'field-hint', data.history_truncated ? 'В таблице последние 50 наблюдений; график показывает последние 2000.' : 'В таблице последние 50 наблюдений; график учитывает всю доступную историю.'));
       target.append(detail);
     } catch (error) { if (current()) empty(target, 'История не загрузилась', error.message, () => showHistory(offer, embeddedTarget, isCurrent), 'Повторить', 'trend'); }
   }
@@ -722,9 +846,12 @@
     const payload = {name: fields.name.value.trim(), filters, notify_mode: mode, min_drop_pct: mode === 'budget' ? 10 : Number(fields.min_drop_pct.value), min_saving_eur: mode === 'budget' ? 100 : Number(fields.min_saving_eur.value), min_review_rating: mode === 'budget' ? 4 : Number(fields.min_review_rating.value), min_review_count: mode === 'budget' ? 20 : Number(fields.min_review_count.value)};
     $('confirm-save').disabled = true; showError($('save-validation'), '');
     try {
-      await api('/api/subscriptions', {method: 'POST', body: payload});
+      const result = await api('/api/subscriptions', {method: 'POST', body: payload});
+      if (result.collection_requested === true) {
+        const spec = compositionSpec(filters); state.queuedPax.add(spec); state.paxErrors.delete(spec); refreshCompositionRequests(spec);
+      }
       closeDialog($('save-dialog')); haptic('medium'); navigate('saved');
-      toast(state.canNotify ? 'Поиск сохранён. Сообщим о подходящей цене.' : 'Поиск сохранён. Нажмите «Старт» в боте для сообщений.');
+      toast(result.collection_requested === true ? 'Поиск сохранён, состав добавлен в сбор. Предложения зависят от следующего успешного обновления источников.' : state.canNotify ? 'Поиск сохранён. Сообщим о подходящей цене.' : 'Поиск сохранён. Нажмите «Старт» в боте для сообщений.');
     } catch (error) { showError($('save-validation'), error.message); }
     finally { $('confirm-save').disabled = false; }
   }

@@ -386,3 +386,43 @@ def test_public_pointer_has_strict_stream_limit():
     publisher.public.objects[DEFAULT_MANIFEST_URL] = b" " * (rotation.MANIFEST_LIMIT + 1)
     with pytest.raises(fmt.ArchiveError, match="public_pointer_not_fresh"):
         publisher.verify_public_pointer({"generation": "fixture"})
+
+
+def test_catalog_that_cannot_fit_reader_staging_is_never_published(tmp_path, monkeypatch):
+    export = exported(tmp_path)
+    publisher = FakePublisher()
+    publisher.request = lambda *_args, **_kwargs: pytest.fail("must not create a release")
+    monkeypatch.setattr(fmt, "encrypt_sqlite", lambda *_args, **_kwargs: {
+        "kind": "catalog", "plaintext_bytes": 252 * fmt.MIB, "bytes": 115 * fmt.MIB})
+    with pytest.raises(fmt.ArchiveError, match="archive_cache_capacity_exceeded"):
+        rotation.publish_verified(export, publisher, key=KEY)
+    assert publisher.uploads == [] and publisher.pointer is None
+
+
+def test_every_asset_capacity_is_checked_before_any_publication(tmp_path, monkeypatch):
+    export = exported(tmp_path)
+    publisher = FakePublisher()
+    publisher.request = lambda *_args, **_kwargs: pytest.fail("must not publish before the final shard passes")
+    checked = []
+    def seal(_path, _destination, **kwargs):
+        return {"kind": kwargs["kind"], "shard": kwargs["shard"], "plaintext_bytes": 1, "bytes": 1}
+    def capacity(descriptor):
+        checked.append(descriptor["shard"])
+        if descriptor["shard"] == 63:
+            raise fmt.ArchiveError("archive_cache_capacity_exceeded")
+        return 3
+    monkeypatch.setattr(fmt, "encrypt_sqlite", seal)
+    monkeypatch.setattr(rotation, "validate_asset_capacity", capacity)
+    with pytest.raises(fmt.ArchiveError, match="archive_cache_capacity_exceeded"):
+        rotation.publish_verified(export, publisher, key=KEY)
+    assert checked == [None, *range(64)]
+    assert publisher.uploads == [] and publisher.pointer is None
+
+
+def test_export_progress_contains_only_phase_and_aggregate_counts(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(rotation, "PROGRESS_ROWS", 2)
+    exported(tmp_path)
+    progress = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    progress = [value for value in progress if value["stage"] == "export_progress"]
+    assert [value["rows"] for value in progress if value["phase"] == "history"] == [0, 2, 4, 5]
+    assert all(set(value) <= {"stage", "phase", "rows", "complete"} for value in progress)

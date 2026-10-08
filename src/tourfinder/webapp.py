@@ -2,6 +2,7 @@
 import hmac
 import json
 import os
+from functools import lru_cache
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -12,6 +13,8 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from . import db, meals, queries, reviews
+from .archive_format import ArchiveError
+from .archive_queries import ReadService, ReadUnavailable
 from .telegram_bot import (InitDataError, access_state, allowed_user_ids, bot_token, now_iso,
                            validate_init_data, webhook_response)
 
@@ -23,6 +26,39 @@ app.mount("/static", StaticFiles(directory=str(ROOT / "static"), check_dir=False
 
 def get_conn():
     return db.connect()
+
+
+@lru_cache(maxsize=1)
+def _read_service(manifest_url, archive_key):
+    # Reuse verified files and manifest caches across warm function requests.
+    # Environment values in the cache key also isolate test/deployment settings.
+    return ReadService(connect=browsing_connection)
+
+
+def browsing_connection():
+    conn = get_conn()
+    try:
+        if conn.dialect == "postgresql":
+            conn.execute("SET LOCAL statement_timeout='15s'")
+            conn.execute("SET LOCAL lock_timeout='3s'")
+        return conn
+    except Exception:
+        conn.close()
+        raise
+
+
+def browsing_store():
+    return _read_service(os.environ.get("TOUR_ARCHIVE_MANIFEST_URL", ""),
+                         os.environ.get("APP_ARCHIVE_KEY", ""))
+
+
+def read_result(operation, *args, **kwargs):
+    try:
+        return operation(*args, **kwargs)
+    except ReadUnavailable:
+        raise HTTPException(503, "Не удалось загрузить данные. Попробуй позже.") from None
+    except (ArchiveError, ValueError):
+        raise HTTPException(400, "Некорректный идентификатор предложения.") from None
 
 
 def require_user(request: Request) -> dict:
@@ -123,20 +159,10 @@ def index():
 
 @app.get("/app")
 def miniapp(request: Request):
-    conn = None
-    try:
-        conn = get_conn()
-        countries = [dict(r) for r in conn.execute(
-            "SELECT DISTINCT country_id,country_name FROM hotels WHERE country_id IS NOT NULL ORDER BY country_name")]
-        boards = [dict(r) for r in conn.execute(
-            "SELECT board_code,max(board_name) AS board_name FROM offers GROUP BY board_code ORDER BY board_code")]
-    except Exception:
-        countries, boards = [], []
-    finally:
-        if conn is not None:
-            conn.close()
+    # The shell must open even during a database outage. Approved clients load
+    # current or archived filter choices through /api/options afterwards.
     return templates.TemplateResponse(request, "miniapp.html", {
-        "countries": countries, "boards": boards,
+        "countries": [], "boards": [],
         "telegram_bot_username": os.environ.get("TELEGRAM_BOT_USERNAME", "").lstrip("@"),
         "telegram_enabled": bool(bot_token() and allowed_user_ids()),
         "demo_mode": demo_browsing(),
@@ -160,19 +186,9 @@ def search(request: Request, date_from: date, date_till: date,
             only_hot=only_hot, stars_min=stars_min).model_dump(mode="json")
     except (ValidationError, ValueError):
         raise HTTPException(400, "Проверь даты, состав туристов и фильтры.") from None
-    conn = get_conn()
-    try:
-        if group and not hotel_id:
-            rows = queries.search_hotels_grouped(conn, sort=sort, source=source, limit=limit, **filters)
-        else:
-            rows = queries.search_offers(conn, sort=sort, source=source, hotel_id=hotel_id, limit=limit, **filters)
-        compositions = queries.available_compositions(conn) if not rows else None
-    finally:
-        conn.close()
-    for row in rows:
-        row["star_gap"] = reviews.star_gap(row.get("category"), row.get("review_rating"), row.get("review_scale"))
-    # Public GETs never schedule paid/external collection work.
-    return {"count": len(rows), "results": rows, "available_compositions": compositions, "queued_spec": None}
+    # Browsing reads never schedule external collection or notification work.
+    return read_result(browsing_store().search, group=bool(group and not hotel_id),
+                       sort=sort, source=source, hotel_id=hotel_id, limit=limit, **filters)
 
 
 @app.get("/api/drops", dependencies=[Depends(require_browsing_user)])
@@ -198,40 +214,25 @@ def drops(adults: int = Query(2, ge=1, le=6), children_ages: str | None = Query(
 
 @app.get("/api/compositions", dependencies=[Depends(require_browsing_user)])
 def compositions():
-    conn = get_conn()
-    try:
-        return {"compositions": queries.available_compositions(conn)}
-    finally:
-        conn.close()
+    return read_result(browsing_store().compositions)
+
+
+@app.get("/api/options", dependencies=[Depends(require_browsing_user)])
+def search_options():
+    return read_result(browsing_store().options)
 
 
 @app.get("/api/offers/{offer_id}/history", dependencies=[Depends(require_browsing_user)])
-def offer_history(offer_id: int):
-    conn = get_conn()
-    try:
-        rows = conn.execute(
-            "SELECT fetched_at,price_cents,currency,is_hot,availability FROM price_snapshots WHERE offer_id=:id ORDER BY fetched_at DESC,id DESC LIMIT 2000",
-            {"id": offer_id}).fetchall()
-        offer = conn.execute("SELECT last_seen_at,date_start FROM offers WHERE id=:id", {"id": offer_id}).fetchone()
-        gone = bool(offer and offer["date_start"] >= datetime.now(timezone.utc).date().isoformat()
-                    and offer["last_seen_at"] < queries._fresh_cutoff())
-        return {"offer_id": offer_id, "gone": gone, "last_seen_at": offer["last_seen_at"] if offer else None,
-                "history": [dict(r) for r in reversed(rows)]}
-    finally:
-        conn.close()
+def offer_history(offer_id: str):
+    return read_result(browsing_store().history, offer_id)
 
 
 @app.get("/api/offers/{offer_id}", dependencies=[Depends(require_browsing_user)])
-def get_offer_detail(offer_id: int):
-    conn = get_conn()
-    try:
-        offer = queries.offer_detail(conn, offer_id)
-        if offer is None:
-            raise HTTPException(404, "Предложение не найдено.")
-        offer["star_gap"] = reviews.star_gap(offer.get("category"), offer.get("review_rating"), offer.get("review_scale"))
-        return {"offer": offer}
-    finally:
-        conn.close()
+def get_offer_detail(offer_id: str):
+    result = read_result(browsing_store().detail, offer_id)
+    if result["offer"] is None:
+        raise HTTPException(404, "Предложение не найдено.")
+    return result
 
 
 @app.post("/api/pax-requests")
@@ -243,15 +244,20 @@ def request_pax(payload: dict = Body(...), user: dict = Depends(require_user)):
             raise ValueError()
     except (TypeError, ValueError):
         raise HTTPException(400, "Допустимо 1–6 взрослых и до 4 детей 0–17 лет.") from None
-    spec = str(adults) + (f"+{len(ages)}:" + ",".join(map(str, ages)) if ages else "")
     conn = get_conn()
     try:
-        conn.execute("INSERT INTO pax_requests(spec,created_at) VALUES (:spec,:now) ON CONFLICT(spec) DO UPDATE SET created_at=excluded.created_at",
-                     {"spec": spec, "now": now_iso()})
+        spec = queue_composition(conn, adults, ages)
         conn.commit()
         return {"spec": spec, "queued": True}
     finally:
         conn.close()
+
+
+def queue_composition(conn, adults: int, ages: list[int]) -> str:
+    spec = str(adults) + (f"+{len(ages)}:" + ",".join(map(str, sorted(ages))) if ages else "")
+    conn.execute("INSERT INTO pax_requests(spec,created_at) VALUES (:spec,:now) ON CONFLICT(spec) DO UPDATE SET created_at=excluded.created_at",
+                 {"spec": spec, "now": now_iso()})
+    return spec
 
 
 @app.get("/api/telegram/session")
@@ -327,8 +333,10 @@ def create_subscription(payload: SubscriptionCreate, user: dict = Depends(requir
              "now": now_iso(), "owner": str(user["id"]), "mode": payload.notify_mode,
              "pct": payload.min_drop_pct, "saving": round(payload.min_saving_eur * 100),
              "rating": payload.min_review_rating, "count": payload.min_review_count, "retained_id": retained_id}).scalar()
+        queue_composition(conn, payload.filters.adults,
+                          [int(age) for age in (payload.filters.children_ages or "").split(",") if age])
         conn.commit()
-        return {"id": sub_id, "new_alerts": 0, "evaluation_pending": True}
+        return {"id": sub_id, "new_alerts": 0, "evaluation_pending": True, "collection_requested": True}
     finally:
         conn.close()
 

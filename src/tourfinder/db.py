@@ -239,9 +239,12 @@ def get_engine(path: str | Path | None = None):
             # disables psycopg's server-side prepared statements, which break
             # behind a transaction-mode pooler.
             engine = create_engine(url, poolclass=NullPool, pool_pre_ping=True,
-                                   connect_args={"prepare_threshold": None})
-        metadata.create_all(engine)
-        _ensure_new_columns(engine)
+                                   connect_args={"prepare_threshold": None, "connect_timeout": 8})
+        # Production web requests only read the explicitly prepared schema.
+        # Avoid DDL/inspection locks during cold starts or archive fallback.
+        if url.startswith("sqlite") or not os.environ.get("VERCEL"):
+            metadata.create_all(engine)
+            _ensure_new_columns(engine)
         if url.startswith("sqlite"):
             with engine.begin() as c:
                 c.exec_driver_sql("PRAGMA journal_mode=WAL")
