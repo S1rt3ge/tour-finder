@@ -28,6 +28,11 @@ CATALOG_LIMIT = 320 * MIB
 SHARD_LIMIT = 32 * MIB
 CHUNK = MIB
 SHARDS = 64
+VALIDATION_CACHE_KIB = 64 * 1024
+_OFFER_IDENTITY_COLUMNS = (
+    "source", "source_hotel_id", "origin_id", "date_start", "nights", "board_code",
+    "room_code", "room_placement", "pax_adl", "pax_chd", "children_ages",
+)
 HEX = re.compile(r"^[0-9a-f]{64}$")
 IDENTIFIER = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
@@ -191,6 +196,10 @@ def validate_sqlite(path: Path, *, dataset_id: str, kind: str, shard=None, expec
     conn = None
     try:
         conn = open_readonly(path)
+        # Full integrity checking probes indexed rows across the catalog.
+        # A bounded validation-only page cache avoids repeated random reads;
+        # normal read connections retain their smaller 8 MiB query cache.
+        conn.execute(f"PRAGMA cache_size=-{VALIDATION_CACHE_KIB}")
         deadline = time.monotonic() + 30
         conn.set_progress_handler(lambda: int(time.monotonic() > deadline), 10000)
         objects = conn.execute("SELECT name,type,sql FROM sqlite_master").fetchall()
@@ -224,8 +233,14 @@ def validate_sqlite(path: Path, *, dataset_id: str, kind: str, shard=None, expec
                 WHERE k.offer_key IS NULL OR p.id IS NULL OR h.source IS NULL LIMIT 1""").fetchone()
             if missing:
                 raise ArchiveError("archive_catalog_incomplete")
-            for row in conn.execute("SELECT o.*,k.offer_key FROM offers o JOIN archive_offer_keys k ON k.offer_id=o.id"):
-                if offer_key(dict(row)) != row["offer_key"]:
+            # sqlite3.Row -> dict performs name lookups for every column.
+            # Stream only identity fields as tuples, preserving every natural
+            # key check while avoiding the wide, quadratic row conversion.
+            cursor = conn.cursor()
+            cursor.row_factory = None
+            identity_sql = ",".join("o." + name for name in _OFFER_IDENTITY_COLUMNS)
+            for row in cursor.execute(f"SELECT {identity_sql},k.offer_key FROM offers o JOIN archive_offer_keys k ON k.offer_id=o.id"):
+                if offer_key(dict(zip(_OFFER_IDENTITY_COLUMNS, row[:-1]))) != row[-1]:
                     raise ArchiveError("archive_offer_identity_mismatch")
         else:
             for row in conn.execute("SELECT * FROM archive_history"):
