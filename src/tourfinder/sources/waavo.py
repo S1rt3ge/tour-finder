@@ -131,7 +131,13 @@ class WaavoClient:
                 # not match children ages: " — verified live 2026-07-27.
                 params["childrenAges"] = ",".join(str(a) for a in children_ages)
             data = self._get(**params)
-            offers = ((data or {}).get("data") or {}).get("offers") or []
+            # A malformed HTTP-200 response is not evidence of exhaustion.
+            # In particular, missing/null containers must not become an empty
+            # success that marks the requested collection scope as complete.
+            if (not isinstance(data, dict) or not isinstance(data.get("data"), dict)
+                    or not isinstance(data["data"].get("offers"), list)):
+                raise WaavoError("waavo_invalid_response_envelope")
+            offers = data["data"]["offers"]
             yield from offers
             page += 1
             if len(offers) < PAGE_SIZE or (max_pages and page >= max_pages):

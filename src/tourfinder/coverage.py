@@ -4,7 +4,8 @@ Stable states: fresh, running, queued, partial, stale, uncollected, unsupported.
 The caller may use unavailable when SQL reads fail; database errors propagate.
 Only explicit source/origin/party/date/night metadata from successful uncapped
 runs contributes coverage. In particular legacy Join Up runs without recorded
-stays, and Waavo runs without recorded origin/duration bounds, cannot prove an
+stays, and Waavo runs without recorded origin/duration bounds plus the exact
+response-validation and bounded-inventory contract versions, cannot prove an
 empty search. Local price, meal and star filters never relax collection scope.
 
 Intervals are inclusive departure dates for which *every requested night count*
@@ -26,6 +27,8 @@ TIERS = (("near", 1, 7, 4), ("mid", 8, 14, 12), ("far", 15, 45, 24))
 HISTORY_LIMIT = 2000
 RUNNING_MAX_AGE = timedelta(minutes=15)
 REQUEST_MAX_AGE = timedelta(days=21)
+WAAVO_SCOPE_VALIDATION = "response_date_nights_v1"
+WAAVO_INVENTORY_CONTRACT = "bounded_inventory_v1"
 
 
 def _time(value):
@@ -285,6 +288,18 @@ def get_search_coverage(conn, filters, now=None, queue_override=None):
                 finish = _time(row["finished_at"])
                 if not start <= finish <= now:
                     raise ValueError("finish")
+                # Earlier Waavo collectors recorded requested bounds without
+                # verifying returned dates/nights. Their successful exit alone
+                # cannot contribute either fresh or historical coverage cells.
+                if source == "waavo" and params.get("scope_validation") != WAAVO_SCOPE_VALIDATION:
+                    reasons.append("response_scope_unverified")
+                    continue
+                # Validated rows (including zero rows) are not proof that the
+                # endpoint exhaustively searched the requested bounds. The
+                # current legacy catalogue adapter never records this contract.
+                if source == "waavo" and params.get("inventory_contract") != WAAVO_INVENTORY_CONTRACT:
+                    reasons.append("inventory_contract_unverified")
+                    continue
                 try:
                     run_nights = _run_nights(params, source)
                 except (ValueError, TypeError):

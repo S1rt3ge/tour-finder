@@ -178,8 +178,12 @@ def run_waavo_fetch(conn, client: waavo.WaavoClient,
                     tier: str | None = None, pax_spec: str | None = None,
                     max_pages: int | None = None,
                     deadline: float | None = None, origin: str = waavo.RIGA_AIRPORT) -> dict:
-    """One Waavo run: paginate the aggregator search over a date window,
-    skip Join Up (collected directly), store offers + TripAdvisor reviews."""
+    """Read legacy catalogue observations, stopping on a date/night mismatch.
+
+    This GET endpoint has no verified bounded-inventory contract. We record
+    response validation only; even an empty successful response cannot prove
+    full coverage. See the dated correction in docs/waavo-recon.md.
+    """
     origin = source_origin("waavo", origin)
     date_from = (date.today() + timedelta(days=days_from)).isoformat()
     date_till = (date.today() + timedelta(days=days_till)).isoformat()
@@ -189,7 +193,8 @@ def run_waavo_fetch(conn, client: waavo.WaavoClient,
                   adults=adults, children_ages=children_ages, tier=tier,
                   departureAirport=origin,
                   durationFrom=duration_from, durationTo=duration_till,
-                  max_pages=max_pages)
+                  max_pages=max_pages,
+                  scope_validation="response_date_nights_v1")
     run_id = _start_run(conn, "waavo", tier, pax_spec, params)
     writer = _BatchWriter(conn, run_id)
     errors: list[str] = []
@@ -203,6 +208,15 @@ def run_waavo_fetch(conn, client: waavo.WaavoClient,
                                        origin=origin,
                                        max_pages=max_pages):
             _check_deadline(deadline)
+            # An ignored upstream filter must not become evidence that this
+            # requested date/night range was completely searched. Check even
+            # excluded operators before storing anything from this response.
+            violation = _waavo_scope_violation(raw, date_from, date_till,
+                                               duration_from, duration_till)
+            if violation:
+                errors.append("partial: waavo_response_scope_mismatch:" + violation)
+                log.warning("waavo response scope mismatch: %s; stopping pagination", violation)
+                break
             if waavo.should_skip(raw):
                 continue
             hotel, offer, review = waavo.normalize(raw, adults, children_ages, origin=origin)
@@ -227,6 +241,29 @@ def run_waavo_fetch(conn, client: waavo.WaavoClient,
     if max_pages:
         errors.append("partial: max_pages limits source coverage")
     return _finish_run(conn, run_id, client, writer.offers_seen, errors, writer=writer)
+
+
+def _waavo_scope_violation(raw, date_from, date_till, duration_from, duration_till):
+    """One bounded diagnostic; no response values or identifying data in logs."""
+    if not isinstance(raw, dict):
+        return "invalid_offer"
+    observed_date = raw.get("date")
+    try:
+        valid_date = date.fromisoformat(observed_date).isoformat() == observed_date
+    except (TypeError, ValueError):
+        valid_date = False
+    if not valid_date:
+        return "invalid_date"
+    if not date_from <= observed_date <= date_till:
+        return "date_outside"
+    # Match normalize's duration fallback while rejecting bools, fractional
+    # values and other malformed counts before they reach the database.
+    nights = waavo._integer(raw.get("duration") or raw.get("tripDuration"))
+    if nights is None or nights <= 0:
+        return "invalid_nights"
+    if not duration_from <= nights <= duration_till:
+        return "nights_outside"
+    return None
 
 
 def prune_snapshots(conn) -> int:
