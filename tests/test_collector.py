@@ -160,11 +160,10 @@ def test_active_airport_party_scopes_preserve_each_users_request_and_subscriptio
         {"origins": "TLL", "adults": 4, "children_ages": "8,6", "date_from": "2026-10-09", "date_till": "2026-10-29"}])
     saved_party(conn, "100", 5, changes={"origins": "VNO,TLL"})
     saved_party(conn, "denied", 6, changes={"origins": "TLL"})
-    request_party(conn, "6")  # Legacy global requests retain Riga semantics.
+    request_party(conn, "6")  # Anonymous demand cannot expand owned workloads.
     active = set(cli.active_collection_scopes(conn, NOW))
-    assert {("VNO", "1"), ("TLL", "4+2:6,8"), ("VNO", "5"), ("TLL", "5"), ("RIX", "6")} <= active
-    assert not {("TLL", "1"), ("VNO", "4+2:6,8"), ("RIX", "1"), ("RIX", "5"), ("TLL", "6")} & active
-    assert {("RIX", spec) for spec in cli.DEFAULT_PAX} <= active
+    assert active == {("VNO", "1"), ("TLL", "4+2:6,8"), ("VNO", "5"), ("TLL", "5")}
+    assert cli.active_pax_specs(conn, NOW) == []
 
 
 def test_entirely_outside_horizon_subscriptions_do_not_activate_airports(conn, monkeypatch):
@@ -185,7 +184,7 @@ def test_real_durable_request_reader_only_activates_approved_nonexpired_exact_pa
             "filters": json.dumps(scope), "now": NOW.strftime("%Y-%m-%dT%H:%M:%SZ"), "expiry": expiry.strftime("%Y-%m-%dT%H:%M:%SZ")})
     conn.commit()
     scopes = set(cli.active_collection_scopes(conn, NOW))
-    assert scopes == {("RIX", spec) for spec in cli.DEFAULT_PAX} | {("VNO", "1"), ("TLL", "4")}
+    assert scopes == {("VNO", "1"), ("TLL", "4")}
     keys = {task.key for task in cli._collect_tasks(scopes)}
     assert ("waavo", "near", "1", "VNO") in keys and ("joinup", "far", "4", "TLL") in keys
     assert ("waavo", "near", "1", "TLL") not in keys and ("joinup", "far", "4", "VNO") not in keys
@@ -601,6 +600,82 @@ def saved_party(conn, owner, adults, children_ages="", *, enabled=1, changes=Non
     conn.commit()
 
 
+def durable_party(conn, owner, adults, *, changes=None, expires=None):
+    filters = {"date_from": "2026-10-09", "date_till": "2026-10-29",
+               "adults": adults, "children_ages": "", **(changes or {})}
+    conn.execute("""INSERT INTO collection_requests(owner_id,request_key,filters,created_at,updated_at,expires_at)
+        VALUES (:owner,:key,:filters,:now,:now,:expires)""",
+        {"owner": owner, "key": json.dumps(filters, sort_keys=True), "filters": json.dumps(filters),
+         "now": NOW.strftime("%Y-%m-%dT%H:%M:%SZ"),
+         "expires": (expires or NOW + timedelta(days=21)).strftime("%Y-%m-%dT%H:%M:%SZ")})
+    conn.commit()
+
+
+def test_owned_three_airports_keep_real_subscription_without_bootstrap_extras(conn, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "100")
+    request_party(conn, "6")
+    durable_party(conn, "100", 1, changes={"origins": "VNO,RIX,TLL"})
+    saved_party(conn, "100", 2)  # Existing approved couple subscription stays active.
+    scopes = cli.active_collection_scopes(conn, NOW)
+    assert set(scopes) == {("RIX", "1"), ("VNO", "1"), ("TLL", "1"), ("RIX", "2")}
+    assert len(cli._collect_tasks(scopes)) == 24  # Four exact pairs, each with 3 tiers and 2 sources.
+    assert set(cli.active_pax_specs(conn, NOW)) == {"1", "2"}
+
+
+@pytest.mark.parametrize("kind", ["request", "subscription"])
+@pytest.mark.parametrize("state", ["revoked", "trip_expired", "future", "reversed", "bad_party", "bad_origin"])
+def test_uncollectable_owned_demand_preserves_bootstrap(conn, monkeypatch, kind, state):
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USER_IDS", raising=False)
+    conn.execute("""INSERT INTO telegram_access_requests(user_id,status,first_name,requested_at)
+        VALUES ('200',:status,'Fixture',:now)""",
+        {"status": "denied" if state == "revoked" else "approved", "now": NOW.isoformat()})
+    changes = {
+        "trip_expired": {"date_till": NOW.date().isoformat()},
+        "future": {"date_from": (NOW.date() + timedelta(days=46)).isoformat(),
+                   "date_till": (NOW.date() + timedelta(days=50)).isoformat()},
+        "reversed": {"date_from": "2026-10-29", "date_till": "2026-10-20"},
+        "bad_origin": {"origins": "BAD"},
+    }.get(state, {})
+    (durable_party if kind == "request" else saved_party)(
+        conn, "200", 7 if state == "bad_party" else 1, changes=changes)
+    request_party(conn, "6")
+    assert cli.active_collection_scopes(conn, NOW) == [("RIX", spec) for spec in cli.DEFAULT_PAX + ["6"]]
+
+
+def test_request_expiry_and_disabled_subscription_restore_bootstrap(conn, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "100")
+    durable_party(conn, "100", 1, expires=NOW + timedelta(seconds=1))
+    saved_party(conn, "100", 4, enabled=0)
+    request_party(conn, "6")
+    assert cli.active_collection_scopes(conn, NOW) == [("RIX", "1")]
+    assert cli.active_collection_scopes(conn, NOW + timedelta(seconds=1)) == [
+        ("RIX", spec) for spec in cli.DEFAULT_PAX + ["6"]]
+
+
+@pytest.mark.parametrize("kind", ["request", "subscription"])
+@pytest.mark.parametrize("days", [1, 45])
+def test_owned_dates_touching_horizon_boundaries_replace_bootstrap(conn, monkeypatch, kind, days):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "100")
+    departure = (NOW.date() + timedelta(days=days)).isoformat()
+    (durable_party if kind == "request" else saved_party)(conn, "100", 1,
+        changes={"date_from": departure, "date_till": departure, "origins": "VNO"})
+    assert cli.active_collection_scopes(conn, NOW) == [("VNO", "1")]
+
+
+def test_last_owned_access_revocation_restores_only_eligible_bootstrap(conn, monkeypatch):
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USER_IDS", raising=False)
+    conn.execute("""INSERT INTO telegram_access_requests(user_id,status,first_name,requested_at)
+        VALUES ('200','approved','Fixture',:now)""", {"now": NOW.isoformat()})
+    durable_party(conn, "200", 1, changes={"origins": "TLL"})
+    saved_party(conn, "200", 4)
+    request_party(conn, "6")
+    request_party(conn, "5", age_days=-1)  # A future timestamp is not a recent request.
+    assert set(cli.active_collection_scopes(conn, NOW)) == {("TLL", "1"), ("RIX", "4")}
+    conn.execute("UPDATE telegram_access_requests SET status='denied' WHERE user_id='200'")
+    conn.commit()
+    assert cli.active_collection_scopes(conn, NOW) == [("RIX", spec) for spec in cli.DEFAULT_PAX + ["6"]]
+
+
 def test_all_recent_requested_parties_survive_newer_requests(conn, monkeypatch):
     monkeypatch.delenv("TELEGRAM_ALLOWED_USER_IDS", raising=False)
     requested = ["1", "1+1:3", "1+1:4", "2+1:4", "2+1:5", "2+1:6"]
@@ -635,7 +710,7 @@ def test_only_active_unexpired_approved_owned_subscriptions_add_parties(conn, mo
     saved_party(conn, "100", 6, changes={"date_from": "2026-09-01", "date_till": "2026-10-07"})
     saved_party(conn, "200", 6, changes={"date_from": "2026-10-30", "date_till": "2026-10-20"})
     active = cli.active_pax_specs(conn, NOW)
-    assert set(active) == set(cli.DEFAULT_PAX) | {"1", "4+2:6,8"}
+    assert set(active) == {"1", "4+2:6,8"}
     assert active.count("4+2:6,8") == 1
     conn.execute("UPDATE telegram_access_requests SET status='denied' WHERE user_id='200'")
     conn.commit()

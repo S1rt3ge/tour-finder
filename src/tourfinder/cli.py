@@ -28,9 +28,9 @@ TIERS = [
     ("far", 15, 45, 24),
 ]
 
-# Party compositions collected by `collect`. Each is a full crawl, so keep
-# the default small; add more with `collect --pax`. Price depends on the
-# exact party, so a search only matches a composition we actually collected.
+# Bootstrap compositions when no approved owner's demand is collectable.
+# Each is a full crawl; explicit `collect --pax` still overrides the planner.
+# Search prices always match the exact composition actually collected.
 DEFAULT_PAX = ["2", "2+1:7", "3"]  # couple; couple + child aged 7; three adults
 SOURCES = ("joinup", "waavo")
 
@@ -64,59 +64,39 @@ def _canonical_pax_spec(spec) -> str:
     return _party_spec(adults, ages)
 
 
-def active_pax_specs(conn, now=None) -> list[str]:
-    """All recent requests and active approved subscriptions, deduplicated.
-
-    The task/time budget bounds each invocation. Keeping every active party in
-    the fair planner prevents a newer request from displacing an older one.
-    Explicit requests expire after 21 days; a live saved search keeps its party
-    active until the search expires or its owner loses access.
-    """
-    from .telegram_bot import approved_user_ids
-
-    now = now or datetime.now(timezone.utc)
+def _bootstrap_pax_specs(conn, now) -> list[str]:
+    """Defaults and recent anonymous requests, used only without owned demand."""
     cutoff = (now - timedelta(days=21)).strftime("%Y-%m-%dT%H:%M:%SZ")
     specs = dict.fromkeys(DEFAULT_PAX)
     for row in conn.execute("""SELECT spec FROM pax_requests WHERE created_at >= :cutoff
-            ORDER BY created_at,spec""", {"cutoff": cutoff}):
+            AND created_at <= :now ORDER BY created_at,spec""",
+            {"cutoff": cutoff, "now": now.strftime("%Y-%m-%dT%H:%M:%SZ")}):
         try:
             specs[_canonical_pax_spec(row["spec"])] = None
         except (ValueError, TypeError):
             continue
-    approved = approved_user_ids(conn)
-    if approved:
-        params = {f"owner{i}": owner for i, owner in enumerate(sorted(approved))}
-        marks = ",".join(f":{name}" for name in params)
-        for row in conn.execute(f"""SELECT filters FROM subscriptions
-                WHERE enabled=1 AND owner_id IN ({marks}) ORDER BY id""", params):
-            try:
-                filters = json.loads(row["filters"])
-                if not isinstance(filters, dict):
-                    continue
-                first, last = date.fromisoformat(filters["date_from"]), date.fromisoformat(filters["date_till"])
-                if last < now.date() + timedelta(days=1) or first > last or first > now.date() + timedelta(days=45):
-                    continue
-                if "RIX" not in normalize_origins(filters.get("origins")).split(","):
-                    continue
-                specs[_party_spec(filters["adults"], filters.get("children_ages"))] = None
-            except (ValueError, TypeError, KeyError):
-                continue  # malformed legacy personal data never schedules work
     return list(specs)
+
+
+def active_pax_specs(conn, now=None) -> list[str]:
+    """Riga-only compatibility view of the same owned-or-bootstrap planner."""
+    return [spec for origin, spec in active_collection_scopes(conn, now) if origin == "RIX"]
 
 
 def active_collection_scopes(conn, now=None) -> list[tuple[str, str]]:
     """Exact (airport, party) demand; never multiply unrelated user requests.
 
-    Legacy global composition requests and defaults remain Riga-only. New
-    durable requests and active approved subscriptions retain their own airport
-    selection. These activate the existing three date tiers, not an exact-filter
+    Approved, currently collectable durable requests and subscriptions replace
+    bootstrap work. Only when none exists do defaults and recent anonymous
+    requests activate Riga-only collection. Owned requests retain their own
+    airports. These activate the existing three date tiers, not an exact-filter
     refresh or any extension beyond the current 45-day collection horizon.
     """
     from .collection_requests import active_scopes
     from .telegram_bot import approved_user_ids
 
     now = now or datetime.now(timezone.utc)
-    scopes = dict.fromkeys(("RIX", spec) for spec in active_pax_specs(conn, now))
+    scopes = {}
     requested = list(active_scopes(conn, now=now))
     approved = approved_user_ids(conn)
     if approved:
@@ -129,6 +109,8 @@ def active_collection_scopes(conn, now=None) -> list[tuple[str, str]]:
                 continue
     for filters in requested:
         try:
+            if not isinstance(filters, dict):
+                continue
             first, last = date.fromisoformat(filters["date_from"]), date.fromisoformat(filters["date_till"])
             if first > last or last < now.date() + timedelta(days=1) or first > now.date() + timedelta(days=45):
                 continue
@@ -137,7 +119,9 @@ def active_collection_scopes(conn, now=None) -> list[tuple[str, str]]:
                 scopes[(origin, spec)] = None
         except (ValueError, TypeError, KeyError):
             continue
-    return list(scopes)
+    if scopes:
+        return list(scopes)
+    return [("RIX", spec) for spec in _bootstrap_pax_specs(conn, now)]
 
 
 def parse_pax(spec: str) -> tuple[int, list[int]]:
