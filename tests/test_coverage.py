@@ -72,6 +72,22 @@ def test_recorded_full_waavo_run_proves_only_selected_source(conn):
     assert {source["source"] for source in both["sources"]} == {"joinup", "waavo"}
 
 
+@pytest.mark.parametrize("running", [False, True])
+@pytest.mark.parametrize("marker", [False, True])
+def test_discovery_demand_never_claims_inventory_cells_or_broad_running(conn, running, marker):
+    add_run(conn, running=running, start=NOW-timedelta(minutes=2),
+            params={"collector_owner": OWNER, "discovery_complete": True,
+                    **({"discovery_contract": "filtered_hotel_discovery_v1"} if marker else {})})
+    if not marker:
+        conn.execute("UPDATE fetch_runs SET tier='demand'")
+        conn.commit()
+    result = read(conn)
+    assert result["state"] == "partial" and not result["complete"]
+    assert result["last_complete_at"] is None
+    assert result["sources"][0]["covered_intervals"] == []
+    assert "filtered_discovery_only" in result["reasons"]
+
+
 def test_both_sources_need_independent_complete_evidence(conn):
     add_run(conn)
     add_run(conn, "joinup")

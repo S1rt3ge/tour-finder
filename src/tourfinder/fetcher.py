@@ -243,6 +243,137 @@ def run_waavo_fetch(conn, client: waavo.WaavoClient,
     return _finish_run(conn, run_id, client, writer.offers_seen, errors, writer=writer)
 
 
+def _discovery_filter_match(hotel, offer, filters):
+    """Repeat local search semantics before admitting a discovered observation."""
+    from . import countries, meals
+
+    if offer.get("currency") != "EUR" or not offer.get("price_cents"):
+        return False
+    if filters.get("budget_max") and offer["price_cents"] > filters["budget_max"] * 100:
+        return False
+    raw_boards = {part.strip() for part in (filters.get("boards") or "").split(",") if part.strip()}
+    if raw_boards and offer.get("board_code") not in raw_boards:
+        return False
+    categories = set((filters.get("board_categories") or "").split(",")) - {""}
+    if categories and meals.category(offer.get("board_code"), offer.get("board_name")) not in categories:
+        return False
+    selected_countries = {part.strip() for part in (filters.get("countries") or "").split(",") if part.strip()}
+    if selected_countries:
+        raw_id = str(hotel.get("country_id") or "")
+        canonical = countries.canonical_country_id("waavo", raw_id, hotel.get("country_name"))
+        if raw_id not in selected_countries and canonical not in selected_countries:
+            return False
+    if filters.get("stars_min"):
+        leading = str(hotel.get("category") or "")[:1]
+        if leading not in "0123456789" or not leading or int(leading) < filters["stars_min"]:
+            return False
+    # A cheap hotel price is not a source-confirmed hot-tour flag.
+    if filters.get("only_hot"):
+        return False
+    return True
+
+
+def run_waavo_demand_fetch(conn, client, *, filters, query_key, pax_spec,
+                          deadline=None, max_requests=8, meal_group=None,
+                          country_ids=None, operator=None, unsupported_reasons=()) -> dict:
+    """Persist one bounded hotel-discovery branch, never full inventory coverage.
+
+    Dates in filters are absolute. The planner resumes between completed
+    branches; this function never persists or resumes an upstream offset.
+    """
+    import re
+    from .collection_requests import canonical_filters
+    from .origins import normalize_origins
+    from .sources import waavo_discovery
+
+    filters = canonical_filters(filters)
+    origin = normalize_origins(filters["origins"])
+    if "," in origin or not re.fullmatch(r"[0-9a-f]{64}", query_key):
+        raise ValueError("invalid_discovery_scope")
+    date_from, date_till = filters["date_from"], filters["date_till"]
+    first, last = date.fromisoformat(date_from), date.fromisoformat(date_till)
+    if first > last or (last - first).days > 6:
+        raise ValueError("invalid_discovery_dates")
+    adults = filters["adults"]
+    ages = [int(value) for value in (filters.get("children_ages") or "").split(",") if value]
+    duration_from, duration_till = filters["nights_min"], filters["nights_max"]
+    if (type(duration_from) is not int or type(duration_till) is not int
+            or not 1 <= duration_from <= duration_till <= 30
+            or not unsupported_reasons and not 2 <= duration_from <= duration_till <= 21):
+        raise ValueError("invalid_discovery_nights")
+    params = dict(source="waavo", tier="demand", dateFrom=date_from, dateTo=date_till,
+                  departureAirport=origin, adults=adults, children_ages=ages,
+                  durationFrom=duration_from, durationTo=duration_till, max_pages=None,
+                  scope_validation="response_date_nights_v1",
+                  discovery_contract="filtered_hotel_discovery_v1",
+                  demand_contract="waavo_discovery_v1", query_key=query_key,
+                  filters=filters, mealGroupFrom=meal_group, meal_group=meal_group,
+                  country_ids=country_ids, operator=operator,
+                  unsupported_reasons=list(unsupported_reasons),
+                  max_requests=max_requests, discovery_complete=False)
+    run_id = _start_run(conn, "waavo", "demand", pax_spec, params)
+    writer = _BatchWriter(conn, run_id)
+    errors, rejected = [], 0
+    blocked = False
+    try:
+        client.deadline = deadline
+        client.max_requests = max_requests
+        _check_deadline(deadline)
+        if unsupported_reasons:
+            errors.append("partial: discovery_filters_unsupported")
+        else:
+            for raw in client.search_pages(date_from, date_till, adults, children_ages=ages,
+                    duration_from=duration_from, duration_till=duration_till, origin=origin,
+                    meal_group=meal_group, stars_min=filters.get("stars_min"),
+                    country_ids=country_ids, budget_max=filters.get("budget_max"), operator=operator):
+                _check_deadline(deadline)
+                violation = _waavo_scope_violation(raw, date_from, date_till,
+                                                   duration_from, duration_till)
+                if violation:
+                    errors.append("partial: waavo_response_scope_mismatch:" + violation)
+                    break
+                if operator is not None and raw.get("operatorCode") != operator:
+                    errors.append("partial: waavo_response_scope_mismatch:operator")
+                    break
+                # The adapter requires echoed party/origin/currency, including
+                # excluded operators; missing echoes are never filled in.
+                hotel, offer, review = waavo_discovery.normalize(raw, adults, ages, origin=origin)
+                if waavo_discovery.should_skip(raw):
+                    continue
+                if not _discovery_filter_match(hotel, offer, filters):
+                    rejected += 1
+                    continue
+                writer.add(hotel, offer, review=review)
+            if not errors and getattr(client, "exhausted", False) is not True:
+                errors.append("partial: discovery_not_exhausted")
+    except waavo.WaavoBlockedError:
+        blocked = True
+        errors.append("partial: waavo_source_blocked")
+    except (waavo.WaavoDeadlineError, waavo_discovery.WaavoDiscoveryBudgetError,
+            CollectionBudgetExceeded):
+        errors.append("partial: discovery_budget_exhausted")
+    except Exception as exc:
+        conn.rollback()
+        errors.append(type(exc).__name__)
+        log.error("waavo discovery failed: %s", type(exc).__name__)
+    except BaseException:
+        conn.rollback()
+        _finish_run(conn, run_id, client, writer.offers_seen, ["interrupted"], writer=writer)
+        raise
+    try:
+        writer.flush()
+    except Exception as exc:
+        errors.append(type(exc).__name__)
+    params.update(discovery_complete=not errors and getattr(client, "exhausted", False) is True,
+                  local_filter_rejections=rejected, collector_owner=collector_owner())
+    conn.execute("UPDATE fetch_runs SET params=:params WHERE id=:id",
+                 {"params": json.dumps(params), "id": run_id})
+    result = _finish_run(conn, run_id, client, writer.offers_seen, errors, writer=writer)
+    result.update(discovery_complete=params["discovery_complete"], inventory_verified=False,
+                  source_blocked=blocked, local_filter_rejections=rejected)
+    return result
+
+
 def _waavo_scope_violation(raw, date_from, date_till, duration_from, duration_till):
     """One bounded diagnostic; no response values or identifying data in logs."""
     if not isinstance(raw, dict):

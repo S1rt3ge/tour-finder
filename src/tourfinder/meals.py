@@ -32,6 +32,31 @@ _NAMES = {
     "UAI": ("uai", "super uai", "ultra ai", "ultra all inclusive", "super all inclusive",
             "ultra viss iekļauts", "ультра всё включено", "Ультра всё включено"),
 }
+_PREFIXES = (("UAI", ("ultra all inclusive", "super uai")),
+             ("AI", ("all inclusive", "viss iekļauts", "soft ai")))
+_ASCII_UPPER = str.maketrans("abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+_ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def category(board_code: str | None, board_name: str | None) -> str:
+    """Classify one observed meal using the same rules as SQLite category_sql.
+
+    SQLite's built-in UPPER/LOWER fold ASCII only; TRIM removes U+0020, not
+    arbitrary whitespace. Preserve those details rather than broadening a
+    user's category filter when a discovery adapter checks a row in Python.
+    """
+    code = str(board_code if board_code is not None else "").strip(" ").translate(_ASCII_UPPER)
+    name = str(board_name if board_name is not None else "").replace("_", " ").strip(" ").translate(_ASCII_LOWER)
+    for label, codes in _CODES.items():
+        if code in codes:
+            return label
+    for label, names in _NAMES.items():
+        if name in names:
+            return label
+    for label, prefixes in _PREFIXES:
+        if name.startswith(prefixes):
+            return label
+    return "OTHER"
 
 
 def normalize_categories(value: str | None) -> str | None:
@@ -59,8 +84,7 @@ def category_sql(alias: str = "o") -> str:
         cases.append(f"WHEN {name} IN ({values}) THEN '{category}'")
     # Preserve operator-specific qualifiers in board_name; these only group
     # the meal plan. They do not promise identical drinks or service levels.
-    for category, prefixes in (("UAI", ("ultra all inclusive", "super uai")),
-                               ("AI", ("all inclusive", "viss iekļauts", "soft ai"))):
+    for category, prefixes in _PREFIXES:
         matches = " OR ".join(f"{name} LIKE {quote(prefix + '%')}" for prefix in prefixes)
         cases.append(f"WHEN {matches} THEN '{category}'")
     return "CASE " + " ".join(cases) + " ELSE 'OTHER' END"

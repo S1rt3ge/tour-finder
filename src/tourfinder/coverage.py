@@ -264,6 +264,13 @@ def get_search_coverage(conn, filters, now=None, queue_override=None):
                 overlap = {day for day in supported_days if run_first <= day <= run_last}
                 if not overlap:
                     continue
+                # Hotel discovery returns selected minimum-price variants,
+                # not all rooms/dates. Even exhausted, exact demand parts
+                # must never fill inventory cells or claim a broad search is
+                # running, regardless of any accidental inventory marker.
+                if row["tier"] == "demand" or params.get("discovery_contract"):
+                    reasons.append("filtered_discovery_only")
+                    continue
                 errors = json.loads(row["errors"]) if row["errors"] is not None else []
                 if "max_pages" not in params:
                     reasons.append("missing_run_metadata")
