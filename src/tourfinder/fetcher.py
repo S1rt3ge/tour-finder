@@ -47,7 +47,7 @@ def _start_run(conn, source, tier, pax_spec, params):
     return run_id
 
 
-def _finish_run(conn, run_id, client, offers_seen, errors):
+def _finish_run(conn, run_id, client, offers_seen, errors, *, writer=None):
     conn.execute(
         "UPDATE fetch_runs SET finished_at=:now, requests_made=:req, "
         "offers_seen=:seen, errors=:errors WHERE id=:id",
@@ -55,6 +55,10 @@ def _finish_run(conn, run_id, client, offers_seen, errors):
          "errors": json.dumps(errors) if errors else None, "id": run_id},
     )
     conn.commit()
+    if writer is not None:
+        log.info("run %s write batches: batch_size=%s flushes=%s committed=%s flush_seconds=%.3f",
+                 run_id, writer.batch_size, writer.flush_count, writer.flush_committed,
+                 writer.flush_seconds)
     return {"run_id": run_id, "offers_seen": offers_seen,
             "requests_made": client.requests_made, "errors": errors,
             "completed": not errors}
@@ -78,6 +82,7 @@ def run_fetch(conn, client: joinup.JoinUpClient,
     writer = _BatchWriter(conn, run_id)
     errors: list[str] = []
     try:
+        client.deadline = deadline
         _check_deadline(deadline)
         destinations = client.destinations(origin)
         if only_destinations:
@@ -136,13 +141,13 @@ def run_fetch(conn, client: joinup.JoinUpClient,
                     writer.flush()
                 log.info("%s done, offers so far: %s, requests: %s",
                          dest_id, writer.offers_seen, client.requests_made)
-            except (joinup.JoinUpBlockedError, CollectionBudgetExceeded):
+            except (joinup.JoinUpBlockedError, joinup.JoinUpDeadlineError, CollectionBudgetExceeded):
                 raise
             except Exception as exc:  # one bad destination must not kill the run
                 conn.rollback()
                 log.error("destination %s failed: %s", dest_id, type(exc).__name__)
                 errors.append(f"{dest_id}: {type(exc).__name__}")
-    except (joinup.JoinUpBlockedError, CollectionBudgetExceeded) as exc:
+    except (joinup.JoinUpBlockedError, joinup.JoinUpDeadlineError, CollectionBudgetExceeded) as exc:
         errors.append(str(exc))
         log.error("run stopped: %s", exc)
     except Exception as exc:
@@ -151,7 +156,7 @@ def run_fetch(conn, client: joinup.JoinUpClient,
         log.error("joinup run failed: %s", type(exc).__name__)
     except BaseException:
         conn.rollback()
-        _finish_run(conn, run_id, client, writer.offers_seen, ["interrupted"])
+        _finish_run(conn, run_id, client, writer.offers_seen, ["interrupted"], writer=writer)
         raise
     try:
         writer.flush()
@@ -159,7 +164,7 @@ def run_fetch(conn, client: joinup.JoinUpClient,
         errors.append(type(exc).__name__)
     if max_pages:
         errors.append("partial: max_pages limits source coverage")
-    return _finish_run(conn, run_id, client, writer.offers_seen, errors)
+    return _finish_run(conn, run_id, client, writer.offers_seen, errors, writer=writer)
 
 
 def run_waavo_fetch(conn, client: waavo.WaavoClient,
@@ -179,6 +184,7 @@ def run_waavo_fetch(conn, client: waavo.WaavoClient,
     writer = _BatchWriter(conn, run_id)
     errors: list[str] = []
     try:
+        client.deadline = deadline
         _check_deadline(deadline)
         for raw in client.search_pages(date_from, date_till, adults,
                                        children_ages=children_ages,
@@ -190,7 +196,7 @@ def run_waavo_fetch(conn, client: waavo.WaavoClient,
             if not offer["source_hotel_id"] or not offer["date_start"]:
                 continue
             writer.add(hotel, offer, review=review)
-    except (waavo.WaavoBlockedError, CollectionBudgetExceeded) as exc:
+    except (waavo.WaavoBlockedError, waavo.WaavoDeadlineError, CollectionBudgetExceeded) as exc:
         errors.append(str(exc))
         log.error("waavo run stopped: %s", exc)
     except Exception as exc:
@@ -199,7 +205,7 @@ def run_waavo_fetch(conn, client: waavo.WaavoClient,
         errors.append(type(exc).__name__)
     except BaseException:
         conn.rollback()
-        _finish_run(conn, run_id, client, writer.offers_seen, ["interrupted"])
+        _finish_run(conn, run_id, client, writer.offers_seen, ["interrupted"], writer=writer)
         raise
     try:
         writer.flush()
@@ -207,7 +213,7 @@ def run_waavo_fetch(conn, client: waavo.WaavoClient,
         errors.append(type(exc).__name__)
     if max_pages:
         errors.append("partial: max_pages limits source coverage")
-    return _finish_run(conn, run_id, client, writer.offers_seen, errors)
+    return _finish_run(conn, run_id, client, writer.offers_seen, errors, writer=writer)
 
 
 def prune_snapshots(conn) -> int:
@@ -349,28 +355,42 @@ def _store_batch(conn, entries, run_id):
 
 class _BatchWriter:
     # 40 * 19 offer columns stays below SQLite's legacy 999 parameter limit.
-    BATCH_SIZE = 40
+    SQLITE_BATCH_SIZE = 40
+    # Keep remote PostgreSQL transactions modest while amortizing round trips.
+    # The largest statement binds 200 * 19 = 3800 values.
+    POSTGRES_BATCH_SIZE = 200
 
     def __init__(self, conn, run_id):
         self.conn, self.run_id = conn, run_id
+        self.batch_size = (self.POSTGRES_BATCH_SIZE if conn.dialect == "postgresql"
+                           else self.SQLITE_BATCH_SIZE)
         self.entries = []
         self.offers_seen = 0
+        self.flush_count = 0
+        self.flush_committed = 0
+        self.flush_seconds = 0.0
 
     def add(self, hotel, offer, *, review=None, is_hot=False):
         self.entries.append((hotel, offer, review, is_hot, utcnow()))
-        if len(self.entries) >= self.BATCH_SIZE:
+        if len(self.entries) >= self.batch_size:
             self.flush()
 
     def flush(self):
         if not self.entries:
             return
         entries, self.entries = self.entries, []
+        started = time.monotonic()
+        self.flush_count += 1
         try:
             count = _store_batch(self.conn, entries, self.run_id)
             self.conn.commit()
+            self.flush_committed += 1
         except Exception:
             self.conn.rollback()
             raise
+        finally:
+            # Includes statement/commit/rollback work, never source requests.
+            self.flush_seconds += max(0.0, time.monotonic() - started)
         self.offers_seen += count
 
 
