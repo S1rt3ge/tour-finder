@@ -12,11 +12,13 @@
     botUsername: document.body.dataset.botUsername || '', lastFilters: null, saveFilters: null,
     searchRequest: null, searchSerial: 0, dealsRequest: null, dealsSerial: 0,
     savedSerial: 0, historySerial: 0, detailSerial: 0, detailRequest: null, toastTimer: null, subscriptions: [], optionsLoaded: false, optionsLoading: false,
-    queuedPax: new Set(), pendingPax: new Set(), paxErrors: new Map(),
+    queuedRequests: new Set(), pendingRequests: new Set(), requestErrors: new Map(),
   };
   const OPERATORS = {joinup: 'Join Up', teztour: 'Tez Tour', novaturas: 'Novatours', coral: 'Coral', anextour: 'Anex', itaka: 'Itaka'};
   const BOARD_LABELS = {RO: 'Без питания', BB: 'Завтраки', HB: 'Двухразовое питание', FB: 'Трёхразовое питание', AI: 'Всё включено', UAI: 'Ультра всё включено', OTHER: 'Другое / не указано'};
   const INCLUDED_MEALS = ['BB', 'HB', 'FB', 'AI', 'UAI'];
+  const AIRPORTS = {RIX: 'Рига', VNO: 'Вильнюс', TLL: 'Таллин'};
+  const MATCHING_FILTERS = ['date_from', 'date_till', 'origins', 'adults', 'children_ages', 'nights_min', 'nights_max', 'budget_max', 'boards', 'board_categories', 'countries', 'only_hot', 'stars_min'];
   const dialogOpeners = new WeakMap();
   const activeRequests = new Set();
   const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -75,6 +77,10 @@
     try { return new Intl.NumberFormat('ru-RU', {style: 'currency', currency, maximumFractionDigits: 0}).format(value / 100); }
     catch { return new Intl.NumberFormat('ru-RU', {maximumFractionDigits: 0}).format(value / 100) + ' ' + String(currency); }
   }
+  function countLabel(count, one, few, many) {
+    const category = new Intl.PluralRules('ru').select(Number(count));
+    return count + ' ' + ({one, few, many}[category] || many);
+  }
   function dateLabel(value, withTime = false) {
     if (!value) return 'Дата неизвестна';
     const date = new Date(String(value).length === 10 ? value + 'T12:00:00' : value);
@@ -115,17 +121,18 @@
     if (reasons.includes('dates_outside_horizon')) {
       parts.push(coverage.state === 'unsupported' ? 'Выбранные даты сейчас не собираются.' : 'Часть выбранных дат сейчас не собирается.');
       if (coverage.horizon?.date_from && coverage.horizon?.date_till) parts.push('Текущий диапазон вылетов: ' + dateLabel(coverage.horizon.date_from) + ' — ' + dateLabel(coverage.horizon.date_till) + '.');
-      parts.push('Заявка на состав не расширяет диапазон дат.');
+      parts.push('Заявка на сбор не расширяет диапазон дат.');
     }
     if (reasons.includes('nights_outside_source_range')) {
       for (const source of Array.isArray(coverage.sources) ? coverage.sources : []) {
         if (!Array.isArray(source.reasons) || !source.reasons.includes('nights_outside_source_range')) continue;
         const nights = source.supported_nights;
-        if (Number.isInteger(nights?.min) && Number.isInteger(nights?.max)) parts.push((source.source === 'waavo' ? 'Waavo' : source.source === 'joinup' ? 'Join Up' : 'Один из источников') + ': диапазон сбора по числу ночей — ' + nights.min + '–' + nights.max + '.');
+        if (Number.isInteger(nights?.min) && Number.isInteger(nights?.max)) parts.push((source.source === 'waavo' ? 'Waavo' : source.source === 'joinup' ? 'Join Up' : 'Один из источников') + (source.origin_code ? ' (' + String(source.origin_code) + ')' : '') + ': диапазон сбора по числу ночей — ' + nights.min + '–' + nights.max + '.');
       }
-      parts.push('Заявка на состав не расширяет диапазон длительности у источников.');
+      parts.push('Заявка на сбор не расширяет диапазон длительности у источников.');
     }
     if (reasons.includes('rooms_unsupported')) parts.push('Сбор выбранного размещения пока не поддерживается.');
+    if (reasons.includes('origin_unsupported')) parts.push('Сбор из части выбранных аэропортов у источников пока не подтверждён.');
     if (coverage.state === 'unsupported') {
       if (!parts.length) parts.push('Эти параметры сейчас вне поддерживаемого диапазона сбора.');
       parts.push('Измените параметры, чтобы искать в текущем диапазоне.');
@@ -134,17 +141,43 @@
     } else if (!coverage.complete) {
       parts.push('Для выбранного состава и параметров пока не подтверждён свежий полный сбор.');
       if (coverage.state === 'running') parts.push('Последний сбор ещё не отмечен завершённым.');
-      if (coverage.state === 'queued' || coverage.queue?.requested === true) parts.push('Заявка на состав активна; срок завершения неизвестен.');
+      if (coverage.state === 'queued' || coverage.queue?.requested === true) parts.push((coverage.queue?.scope === 'exact_search' ? 'Заявка на эти параметры сохранена.' : 'Заявка на сбор состава сохранена.') + ' Это не подтверждает запуск сбора; срок неизвестен.');
       if (emptyResult) parts.push('Это не означает, что у продавцов нет подходящих туров.');
     }
     return parts.join(' ');
   }
   function searchCoverageRestricted(coverage) {
-    return Array.isArray(coverage?.reasons) && coverage.reasons.some(reason => ['dates_outside_horizon', 'nights_outside_source_range', 'rooms_unsupported'].includes(reason));
+    return Array.isArray(coverage?.reasons) && coverage.reasons.some(reason => ['dates_outside_horizon', 'nights_outside_source_range', 'rooms_unsupported', 'origin_unsupported'].includes(reason));
   }
   function localDate(offset = 0) {
     const date = new Date(); date.setDate(date.getDate() + offset);
     return [date.getFullYear(), String(date.getMonth() + 1).padStart(2, '0'), String(date.getDate()).padStart(2, '0')].join('-');
+  }
+  function originCodes(value) {
+    // Missing origins belong to legacy Riga searches; an explicit empty
+    // selection stays empty so validation cannot silently broaden it.
+    return Array.from(new Set(String(value ?? 'RIX').split(',').map(code => code.trim().toUpperCase()).filter(Boolean))).sort();
+  }
+  function originSelectionLabel(filters) {
+    const codes = originCodes(filters.origins);
+    if (!codes.length) return 'Аэропорт не выбран';
+    if (codes.length === 3 && codes.every(code => Object.hasOwn(AIRPORTS, code))) return 'Рига, Вильнюс, Таллин';
+    return codes.map(code => AIRPORTS[code] || code).join(', ');
+  }
+  function offerOriginLabel(offer) {
+    const code = String(offer.origin_code || '').trim().toUpperCase();
+    const name = AIRPORTS[code] || offer.origin_name;
+    return name ? String(name) + (code ? ' (' + code + ')' : '') : code || 'Аэропорт не указан';
+  }
+  function syncOrigins() {
+    const codes = Array.from(form.querySelectorAll('[name=origin]:checked')).map(input => input.value);
+    $('origins-any').setAttribute('aria-pressed', String(codes.length === 3 && codes.every(code => Object.hasOwn(AIRPORTS, code))));
+    $('route-origin').textContent = codes.length === 3 && codes.every(code => Object.hasOwn(AIRPORTS, code)) ? 'Три аэропорта'
+      : codes.length === 1 ? AIRPORTS[codes[0]] || codes[0] : codes.length ? codes.length + ' аэропорта' : 'Выберите вылет';
+  }
+  function selectOrigins(codes) {
+    for (const input of form.querySelectorAll('[name=origin]')) input.checked = codes.includes(input.value);
+    syncOrigins(); haptic();
   }
   function partyLabel(filters) {
     const adults = Number(filters.adults) || 2;
@@ -157,7 +190,7 @@
     return offer.board_label || BOARD_LABELS[offer.board_category] || original || 'Питание не указано';
   }
   function filterDescription(filters) {
-    const parts = [dateLabel(filters.date_from) + ' — ' + dateLabel(filters.date_till), partyLabel(filters), filters.nights_min + '–' + filters.nights_max + ' ночей'];
+    const parts = [originSelectionLabel(filters), dateLabel(filters.date_from) + ' — ' + dateLabel(filters.date_till), partyLabel(filters), filters.nights_min + '–' + filters.nights_max + ' ночей'];
     if (filters.budget_max) parts.push('до ' + money(Number(filters.budget_max) * 100));
     if (filters.stars_min) parts.push('от ' + filters.stars_min + ' ★');
     if (filters.board_categories) parts.push(String(filters.board_categories).split(',').map(code => BOARD_LABELS[code] || code).join(' / '));
@@ -205,7 +238,7 @@
     for (const controller of activeRequests) controller.abort();
     state.lastFilters = null; state.saveFilters = null; state.subscriptions = [];
     state.optionsLoaded = false; state.optionsLoading = false;
-    state.queuedPax.clear(); state.pendingPax.clear(); state.paxErrors.clear();
+    state.queuedRequests.clear(); state.pendingRequests.clear(); state.requestErrors.clear();
     $('search-storage').hidden = true; $('search-storage').textContent = ''; $('options-note').hidden = true;
     clearTimeout(state.toastTimer); $('toast').hidden = true; $('toast').textContent = '';
     for (const dialog of document.querySelectorAll('dialog[open]')) closeDialog(dialog);
@@ -276,6 +309,7 @@
   function currentFilters() {
     const fields = form.elements;
     const filters = {date_from: fields.date_from.value, date_till: fields.date_till.value, adults: Number(fields.adults.value), nights_min: Number(fields.nights_min.value), nights_max: Number(fields.nights_max.value)};
+    filters.origins = originCodes(Array.from(form.querySelectorAll('[name=origin]:checked')).map(input => input.value).join(',')).join(',');
     const ages = Array.from($('age-inputs').querySelectorAll('input')).map(input => Number(input.value)).sort((a, b) => a - b);
     if (ages.length) filters.children_ages = ages.join(',');
     if (fields.budget_max.value) filters.budget_max = Number(fields.budget_max.value);
@@ -293,7 +327,8 @@
     if (!form.reportValidity()) return null;
     const filters = currentFilters();
     let error = '';
-    if (filters.date_from < localDate()) error = 'Выберите дату вылета не раньше сегодняшней.';
+    if (!originCodes(filters.origins).length || originCodes(filters.origins).some(code => !Object.hasOwn(AIRPORTS, code))) error = 'Выберите хотя бы один аэропорт: Рига, Вильнюс или Таллин.';
+    else if (filters.date_from < localDate()) error = 'Выберите дату вылета не раньше сегодняшней.';
     else if (filters.date_till < filters.date_from) error = 'Конец периода должен быть не раньше его начала.';
     else if ((Date.parse(filters.date_till) - Date.parse(filters.date_from)) / 86400000 > 90) error = 'Выберите диапазон вылета не длиннее 90 дней.';
     else if (filters.nights_max < filters.nights_min) error = 'Максимальное число ночей должно быть не меньше минимального.';
@@ -315,12 +350,14 @@
     form.elements.only_hot.checked = Boolean(filters.only_hot);
     const ages = String(filters.children_ages || '').split(',').filter(Boolean);
     form.elements.children.value = ages.length; syncChildAges(ages);
+    const restored = {...filters, origins: originCodes(filters.origins).join(',')};
     for (const [name, key, target, label] of [
+      ['origin', 'origins', $('origin-options'), value => AIRPORTS[value] || 'Неизвестный аэропорт · ' + value],
       ['board', 'boards', $('board-options'), value => 'Сохранённое питание · ' + value],
       ['board_category', 'board_categories', form.querySelector('.meal-chips'), value => BOARD_LABELS[value] || 'Сохранённая категория · ' + value],
       ['country', 'countries', $('country-options'), value => 'Сохранённая страна · ' + value],
     ]) {
-      const selected = new Set(String(filters[key] || '').split(',').filter(Boolean));
+      const selected = new Set(String(restored[key] || '').split(',').filter(Boolean));
       const present = new Set(Array.from(target.querySelectorAll('input')).map(input => input.value));
       const missing = Array.from(selected).filter(value => !present.has(value)).map(value => ({value}));
       // A delayed/failed dictionary must never broaden a saved search. Keep
@@ -329,7 +366,7 @@
       for (const input of target.querySelectorAll('input')) input.checked = selected.has(input.value);
     }
     if (filters.boards) { $('raw-meals').open = true; $('raw-meals').closest('.more-filters').open = true; }
-    syncMealPresets(); collapseFilters(false);
+    syncMealPresets(); syncOrigins(); collapseFilters(false);
   }
 
   function syncMealPresets() {
@@ -352,6 +389,7 @@
       const item = el('label', 'filter-chip'); const input = el('input');
       input.type = 'checkbox'; input.name = name; input.value = value; input.checked = checked.has(value);
       if (name === 'board') input.addEventListener('change', syncMealPresets);
+      if (name === 'origin') input.addEventListener('change', syncOrigins);
       item.append(input, el('span', '', text)); return item;
     }));
   }
@@ -491,7 +529,7 @@
     $('save-search').hidden = false;
     $('search-submit').disabled = true; $('search-submit').querySelector('span').textContent = 'Ищем подходящие туры…';
     $('search-results-title').textContent = 'Сверяем ваши параметры';
-    $('search-results-caption').textContent = partyLabel(filters) + ' · цена за всех';
+    $('search-results-caption').textContent = originSelectionLabel(filters) + ' · ' + partyLabel(filters) + ' · цена за всех';
     $('search-storage').hidden = true; $('search-storage').textContent = '';
     loading($('search-results'), 'Ищем среди собранных предложений…');
     try {
@@ -500,7 +538,7 @@
       if (!Array.isArray(data.results)) throw new Error('Не удалось прочитать предложения. Попробуйте позже.');
       $('search-results').removeAttribute('aria-busy');
       $('search-results-title').textContent = data.results.length ? 'Варианты для вашего отпуска' : 'Пока без совпадений';
-      $('search-results-caption').textContent = (data.results.length ? data.results.length + ' отелей · ' : '') + partyLabel(filters) + ' · цена за всех';
+      $('search-results-caption').textContent = (data.results.length ? countLabel(data.results.length, 'отель', 'отеля', 'отелей') + ' · ' : '') + originSelectionLabel(filters) + ' · ' + partyLabel(filters) + ' · цена за всех';
       const coverageNote = searchCoverageMessage(data.coverage, !data.results.length);
       const unsupported = data.coverage?.state === 'unsupported';
       $('search-storage').textContent = [storageMessage(data.storage), data.results.length ? coverageNote : ''].filter(Boolean).join(' ');
@@ -511,17 +549,18 @@
       } else {
         const ages = filters.children_ages || '';
         const known = Array.isArray(data.available_compositions) && data.available_compositions.some(item => Number(item.pax_adl) === filters.adults && String(item.children_ages || '') === ages);
-        if (data.queued_spec) { const spec = compositionSpec(filters); state.queuedPax.add(spec); state.paxErrors.delete(spec); }
-        const queued = Boolean(data.queued_spec) || state.queuedPax.has(compositionSpec(filters));
+        // Legacy queued_spec acknowledges a party only, never these exact
+        // airports/dates/nights. Only an explicit full request confirms them.
+        const queued = state.queuedRequests.has(collectionScopeKey(filters));
         const message = coverageNote || (queued
-          ? 'Запрос на этот состав сохранён. Предложения появятся, если следующий успешный сбор найдёт подходящие туры; точное время неизвестно.'
+          ? 'Заявка с этими аэропортами, датами и параметрами сохранена. Результат зависит от успешного сбора источников; срок неизвестен.'
           : data.storage?.partial ? (archiveSearchLimited(data.storage)
             ? 'Проверена ограниченная часть архива, поэтому отсутствие совпадений пока не подтверждено. Уточните параметры или запросите свежий сбор для этого состава.'
             : 'Не все данные удалось проверить. Повторите поиск позже или уточните параметры.')
           : known ? 'В собранных данных сейчас нет совпадений для этих дат и фильтров. Можно изменить параметры или запросить свежий сбор для этого состава.'
           : 'Для этого точного состава пока нет собранных предложений. Цены другого состава могут отличаться — мы не будем их подменять.');
-        empty($('search-results'), unsupported ? 'За пределами текущего сбора' : queued ? 'Состав добавлен в сбор' : 'Попробуем другие параметры?', message, () => { collapseFilters(false); form.elements.date_from.focus(); }, 'Изменить поиск');
-        if (!unsupported && !demoMode && state.user) appendCompositionRequest($('search-results').querySelector('.empty-state'), filters, known, data.coverage);
+        empty($('search-results'), unsupported ? 'За пределами текущего сбора' : queued ? 'Заявка сохранена' : 'Попробуем другие параметры?', message, () => { collapseFilters(false); form.elements.date_from.focus(); }, 'Изменить поиск');
+        if (!unsupported && !demoMode && state.user) appendCollectionRequest($('search-results').querySelector('.empty-state'), filters, known, data.coverage);
       }
       if (window.matchMedia('(max-width: 699px)').matches) collapseFilters(true);
     } catch (error) {
@@ -545,54 +584,65 @@
     return photo;
   }
 
-  function compositionPayload(filters) {
-    return {adults: Number(filters.adults), children_ages: String(filters.children_ages || '').split(',').filter(value => value.trim()).map(Number).sort((a, b) => a - b)};
+  function matchingFilterPayload(filters) {
+    const payload = Object.fromEntries(MATCHING_FILTERS.filter(key => filters[key] !== undefined && filters[key] !== null && filters[key] !== '').map(key => [key, filters[key]]));
+    payload.origins = originCodes(filters.origins).join(',');
+    payload.adults = Number(filters.adults ?? 2);
+    payload.children_ages = String(filters.children_ages || '').split(',').filter(value => value.trim()).map(Number).sort((a, b) => a - b).join(',');
+    payload.nights_min = Number(filters.nights_min ?? 1); payload.nights_max = Number(filters.nights_max ?? 30);
+    payload.only_hot = filters.only_hot === true;
+    for (const key of ['boards', 'board_categories', 'countries']) {
+      const values = Array.from(new Set(String(filters[key] || '').split(',').map(value => key === 'board_categories' ? value.trim().toUpperCase() : value.trim()).filter(Boolean))).sort();
+      if (values.length) payload[key] = values.join(','); else delete payload[key];
+    }
+    for (const key of ['budget_max', 'stars_min']) if (payload[key] !== undefined) payload[key] = Number(payload[key]);
+    return payload;
   }
-  function compositionSpec(filters) {
-    const payload = compositionPayload(filters);
-    return String(payload.adults) + (payload.children_ages.length ? '+' + payload.children_ages.length + ':' + payload.children_ages.join(',') : '');
+  function collectionScopeKey(filters) {
+    return JSON.stringify(Object.entries(matchingFilterPayload(filters)).sort(([a], [b]) => a.localeCompare(b)));
   }
-  function refreshCompositionRequests(spec) {
-    for (const panel of document.querySelectorAll('[data-pax-request]')) {
-      if (panel.dataset.paxRequest !== spec) continue;
+  function refreshCollectionRequests(spec) {
+    for (const panel of document.querySelectorAll('[data-collection-request]')) {
+      if (panel.dataset.collectionRequest !== spec) continue;
       const trigger = panel.querySelector('button'); const note = panel.querySelector('p');
-      const queued = state.queuedPax.has(spec); const pending = state.pendingPax.has(spec); const error = state.paxErrors.get(spec);
+      const queued = state.queuedRequests.has(spec); const pending = state.pendingRequests.has(spec); const error = state.requestErrors.get(spec);
       trigger.disabled = queued || pending;
-      trigger.querySelector('span').textContent = queued ? 'Состав добавлен в сбор' : pending ? 'Сохраняем запрос…' : panel.dataset.paxRequestLabel;
+      trigger.querySelector('span').textContent = queued ? 'Заявка сохранена' : pending ? 'Сохраняем запрос…' : panel.dataset.collectionRequestLabel;
       note.className = error ? 'form-error' : 'field-hint';
       note.setAttribute('role', error ? 'alert' : 'status');
-      note.textContent = error || (panel.dataset.paxRequestRestricted === 'true'
-        ? (queued ? 'Запрос на состав сохранён. ' : 'Заявка относится к составу туристов. ') + 'Она не расширяет диапазон дат и длительности сбора; срок неизвестен.'
-        : queued ? 'Запрос сохранён. Предложения появятся, если следующий успешный сбор найдёт подходящие туры. Срок пока неизвестен.' : 'После отправки состав попадёт в очередной сбор источников.');
+      note.textContent = error || (panel.dataset.collectionRequestRestricted === 'true'
+        ? (queued ? 'Заявка с выбранными параметрами сохранена. ' : 'Заявка сохранит выбранные параметры. ') + 'Она не расширяет поддерживаемый диапазон дат и длительности сбора; срок неизвестен.'
+        : queued ? 'Заявка сохранена с вашими аэропортами, датами и фильтрами. Результат зависит от успешного сбора источников. Срок пока неизвестен.' : 'Сохраним аэропорты, даты, ночи, состав и остальные фильтры. Заявка не гарантирует наличие туров или срок сбора.');
     }
   }
-  function appendCompositionRequest(target, filters, known = false, coverage = null) {
-    const spec = compositionSpec(filters); const panel = el('div'); panel.dataset.paxRequest = spec;
-    panel.dataset.paxRequestLabel = known ? 'Запросить свежие предложения' : 'Собрать предложения для этого состава';
-    panel.dataset.paxRequestRestricted = String(searchCoverageRestricted(coverage));
-    const request = button(panel.dataset.paxRequestLabel, 'button button-primary', () => requestComposition({...filters}));
-    panel.append(request, el('p', 'field-hint')); target.append(panel); refreshCompositionRequests(spec);
+  function appendCollectionRequest(target, filters, known = false, coverage = null) {
+    const spec = collectionScopeKey(filters); const panel = el('div'); panel.dataset.collectionRequest = spec;
+    panel.dataset.collectionRequestLabel = known ? 'Запросить свежие предложения' : 'Запросить сбор по этим параметрам';
+    panel.dataset.collectionRequestRestricted = String(searchCoverageRestricted(coverage));
+    const request = button(panel.dataset.collectionRequestLabel, 'button button-primary', () => requestCollection({...filters}));
+    panel.append(request, el('p', 'field-hint')); target.append(panel); refreshCollectionRequests(spec);
   }
-  async function requestComposition(filters) {
+  async function requestCollection(filters) {
     if (demoMode || !state.user) { renderAccess(); return; }
-    const spec = compositionSpec(filters);
-    if (state.pendingPax.has(spec) || state.queuedPax.has(spec)) return;
-    const payload = compositionPayload(filters);
-    if (!Number.isInteger(payload.adults) || payload.adults < 1 || payload.adults > 6 || payload.children_ages.length > 4 || payload.children_ages.some(age => !Number.isInteger(age) || age < 0 || age > 17)) {
-      state.paxErrors.set(spec, 'Проверьте состав: 1–6 взрослых и не больше 4 детей с возрастом от 0 до 17 лет.');
-      refreshCompositionRequests(spec); return;
+    const spec = collectionScopeKey(filters);
+    if (state.pendingRequests.has(spec) || state.queuedRequests.has(spec)) return;
+    const payload = matchingFilterPayload(filters);
+    const ages = payload.children_ages.split(',').filter(Boolean).map(Number);
+    if (!originCodes(payload.origins).length || originCodes(payload.origins).some(code => !Object.hasOwn(AIRPORTS, code)) || !Number.isInteger(payload.adults) || payload.adults < 1 || payload.adults > 6 || ages.length > 4 || ages.some(age => !Number.isInteger(age) || age < 0 || age > 17)) {
+      state.requestErrors.set(spec, 'Проверьте аэропорты и состав: 1–6 взрослых, до 4 детей с возрастом 0–17 лет.');
+      refreshCollectionRequests(spec); return;
     }
-    state.pendingPax.add(spec); state.paxErrors.delete(spec); refreshCompositionRequests(spec);
+    state.pendingRequests.add(spec); state.requestErrors.delete(spec); refreshCollectionRequests(spec);
     try {
-      const data = await api('/api/pax-requests', {method: 'POST', body: payload});
-      if (data.queued !== true) throw new Error('Сервис не подтвердил сохранение запроса. Повторите позже.');
-      state.queuedPax.add(spec); haptic();
+      const data = await api('/api/collection-requests', {method: 'POST', body: {filters: payload}});
+      if (data.queued !== true || data.id === undefined || data.id === null) throw new Error('Сервис не подтвердил сохранение заявки с этими параметрами. Повторите позже.');
+      state.queuedRequests.add(spec); haptic();
     } catch (error) {
-      if (!state.user || state.queuedPax.has(spec) || error.name === 'AbortError') return;
-      const message = [400, 422].includes(error.status) ? 'Проверьте состав: 1–6 взрослых и не больше 4 детей с возрастом от 0 до 17 лет.'
+      if (!state.user || state.queuedRequests.has(spec) || error.name === 'AbortError') return;
+      const message = [400, 422].includes(error.status) ? 'Проверьте аэропорты, даты, ночи, состав и остальные параметры поиска.'
         : error.status === 503 ? 'Не удалось подтвердить запрос на сбор: сервис временно недоступен. Повторите позже.' : error.message;
-      state.paxErrors.set(spec, message);
-    } finally { state.pendingPax.delete(spec); refreshCompositionRequests(spec); }
+      state.requestErrors.set(spec, message);
+    } finally { state.pendingRequests.delete(spec); refreshCollectionRequests(spec); }
   }
   function hotelCard(row, filters, isDrop = false) {
     const card = el('article', 'hotel-card');
@@ -626,7 +676,7 @@
       body.append(rating);
     }
     const facts = el('div', 'hotel-facts');
-    [dateLabel(row.date_start), row.nights + ' ночей', boardLabel(row)].forEach(text => facts.append(el('span', '', text)));
+    [offerOriginLabel(row), dateLabel(row.date_start), row.nights + ' ночей', boardLabel(row)].forEach(text => facts.append(el('span', '', text)));
     body.append(facts);
     if (row.room_name) body.append(el('p', 'room-name', row.room_name));
     const prices = el('div', 'price-block'); const priceMain = el('div');
@@ -647,7 +697,7 @@
     if (isDrop || Number(row.variants) <= 1) actions.append(button('История цены', 'button', () => showHistory(row), 'trend'));
     else {
       const variants = el('div', 'variants-area'); variants.hidden = true;
-      const trigger = button(row.variants + ' вариантов', 'button', () => toggleVariants(variants, trigger, row, filters), 'down');
+      const trigger = button(countLabel(row.variants, 'вариант', 'варианта', 'вариантов'), 'button', () => toggleVariants(variants, trigger, row, filters), 'down');
       trigger.setAttribute('aria-expanded', 'false'); actions.append(trigger);
       body.append(actions); body.append(variants);
     }
@@ -679,7 +729,7 @@
   function variantRow(offer, filters) {
     const row = el('div', 'variant-row'); const head = el('div', 'variant-head');
     head.append(el('span', 'variant-title', dateLabel(offer.date_start) + ' · ' + offer.nights + ' н. · ' + boardLabel(offer)), el('strong', 'variant-price', money(offer.price_cents, offer.currency)));
-    row.append(head, el('p', 'room-name', offer.room_name || offer.board_name || ''));
+    row.append(el('p', 'field-hint', 'Вылет: ' + offerOriginLabel(offer)), head, el('p', 'room-name', offer.room_name || offer.board_name || ''));
     if (isArchived(offer) || offer.stale) row.append(el('p', 'variant-archive-note', observationLabel(offer)));
     const actions = el('div', 'variant-actions');
     actions.append(button('Подробнее о варианте', 'text-button', () => showOffer(offer, filters)), externalLink(offer.link, 'У продавца ↗', 'text-link'));
@@ -739,6 +789,7 @@
     if (storage?.partial) appendStorageNotice(body, storage);
     const specs = el('dl', 'offer-specs');
     const facts = [
+      ['Вылет', offerOriginLabel(offer)],
       ['Даты тура', dateLabel(offer.date_start) + (offer.date_end ? ' — ' + dateLabel(offer.date_end) : '')],
       ['Продолжительность', Number(offer.nights) > 0 ? offer.nights + ' ночей' : 'Не указана'],
       ['Питание', boardLabel(offer)],
@@ -798,16 +849,16 @@
 
   async function runDeals() {
     if (!hasAccess()) { renderAccess(); return; }
-    // /api/drops currently supports party composition, not the other search filters.
+    // Drops apply the exact party and airports, not the other search filters.
     const filters = currentFilters();
     const ages = String(filters.children_ages || '').split(',').filter(Boolean).map(Number);
-    if (!Number.isInteger(filters.adults) || filters.adults < 1 || filters.adults > 6 || ages.length > 4 || ages.some(age => !Number.isInteger(age) || age < 0 || age > 17)) {
-      empty($('deals-results'), 'Уточните состав', 'В поиске выберите от 1 до 6 взрослых и возраст каждого ребёнка.', () => navigate('search'), 'Изменить состав'); return;
+    if (!originCodes(filters.origins).length || originCodes(filters.origins).some(code => !Object.hasOwn(AIRPORTS, code)) || !Number.isInteger(filters.adults) || filters.adults < 1 || filters.adults > 6 || ages.length > 4 || ages.some(age => !Number.isInteger(age) || age < 0 || age > 17)) {
+      empty($('deals-results'), 'Уточните аэропорты и состав', 'В поиске выберите аэропорты, от 1 до 6 взрослых и возраст каждого ребёнка.', () => navigate('search'), 'Изменить параметры'); return;
     }
-    $('deals-party').textContent = partyLabel(filters);
+    $('deals-party').textContent = originSelectionLabel(filters) + ' · ' + partyLabel(filters);
     state.dealsRequest?.abort(); const controller = new AbortController(); state.dealsRequest = controller;
     const serial = ++state.dealsSerial;
-    const params = {adults: filters.adults, hours: 72, limit: 100}; if (filters.children_ages) params.children_ages = filters.children_ages;
+    const params = {origins: originCodes(filters.origins).join(','), adults: filters.adults, hours: 72, limit: 100}; if (filters.children_ages) params.children_ages = filters.children_ages;
     $('refresh-deals').disabled = true; loading($('deals-results'), 'Сравниваем собранные цены…');
     try {
       const data = await api('/api/drops?' + new URLSearchParams(params), {signal: controller.signal});
@@ -898,17 +949,17 @@
     if (mode !== 'deal' && !state.saveFilters.budget_max) { showError($('save-validation'), 'Для сигналов по бюджету сначала задайте бюджет в поиске. Или выберите «О заметной выгоде».'); return; }
     if (!$('save-form').reportValidity()) return;
     if (!fields.name.value.trim()) { showError($('save-validation'), 'Дайте поиску короткое название.'); return; }
-    const allowedFilters = ['date_from', 'date_till', 'adults', 'children_ages', 'nights_min', 'nights_max', 'budget_max', 'boards', 'board_categories', 'countries', 'only_hot', 'stars_min'];
-    const filters = Object.fromEntries(allowedFilters.filter(key => state.saveFilters[key] !== undefined).map(key => [key, state.saveFilters[key]]));
+    const filters = matchingFilterPayload(state.saveFilters);
     const payload = {name: fields.name.value.trim(), filters, notify_mode: mode, min_drop_pct: mode === 'budget' ? 10 : Number(fields.min_drop_pct.value), min_saving_eur: mode === 'budget' ? 100 : Number(fields.min_saving_eur.value), min_review_rating: mode === 'budget' ? 4 : Number(fields.min_review_rating.value), min_review_count: mode === 'budget' ? 20 : Number(fields.min_review_count.value)};
     $('confirm-save').disabled = true; showError($('save-validation'), '');
     try {
       const result = await api('/api/subscriptions', {method: 'POST', body: payload});
-      if (result.collection_requested === true) {
-        const spec = compositionSpec(filters); state.queuedPax.add(spec); state.paxErrors.delete(spec); refreshCompositionRequests(spec);
+      const collectionAccepted = result.collection_request?.queued === true && result.collection_request.id !== undefined && result.collection_request.id !== null;
+      if (collectionAccepted) {
+        const spec = collectionScopeKey(filters); state.queuedRequests.add(spec); state.requestErrors.delete(spec); refreshCollectionRequests(spec);
       }
       closeDialog($('save-dialog')); haptic('medium'); navigate('saved');
-      toast(result.collection_requested === true ? 'Поиск сохранён, состав добавлен в сбор. Предложения зависят от следующего успешного обновления источников.' : state.canNotify ? 'Поиск сохранён. Сообщим о подходящей цене.' : 'Поиск сохранён. Нажмите «Старт» в боте для сообщений.');
+      toast(collectionAccepted ? 'Поиск и заявка с этими параметрами сохранены. Результат зависит от успешного сбора источников; срок неизвестен.' : state.canNotify ? 'Поиск сохранён. Сообщим о подходящей цене.' : 'Поиск сохранён. Нажмите «Старт» в боте для сообщений.');
     } catch (error) { showError($('save-validation'), error.message); }
     finally { $('confirm-save').disabled = false; }
   }
@@ -1019,6 +1070,8 @@
   form.elements.children.addEventListener('input', () => syncChildAges());
   $('meals-any').addEventListener('click', () => selectMeals([]));
   $('meals-included').addEventListener('click', () => selectMeals(INCLUDED_MEALS));
+  $('origins-any').addEventListener('click', () => selectOrigins(Object.keys(AIRPORTS)));
+  for (const input of form.querySelectorAll('[name=origin]')) input.addEventListener('change', syncOrigins);
   for (const input of form.querySelectorAll('[name=board_category], [name=board]')) input.addEventListener('change', syncMealPresets);
   for (const step of document.querySelectorAll('[data-step]')) step.addEventListener('click', () => {
     const [name, amount] = step.dataset.step.split(':'); const input = form.elements[name];

@@ -8,6 +8,7 @@ body[data-theme=dark]{color-scheme:dark;--bg:#172029;--surface:#202c36;--text:#e
 
 /* Meal categories and in-app offer preview. */
 .meal-field{grid-column:1/-1;margin-top:3px;margin-bottom:20px}
+.airport-field{margin-bottom:20px}.airport-chips{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin-bottom:8px}.airport-chips .filter-chip span{text-align:center;min-height:48px;display:flex;flex-direction:column;justify-content:center;gap:4px;padding:8px 5px}.airport-chips small{font-size:9px;font-weight:500;opacity:.8}
 .meal-field legend{font-size:12px;color:var(--text)}
 .meal-presets{display:flex;gap:8px;margin-bottom:10px}
 .meal-presets .text-button{font-size:11px;padding:7px 10px;min-height:35px;border:1px solid var(--line);border-radius:9px;color:var(--muted)}

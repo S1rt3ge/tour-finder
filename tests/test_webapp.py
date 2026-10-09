@@ -89,9 +89,81 @@ def test_saved_search_queues_exact_party_once(client):
         assert response.status_code == 200 and response.json()["collection_requested"]
     conn = db.connect()
     try:
-        assert [row["spec"] for row in conn.execute("SELECT spec FROM pax_requests")] == ["3+2:5,12"]
+        rows = conn.execute("SELECT owner_id,filters FROM collection_requests").fetchall()
+        assert len(rows) == 1 and rows[0]["owner_id"] == "123"
+        scope = json.loads(rows[0]["filters"])
+        assert scope["adults"] == 3 and scope["children_ages"] == "5,12" and scope["origins"] == "RIX"
+        assert conn.execute("SELECT count(*) FROM pax_requests").scalar() == 0
     finally:
         conn.close()
+
+
+def test_collection_requests_are_exact_idempotent_owned_and_read_only_on_get(client):
+    filters = payload()["filters"] | {"adults": 1, "origins": "VNO,RIX", "stars_min": 4,
+                                      "board_categories": "AI,BB", "nights_min": 5, "nights_max": 9}
+    assert client.post("/api/collection-requests", json={"filters": filters}).status_code == 401
+    assert client.post("/api/collection-requests", json={"filters": filters}, headers=auth(789)).status_code == 403
+    first = client.post("/api/collection-requests", json={"filters": filters}, headers=auth())
+    assert first.status_code == 200, first.text
+    row = first.json()
+    assert row["filters"]["origins"] == "RIX,VNO" and row["filters"]["adults"] == 1
+    assert row["coverage"]["complete"] is False and row["coverage"]["queue"]["scope"] == "exact_search"
+    again = client.post("/api/collection-requests", json={"filters": filters | {"origins": "RIX,VNO", "board_categories": "BB,AI"}}, headers=auth())
+    assert again.status_code == 200 and again.json()["id"] == row["id"]
+    different = client.post("/api/collection-requests", json={"filters": filters | {"origins": "TLL"}}, headers=auth())
+    assert different.status_code == 200 and different.json()["id"] != row["id"]
+    assert client.get(f"/api/collection-requests/{row['id']}", headers=auth(456)).status_code == 404
+    assert client.get("/api/collection-requests", headers=auth(456)).json() == {"requests": []}
+    assert len(client.get("/api/collection-requests", headers=auth()).json()["requests"]) == 2
+    searched = client.get("/api/search", params=filters, headers=auth())
+    assert searched.status_code == 200
+    assert searched.json()["coverage"]["queue"]["request_id"] == row["id"]
+    altered = client.get("/api/search", params=filters | {"stars_min": 5}, headers=auth())
+    assert altered.json()["coverage"]["queue"]["requested"] is False
+    assert len(client.get("/api/collection-requests", headers=auth()).json()["requests"]) == 2
+
+
+def test_airport_api_validates_scope_and_preserves_subscription(client):
+    filters = payload()["filters"] | {"origins": "VNO,TLL"}
+    result = client.post("/api/subscriptions", json=payload() | {"filters": filters}, headers=auth())
+    assert result.status_code == 200, result.text
+    assert result.json()["collection_request"]["filters"]["origins"] == "TLL,VNO"
+    saved = client.get("/api/subscriptions", headers=auth()).json()["subscriptions"][0]
+    assert saved["filters"]["origins"] == "TLL,VNO"
+    assert client.get("/api/search", params=filters | {"origins": "LHR"}, headers=auth()).status_code == 400
+    assert client.get("/api/drops", params={"origins": "LHR"}, headers=auth()).status_code == 400
+    assert client.post("/api/collection-requests", json={"filters": filters | {"origins": "LHR"}}, headers=auth()).status_code == 422
+
+
+def test_unsupported_date_scope_is_not_accepted_as_a_collectable_request(client):
+    start = date.today() + timedelta(days=180)
+    filters = {"date_from": start.isoformat(), "date_till": start.isoformat(), "origins": "VNO"}
+    response = client.post("/api/collection-requests", json={"filters": filters}, headers=auth())
+    assert response.status_code == 400
+    saved = client.post("/api/subscriptions", json=payload() | {"filters": filters}, headers=auth())
+    assert saved.status_code == 200 and saved.json()["collection_requested"] is False
+    assert saved.json()["collection_request"] is None
+    assert client.get("/api/collection-requests", headers=auth()).json() == {"requests": []}
+
+
+def test_future_subscription_reserves_capacity_without_claiming_queued_work(client, monkeypatch):
+    from tourfinder import collection_requests
+    monkeypatch.setattr(collection_requests, "MAX_ACTIVE_ORIGIN_PARTIES", 4)
+    start = date.today() + timedelta(days=180)
+    item = payload() | {"filters": {"date_from": start.isoformat(), "date_till": start.isoformat(),
+                                    "origins": "VNO", "adults": 1}}
+    first = client.post("/api/subscriptions", json=item, headers=auth())
+    assert first.status_code == 200 and first.json()["collection_requested"] is False
+    blocked = client.post("/api/subscriptions", json=item | {"filters": item["filters"] | {"origins": "TLL"}}, headers=auth())
+    assert blocked.status_code == 429
+    saved = client.get("/api/subscriptions", headers=auth()).json()["subscriptions"]
+    assert len(saved) == 1
+    assert client.get("/api/collection-requests", headers=auth()).json() == {"requests": []}
+    sub_id = first.json()["id"]
+    assert client.patch(f"/api/subscriptions/{sub_id}", json={"enabled": False}, headers=auth()).status_code == 200
+    replacement = client.post("/api/subscriptions", json=item | {"filters": item["filters"] | {"origins": "TLL"}}, headers=auth())
+    assert replacement.status_code == 200
+    assert client.patch(f"/api/subscriptions/{sub_id}", json={"enabled": True}, headers=auth()).status_code == 429
 
 
 def test_browsing_outage_does_not_become_empty_success(client, monkeypatch):

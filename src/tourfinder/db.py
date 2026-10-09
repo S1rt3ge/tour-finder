@@ -186,6 +186,21 @@ Table(
     Index("idx_telegram_access_status", "status", "requested_at"),
 )
 
+# Owner-scoped, idempotent search requests. They retain the requested filters;
+# queue admission is separate from measured source coverage.
+Table(
+    "collection_requests", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("owner_id", Text, nullable=False),
+    Column("request_key", Text, nullable=False),
+    Column("filters", Text, nullable=False),
+    Column("created_at", Text, nullable=False),
+    Column("updated_at", Text, nullable=False),
+    Column("expires_at", Text, nullable=False),
+    UniqueConstraint("owner_id", "request_key", name="uq_collection_request_owner_scope"),
+    Index("idx_collection_request_active", "expires_at", "owner_id"),
+)
+
 Table(
     "telegram_updates", metadata,
     Column("update_id", Text, primary_key=True),
@@ -243,7 +258,19 @@ def get_engine(path: str | Path | None = None):
         # Production web requests only read the explicitly prepared schema.
         # Avoid DDL/inspection locks during cold starts or archive fallback.
         if url.startswith("sqlite") or not os.environ.get("VERCEL"):
-            metadata.create_all(engine)
+            with engine.begin() as schema_conn:
+                metadata.create_all(schema_conn)
+                if engine.dialect.name == "postgresql":
+                    # Request filters and owner IDs are private to the backend.
+                    # New installations must never expose this table through
+                    # Supabase's client API, even with default public grants.
+                    schema_conn.exec_driver_sql("ALTER TABLE collection_requests ENABLE ROW LEVEL SECURITY")
+                    schema_conn.exec_driver_sql("REVOKE ALL ON collection_requests FROM PUBLIC")
+                    # These roles are Supabase-specific, so plain PostgreSQL
+                    # installations without them remain supported.
+                    for role in ("anon", "authenticated"):
+                        if schema_conn.execute(text("SELECT 1 FROM pg_roles WHERE rolname=:role"), {"role": role}).first():
+                            schema_conn.exec_driver_sql(f"REVOKE ALL ON collection_requests FROM {role}")
             _ensure_new_columns(engine)
         if url.startswith("sqlite"):
             with engine.begin() as c:

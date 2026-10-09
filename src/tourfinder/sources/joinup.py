@@ -12,6 +12,8 @@ from decimal import Decimal, InvalidOperation
 import requests
 from urllib3.util import Timeout
 
+from ..origins import normalize_source_origin, source_origin
+
 log = logging.getLogger(__name__)
 
 SOURCE_NAME = "joinup"
@@ -46,6 +48,13 @@ USER_AGENT = (
 
 RIGA_ORIGIN_ID = "3164"
 HOT_TOUR_TYPE = "hot_tour"
+
+
+def _origin_id(value):
+    code = normalize_source_origin("joinup", value)
+    if code is None:
+        raise ValueError("joinup_invalid_origin")
+    return source_origin("joinup", code)
 
 
 class JoinUpError(RuntimeError):
@@ -130,16 +139,17 @@ class JoinUpClient:
         raise JoinUpError(f"{path}: retries exhausted")
 
     def destinations(self, origin: str) -> list[dict]:
-        return self._get("tour/destinations", origins=origin)["destinations"]
+        return self._get("tour/destinations", origins=_origin_id(origin))["destinations"]
 
     def stays(self, origin: str, destination: str, dates: str) -> list[int]:
-        data = self._get("tour/stays", origins=origin, destinations=destination, dates=dates)
+        data = self._get("tour/stays", origins=_origin_id(origin), destinations=destination, dates=dates)
         return [s["stay"] for s in data.get("stays", [])]
 
     def search_pages(self, origin: str, destinations: str, dates: str, stays: str,
                      pax_adl: int, children_ages: list[int] | None = None,
                      tour_types: str | None = None, max_pages: int | None = None):
         """Yield raw tour dicts across all result pages of one search."""
+        origin = _origin_id(origin)
         page = 1
         while True:
             params = dict(origins=origin, destinations=destinations, dates=dates,
@@ -176,12 +186,15 @@ def ages_str(children_ages: list[int] | None) -> str:
 
 
 def normalize(tour: dict, pax_adl: int, children_ages: list[int] | None = None,
-              lang: str = "lv") -> tuple[dict, list[dict]]:
+              lang: str = "lv", *, origin: str = RIGA_ORIGIN_ID) -> tuple[dict, list[dict]]:
     """Raw API tour -> (hotel row, offer rows with embedded snapshot fields).
 
     pax composition comes from the search query, not the response:
     the API echoes pax back as an empty list.
     """
+    requested_origin = normalize_source_origin("joinup", origin)
+    if requested_origin is None:
+        raise ValueError("joinup_invalid_origin")
     ages = ages_str(children_ages)
     h = tour["hotel"]
     loc = h.get("location") or {}
@@ -205,6 +218,11 @@ def normalize(tour: dict, pax_adl: int, children_ages: list[int] | None = None,
     offers = []
     for o in tour.get("offers", []):
         frm = o.get("from") or {}
+        echoed = frm.get("id")
+        actual_origin = requested_origin if echoed in (None, "") else normalize_source_origin("joinup", echoed)
+        if actual_origin != requested_origin:
+            raise ValueError("joinup_origin_echo_mismatch")
+        origin_id = source_origin("joinup", actual_origin)
         room = (o.get("rooms") or [{}])[0]
         board = o.get("board") or {}
         price_block = o.get("price") or {}
@@ -218,7 +236,7 @@ def normalize(tour: dict, pax_adl: int, children_ages: list[int] | None = None,
         offers.append({
             "source": SOURCE_NAME,
             "source_hotel_id": hotel["source_hotel_id"],
-            "origin_id": str(frm.get("id") or ""),
+            "origin_id": origin_id,
             "origin_name": frm.get("name"),
             "date_start": o["date_start"],
             "date_end": o.get("date_end"),
@@ -232,7 +250,7 @@ def normalize(tour: dict, pax_adl: int, children_ages: list[int] | None = None,
             "pax_chd": len(children_ages) if children_ages else 0,
             "children_ages": ages,
             "link": hotel_deeplink(
-                h["id"], frm.get("id"), o["date_start"],
+                h["id"], origin_id, o["date_start"],
                 (o.get("stay") or {}).get("stay"), pax_adl, ages,
                 # the hotel page's board selector keys on the numeric meal
                 # code (e.g. 1202 = AI), not the board_type letters

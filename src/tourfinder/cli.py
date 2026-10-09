@@ -17,6 +17,7 @@ from pathlib import Path
 from statistics import median
 
 from . import db
+from .origins import normalize_origins, normalize_source_origin
 
 # Snapshot cadence by departure proximity (SPEC: price movement lives in
 # the last week — poll near departures often, far ones daily).
@@ -93,12 +94,50 @@ def active_pax_specs(conn, now=None) -> list[str]:
                 if not isinstance(filters, dict):
                     continue
                 first, last = date.fromisoformat(filters["date_from"]), date.fromisoformat(filters["date_till"])
-                if last < now.date() or first > last:
+                if last < now.date() + timedelta(days=1) or first > last or first > now.date() + timedelta(days=45):
+                    continue
+                if "RIX" not in normalize_origins(filters.get("origins")).split(","):
                     continue
                 specs[_party_spec(filters["adults"], filters.get("children_ages"))] = None
             except (ValueError, TypeError, KeyError):
                 continue  # malformed legacy personal data never schedules work
     return list(specs)
+
+
+def active_collection_scopes(conn, now=None) -> list[tuple[str, str]]:
+    """Exact (airport, party) demand; never multiply unrelated user requests.
+
+    Legacy global composition requests and defaults remain Riga-only. New
+    durable requests and active approved subscriptions retain their own airport
+    selection. These activate the existing three date tiers, not an exact-filter
+    refresh or any extension beyond the current 45-day collection horizon.
+    """
+    from .collection_requests import active_scopes
+    from .telegram_bot import approved_user_ids
+
+    now = now or datetime.now(timezone.utc)
+    scopes = dict.fromkeys(("RIX", spec) for spec in active_pax_specs(conn, now))
+    requested = list(active_scopes(conn, now=now))
+    approved = approved_user_ids(conn)
+    if approved:
+        params = {f"owner{i}": owner for i, owner in enumerate(sorted(approved))}
+        marks = ",".join(f":{name}" for name in params)
+        for row in conn.execute(f"SELECT filters FROM subscriptions WHERE enabled=1 AND owner_id IN ({marks}) ORDER BY id", params):
+            try:
+                requested.append(json.loads(row["filters"]))
+            except (ValueError, TypeError):
+                continue
+    for filters in requested:
+        try:
+            first, last = date.fromisoformat(filters["date_from"]), date.fromisoformat(filters["date_till"])
+            if first > last or last < now.date() + timedelta(days=1) or first > now.date() + timedelta(days=45):
+                continue
+            spec = _party_spec(filters["adults"], filters.get("children_ages"))
+            for origin in normalize_origins(filters.get("origins")).split(","):
+                scopes[(origin, spec)] = None
+        except (ValueError, TypeError, KeyError):
+            continue
+    return list(scopes)
 
 
 def parse_pax(spec: str) -> tuple[int, list[int]]:
@@ -142,10 +181,11 @@ class CollectTask:
     days_from: int
     days_till: int
     period_hours: int
+    origin: str = "RIX"
 
     @property
     def key(self):
-        return (self.source, self.tier, self.pax)
+        return (self.source, self.tier, self.pax, self.origin)
 
 
 def _run_history(conn):
@@ -164,7 +204,12 @@ def _run_history(conn):
                 continue
         except (ValueError, TypeError, AttributeError):
             continue  # malformed metadata is never evidence of fresh coverage
-        key = (source, row["tier"], pax)
+        field = "origin" if source == "joinup" else "departureAirport"
+        # Before airport-scoped collection, omitted origin meant Riga only.
+        origin = "RIX" if field not in params else normalize_source_origin(source, params[field])
+        if origin is None:
+            continue
+        key = (source, row["tier"], pax, origin)
         item = history.setdefault(key, {"attempted": None, "succeeded": None, "durations": []})
         if item["attempted"] is None or started > item["attempted"]:
             item["attempted"] = started
@@ -201,7 +246,7 @@ def _duration_estimate(task, history, now):
         observed = max(exact, key=lambda sample: sample[0])[1]
     else:
         peers = [sample for key, record in history.items()
-                 if key[:2] == task.key[:2] for sample in recent(record)]
+                 if key[:2] == task.key[:2] and key[3] == task.origin for sample in recent(record)]
         if not peers:
             return None
         latest = sorted(peers, key=lambda sample: sample[0], reverse=True)[:3]
@@ -210,9 +255,10 @@ def _duration_estimate(task, history, now):
 
 
 def _collect_tasks(pax_specs):
-    return [CollectTask(source, tier, spec, start, end, hours)
+    scopes = dict.fromkeys(("RIX", spec) if isinstance(spec, str) else tuple(spec) for spec in pax_specs)
+    return [CollectTask(source, tier, spec, start, end, hours, origin)
             for tier, start, end, hours in TIERS
-            for spec in dict.fromkeys(pax_specs) for source in SOURCES]
+            for origin, spec in scopes for source in SOURCES]
 
 
 def plan_collection(conn, pax_specs, now=None, *, history=None):
@@ -300,7 +346,7 @@ def cmd_collect(args):
         recovered = _prepare_collection(conn, datetime.now(timezone.utc))
         if recovered:
             log.warning("marked %s abandoned run(s) incomplete", recovered)
-        pax_specs = args.pax or active_pax_specs(conn)
+        pax_specs = args.pax or active_collection_scopes(conn)
         history = _run_history(conn)
         tasks = plan_collection(conn, pax_specs, history=history)
         log.info("%s source/tier/party tasks due; invocation budget: %s tasks, %s min",
@@ -315,12 +361,12 @@ def cmd_collect(args):
                 # Do not create a fetch_run: keeping its old attempt time lets
                 # this task move to the front of the next invocation.
                 deferred += 1
-                log.info("deferred %s/%s/%s: estimated_fetch_seconds=%.1f remaining_seconds=%.1f",
+                log.info("deferred %s/%s/%s/%s: estimated_fetch_seconds=%.1f remaining_seconds=%.1f",
                          *task.key, estimate, remaining)
                 continue
             attempted += 1
             adults, ages = parse_pax(task.pax)
-            log.info("fetching %s/%s/%s days %s..%s", *task.key,
+            log.info("fetching %s/%s/%s/%s days %s..%s", *task.key,
                      task.days_from, task.days_till)
             fetch, client_type = ((run_fetch, JoinUpClient) if task.source == "joinup"
                                   else (run_waavo_fetch, WaavoClient))
@@ -328,7 +374,7 @@ def cmd_collect(args):
             result = fetch(conn, client_type(delay=args.delay),
                            days_from=task.days_from, days_till=task.days_till,
                            adults=adults, children_ages=ages,
-                           tier=task.tier, pax_spec=task.pax, deadline=deadline)
+                           tier=task.tier, pax_spec=task.pax, deadline=deadline, origin=task.origin)
             elapsed = max(0.0, time.monotonic() - fetch_started)
             if result["errors"]:
                 failures += 1
@@ -336,7 +382,7 @@ def cmd_collect(args):
                 completed += 1
                 history.setdefault(task.key, {"durations": []})["durations"].append(
                     (datetime.now(timezone.utc), elapsed))
-            log.info("%s/%s/%s run #%s: %s offers, %s requests, completed=%s",
+            log.info("%s/%s/%s/%s run #%s: %s offers, %s requests, completed=%s",
                      *task.key, result["run_id"], result["offers_seen"],
                      result["requests_made"], not result["errors"])
             # A completed task must make notifications reachable even when the
@@ -371,7 +417,7 @@ def cmd_assert_fresh(args):
     try:
         cutoff = datetime.now(timezone.utc) - timedelta(hours=args.hours)
         history = _run_history(conn)
-        tasks = _collect_tasks(args.pax or active_pax_specs(conn))
+        tasks = _collect_tasks(args.pax or active_collection_scopes(conn))
         stale = ["/".join(task.key) for task in tasks
                  if not history.get(task.key, {}).get("succeeded") or
                  history[task.key]["succeeded"] < cutoff]

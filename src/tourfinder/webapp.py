@@ -12,7 +12,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from . import db, meals, queries, reviews
+from . import collection_requests, countries, db, meals, queries, reviews
+from .origins import normalize_origins
+from .coverage import get_search_coverage
 from .archive_format import ArchiveError
 from .archive_queries import ReadService, ReadUnavailable
 from .telegram_bot import (InitDataError, access_state, allowed_user_ids, bot_token, now_iso,
@@ -102,6 +104,7 @@ class SearchFilters(BaseModel):
     date_from: date
     date_till: date
     adults: int = Field(2, ge=1, le=6)
+    origins: str | None = Field("RIX", max_length=32)
     children_ages: str | None = Field(None, max_length=20)
     nights_min: int = Field(1, ge=1, le=30)
     nights_max: int = Field(30, ge=1, le=30)
@@ -123,8 +126,15 @@ class SearchFilters(BaseModel):
         if len(values) > 4 or any(a < 0 or a > 17 for a in values):
             raise ValueError("Допустимо до 4 детей, возраст 0–17.")
         self.children_ages = ages or None
+        self.origins = normalize_origins(self.origins)
+        self.countries = countries.normalize_countries(self.countries)
         self.board_categories = meals.normalize_categories(self.board_categories)
         return self
+
+
+class CollectionRequestCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    filters: SearchFilters
 
 
 class SubscriptionCreate(BaseModel):
@@ -169,33 +179,38 @@ def miniapp(request: Request):
     })
 
 
-@app.get("/api/search", dependencies=[Depends(require_browsing_user)])
+@app.get("/api/search")
 def search(request: Request, date_from: date, date_till: date,
            adults: int = 2, children_ages: str | None = None,
+           origins: str | None = Query("RIX", max_length=32),
            nights_min: int = 1, nights_max: int = 30, budget_max: int | None = None,
            boards: str | None = None, countries: str | None = None,
            board_categories: str | None = Query(None, max_length=128),
            only_hot: bool = False, stars_min: int | None = None,
            hotel_id: str | None = Query(None, max_length=128),
            source: str | None = Query(None, max_length=32),
-           sort: str = "price", group: bool = True, limit: int = Query(100, ge=1, le=100)):
+           sort: str = "price", group: bool = True, limit: int = Query(100, ge=1, le=100),
+           user: dict | None = Depends(require_browsing_user)):
     try:
         filters = SearchFilters(date_from=date_from, date_till=date_till, adults=adults,
             children_ages=children_ages, nights_min=nights_min, nights_max=nights_max,
             budget_max=budget_max, boards=boards, board_categories=board_categories, countries=countries,
-            only_hot=only_hot, stars_min=stars_min).model_dump(mode="json")
+            only_hot=only_hot, stars_min=stars_min, origins=origins).model_dump(mode="json")
     except (ValidationError, ValueError):
         raise HTTPException(400, "Проверь даты, состав туристов и фильтры.") from None
     # Browsing reads never schedule external collection or notification work.
     return read_result(browsing_store().search, group=bool(group and not hotel_id),
-                       sort=sort, source=source, hotel_id=hotel_id, limit=limit, **filters)
+                       sort=sort, source=source, hotel_id=hotel_id, limit=limit,
+                       owner_id=str(user["id"]) if user else None, **filters)
 
 
 @app.get("/api/drops", dependencies=[Depends(require_browsing_user)])
 def drops(adults: int = Query(2, ge=1, le=6), children_ages: str | None = Query(None, max_length=20),
+          origins: str | None = Query("RIX", max_length=32),
           hours: int = Query(72, ge=1, le=72), limit: int = Query(100, ge=1, le=100)):
     try:
         ages = queries._norm_ages(children_ages)
+        origins = normalize_origins(origins)
         values = [int(a) for a in ages.split(",") if a]
         if len(values) > 4 or any(not 0 <= a <= 17 for a in values):
             raise ValueError()
@@ -206,7 +221,7 @@ def drops(adults: int = Query(2, ge=1, le=6), children_ages: str | None = Query(
     try:
         rows = queries.price_drops(conn, adults=adults, children_ages=ages,
             since=(now - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            today=now.date().isoformat(), limit=limit, source="joinup")
+            today=now.date().isoformat(), limit=limit, source="joinup", origins=origins)
         return {"count": len(rows), "results": rows}
     finally:
         conn.close()
@@ -246,18 +261,74 @@ def request_pax(payload: dict = Body(...), user: dict = Depends(require_user)):
         raise HTTPException(400, "Допустимо 1–6 взрослых и до 4 детей 0–17 лет.") from None
     conn = get_conn()
     try:
-        spec = queue_composition(conn, adults, ages)
+        today = datetime.now(timezone.utc).date()
+        filters = SearchFilters(date_from=today + timedelta(days=1), date_till=today + timedelta(days=21),
+                                adults=adults, children_ages=",".join(map(str, ages))).model_dump(mode="json")
+        queued = collection_requests.queue_request(conn, user["id"], filters)
         conn.commit()
-        return {"spec": spec, "queued": True}
+        spec = str(adults) + (f"+{len(ages)}:" + ",".join(map(str, ages)) if ages else "")
+        return {"spec": spec, "queued": True, "request_id": queued["id"]}
+    except collection_requests.RequestLimit as exc:
+        raise HTTPException(429, str(exc)) from None
     finally:
         conn.close()
 
 
-def queue_composition(conn, adults: int, ages: list[int]) -> str:
-    spec = str(adults) + (f"+{len(ages)}:" + ",".join(map(str, sorted(ages))) if ages else "")
-    conn.execute("INSERT INTO pax_requests(spec,created_at) VALUES (:spec,:now) ON CONFLICT(spec) DO UPDATE SET created_at=excluded.created_at",
-                 {"spec": spec, "now": now_iso()})
-    return spec
+def request_response(conn, row):
+    filters = json.loads(row["filters"])
+    queue = {"requested": True, "request_id": row["id"],
+             "requested_at": row["updated_at"], "scope": "exact_search"}
+    try:
+        coverage = get_search_coverage(conn, filters, queue_override=queue)
+    except Exception:
+        conn.rollback()
+        coverage = {"state": "unavailable", "complete": False, "reasons": ["coverage_read_failed"]}
+    coverage["queue"] = queue
+    return {"id": row["id"], "queued": True, "status": coverage["state"], "filters": filters,
+            "created_at": row["created_at"], "updated_at": row["updated_at"],
+            "expires_at": row["expires_at"], "coverage": coverage}
+
+
+@app.post("/api/collection-requests")
+def create_collection_request(payload: CollectionRequestCreate, user: dict = Depends(require_user)):
+    filters = payload.filters.model_dump(mode="json")
+    today = datetime.now(timezone.utc).date()
+    if payload.filters.date_till <= today or payload.filters.date_from > today + timedelta(days=45):
+        raise HTTPException(400, "Сейчас сбор охватывает вылеты с завтрашнего дня на 45 дней вперёд.")
+    conn = get_conn()
+    try:
+        row = collection_requests.queue_request(conn, user["id"], filters)
+        conn.commit()
+        return request_response(conn, row)
+    except collection_requests.RequestLimit as exc:
+        raise HTTPException(429, str(exc)) from None
+    finally:
+        conn.close()
+
+
+@app.get("/api/collection-requests")
+def list_collection_requests(user: dict = Depends(require_user)):
+    conn = get_conn()
+    try:
+        rows = conn.execute("""SELECT id,filters,created_at,updated_at,expires_at FROM collection_requests
+            WHERE owner_id=:owner AND expires_at>:now ORDER BY updated_at DESC,id DESC LIMIT 20""",
+            {"owner": str(user["id"]), "now": now_iso()}).fetchall()
+        return {"requests": [{**dict(row), "filters": json.loads(row["filters"]), "status": "queued"} for row in rows]}
+    finally:
+        conn.close()
+
+
+@app.get("/api/collection-requests/{request_id}")
+def get_collection_request(request_id: int, user: dict = Depends(require_user)):
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT * FROM collection_requests WHERE id=:id AND owner_id=:owner AND expires_at>:now",
+                           {"id": request_id, "owner": str(user["id"]), "now": now_iso()}).fetchone()
+        if not row:
+            raise HTTPException(404, "Заявка не найдена.")
+        return request_response(conn, row)
+    finally:
+        conn.close()
 
 
 @app.get("/api/telegram/session")
@@ -322,8 +393,15 @@ def list_subscriptions(user: dict = Depends(require_user)):
 def create_subscription(payload: SubscriptionCreate, user: dict = Depends(require_user)):
     conn = get_conn()
     try:
+        collection_requests.lock_owner(conn, user["id"])
         if conn.execute("SELECT count(*) FROM subscriptions WHERE owner_id=:owner", {"owner": str(user["id"])}).scalar() >= 20:
             raise HTTPException(400, "Лимит: 20 сохранённых поисков.")
+        today = datetime.now(timezone.utc).date()
+        queued = None
+        if payload.filters.date_till > today and payload.filters.date_from <= today + timedelta(days=45):
+            queued = collection_requests.queue_request(conn, user["id"], payload.filters.model_dump(mode="json"))
+        else:
+            collection_requests.admit_scope(conn, user["id"], payload.filters.model_dump(mode="json"))
         retained_id = conn.next_retained_id("subscriptions")
         id_column, id_value = ("id,", ":retained_id,") if retained_id is not None else ("", "")
         sub_id = conn.execute(
@@ -333,10 +411,12 @@ def create_subscription(payload: SubscriptionCreate, user: dict = Depends(requir
              "now": now_iso(), "owner": str(user["id"]), "mode": payload.notify_mode,
              "pct": payload.min_drop_pct, "saving": round(payload.min_saving_eur * 100),
              "rating": payload.min_review_rating, "count": payload.min_review_count, "retained_id": retained_id}).scalar()
-        queue_composition(conn, payload.filters.adults,
-                          [int(age) for age in (payload.filters.children_ages or "").split(",") if age])
         conn.commit()
-        return {"id": sub_id, "new_alerts": 0, "evaluation_pending": True, "collection_requested": True}
+        return {"id": sub_id, "new_alerts": 0, "evaluation_pending": True,
+                "collection_requested": queued is not None,
+                "collection_request": request_response(conn, queued) if queued else None}
+    except collection_requests.RequestLimit as exc:
+        raise HTTPException(429, str(exc)) from None
     finally:
         conn.close()
 
@@ -353,11 +433,22 @@ def update_subscription(sub_id: int, payload: SubscriptionPatch, user: dict = De
     try:
         owned_sub(conn, sub_id, user)
         if payload.enabled is not None:
+            if payload.enabled:
+                collection_requests.lock_owner(conn, user["id"])
+                saved = conn.execute("SELECT filters FROM subscriptions WHERE id=:id", {"id": sub_id}).fetchone()
+                filters = SearchFilters(**json.loads(saved["filters"])).model_dump(mode="json")
+                today = datetime.now(timezone.utc).date()
+                if filters["date_till"] > today.isoformat() and filters["date_from"] <= (today + timedelta(days=45)).isoformat():
+                    collection_requests.queue_request(conn, user["id"], filters)
+                else:
+                    collection_requests.admit_scope(conn, user["id"], filters)
             conn.execute("UPDATE subscriptions SET enabled=:enabled WHERE id=:id", {"enabled": int(payload.enabled), "id": sub_id})
         if payload.name is not None:
             conn.execute("UPDATE subscriptions SET name=:name WHERE id=:id", {"name": payload.name.strip() or "Мой поиск", "id": sub_id})
         conn.commit()
         return {"ok": True}
+    except collection_requests.RequestLimit as exc:
+        raise HTTPException(429, str(exc)) from None
     finally:
         conn.close()
 

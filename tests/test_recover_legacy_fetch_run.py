@@ -280,7 +280,7 @@ def test_recovered_row_never_counts_as_successful_freshness():
     recovery.apply_recovery(conn, api, report, expected, after)
     history_conn = Mock()
     history_conn.execute.return_value.fetchall.return_value = [after]
-    record = _run_history(history_conn)[("joinup", "near", "2+1:7")]
+    record = _run_history(history_conn)[("joinup", "near", "2+1:7", "RIX")]
     assert record["attempted"] is not None and record["succeeded"] is None
 
 

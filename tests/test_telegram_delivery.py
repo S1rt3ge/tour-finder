@@ -211,6 +211,19 @@ def test_hundred_paused_alerts_do_not_starve_ready_user_and_expire_normally(conn
     assert bot.call.call_count == 1
 
 
+@pytest.mark.parametrize("origin,label", [("VNO", "Вильнюса (VNO)"), ("TLL", "Таллина (TLL)"), ("RIX", "Риги (RIX)")])
+def test_notification_uses_actual_offer_departure_airport(conn, origin, label):
+    pending(conn)
+    conn.execute("UPDATE offers SET origin_id=:origin WHERE id=1", {"origin": origin})
+    conn.commit()
+    bot = client()
+    assert delivery.run_worker(conn, client=bot, now=NOW)["sent"] == 1
+    text = bot.call.call_args.kwargs["text"]
+    assert label in text
+    if origin != "RIX":
+        assert "из Риги" not in text
+
+
 def test_expired_alert_is_discarded_without_http(conn):
     pending(conn, alert_age=timedelta(hours=24, minutes=1))
     bot = client()

@@ -11,6 +11,7 @@ import time
 from datetime import date, datetime, timedelta, timezone
 
 from .sources import joinup, waavo
+from .origins import normalize_source_origin, source_origin
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +72,10 @@ def run_fetch(conn, client: joinup.JoinUpClient,
               only_destinations: list[str] | None = None,
               max_pages: int | None = None, tier: str | None = None,
               pax_spec: str | None = None, deadline: float | None = None) -> dict:
+    origin_code = normalize_source_origin("joinup", origin)
+    if origin_code is None:
+        raise ValueError("joinup_invalid_origin")
+    origin = source_origin("joinup", origin_code)
     date_from = date.today() + timedelta(days=days_from)
     date_till = date.today() + timedelta(days=days_till)
     dates = f"{date_from.isoformat()}:{date_till.isoformat()}"
@@ -114,7 +119,7 @@ def run_fetch(conn, client: joinup.JoinUpClient,
                                                     max_pages=max_pages):
                         _check_deadline(deadline)
                         hotel, offers = joinup.normalize(tour, adults, children_ages,
-                                                         client.lang)
+                                                        client.lang, origin=origin)
                         for offer in offers:
                             _check_deadline(deadline)
                             offer.setdefault("operator", "joinup")
@@ -133,7 +138,7 @@ def run_fetch(conn, client: joinup.JoinUpClient,
                                                     max_pages=max_pages):
                         _check_deadline(deadline)
                         hotel, offers = joinup.normalize(tour, adults, children_ages,
-                                                         client.lang)
+                                                        client.lang, origin=origin)
                         for offer in offers:
                             _check_deadline(deadline)
                             offer.setdefault("operator", "joinup")
@@ -172,16 +177,17 @@ def run_waavo_fetch(conn, client: waavo.WaavoClient,
                     adults: int = 2, children_ages: list[int] | None = None,
                     tier: str | None = None, pax_spec: str | None = None,
                     max_pages: int | None = None,
-                    deadline: float | None = None) -> dict:
+                    deadline: float | None = None, origin: str = waavo.RIGA_AIRPORT) -> dict:
     """One Waavo run: paginate the aggregator search over a date window,
     skip Join Up (collected directly), store offers + TripAdvisor reviews."""
+    origin = source_origin("waavo", origin)
     date_from = (date.today() + timedelta(days=days_from)).isoformat()
     date_till = (date.today() + timedelta(days=days_till)).isoformat()
 
     duration_from, duration_till = 2, 21
     params = dict(source="waavo", dateFrom=date_from, dateTo=date_till,
                   adults=adults, children_ages=children_ages, tier=tier,
-                  departureAirport=waavo.RIGA_AIRPORT,
+                  departureAirport=origin,
                   durationFrom=duration_from, durationTo=duration_till,
                   max_pages=max_pages)
     run_id = _start_run(conn, "waavo", tier, pax_spec, params)
@@ -194,11 +200,12 @@ def run_waavo_fetch(conn, client: waavo.WaavoClient,
                                        children_ages=children_ages,
                                        duration_from=duration_from,
                                        duration_till=duration_till,
+                                       origin=origin,
                                        max_pages=max_pages):
             _check_deadline(deadline)
             if waavo.should_skip(raw):
                 continue
-            hotel, offer, review = waavo.normalize(raw, adults, children_ages)
+            hotel, offer, review = waavo.normalize(raw, adults, children_ages, origin=origin)
             if not offer["source_hotel_id"] or not offer["date_start"]:
                 continue
             writer.add(hotel, offer, review=review)
