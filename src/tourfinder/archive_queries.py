@@ -47,7 +47,13 @@ def parse_offer_id(value):
 
 def _status():
     return dict(live="unavailable", archive="not_configured", mode="unavailable",
-                archive_as_of=None, partial=False)
+                archive_as_of=None, partial=False, partial_reasons=[])
+
+
+def _note_partial(status, reason):
+    status["partial"] = True
+    if reason not in status["partial_reasons"]:
+        status["partial_reasons"].append(reason)
 
 
 def _finish(status, rows):
@@ -234,12 +240,13 @@ class ReadService:
                             cold_rows = [_label(row, archived=True, as_of=status["archive_as_of"],
                                                dataset_id=catalog.manifest["dataset_id"])
                                          for row in candidates if row["offer_key"] not in blocked]
-                            status["partial"] |= clipped
+                            if clipped:
+                                _note_partial(status, "archive_candidate_limit")
                             if not live_rows and not cold_rows:
                                 try:
                                     cold_compositions = queries.available_compositions(catalog)
                                 except Exception:
-                                    status["partial"] = True
+                                    _note_partial(status, "composition_lookup_failed")
                     except Exception:
                         self._archive_failure(status)
             live_rows = [_label(row) for row in live_rows]
@@ -258,7 +265,7 @@ class ReadService:
                     try:
                         live_compositions = queries.available_compositions(conn)
                     except Exception:
-                        status["partial"] = True
+                        _note_partial(status, "composition_lookup_failed")
                 if live_compositions is not None or cold_compositions is not None:
                     compositions = _merge_compositions(live_compositions or [], cold_compositions or [])
         return dict(count=len(rows), results=rows, available_compositions=compositions,

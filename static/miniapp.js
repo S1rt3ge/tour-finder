@@ -87,6 +87,10 @@
   function observationLabel(row) {
     return (isArchived(row) ? 'Архивная цена, наблюдали ' : row.stale ? 'Последнее наблюдение ' : 'Проверено ') + dateLabel(row.fetched_at || row.last_seen_at, true);
   }
+  function archiveSearchLimited(storage) {
+    return Boolean(storage?.partial && storage.live !== 'unavailable' && storage.archive !== 'unavailable'
+      && Array.isArray(storage.partial_reasons) && storage.partial_reasons.includes('archive_candidate_limit'));
+  }
   function storageMessage(storage, context = 'search') {
     if (!storage) return '';
     const messages = [];
@@ -94,7 +98,9 @@
     else if (storage.archive === 'unavailable') messages.push(context === 'history' ? 'Архив сейчас недоступен. История показана не полностью.' : 'Архив сейчас недоступен. Показаны только доступные предложения из текущего сбора.');
     else if (context !== 'history' && storage.mode === 'archive') messages.push('Это архивные предложения. Цены исторические и могут уже не действовать.');
     else if (context !== 'history' && storage.mode === 'mixed') messages.push('Архивные цены отмечены отдельно. Их актуальность нужно проверить у продавца.');
-    if (storage.partial && storage.live !== 'unavailable' && storage.archive !== 'unavailable') messages.push(context === 'history' ? 'Часть истории недоступна.' : 'Показана часть совпадений. Сузьте даты или другие параметры поиска.');
+    if (storage.partial && storage.live !== 'unavailable' && storage.archive !== 'unavailable') messages.push(context === 'history' ? 'Часть истории недоступна.' : archiveSearchLimited(storage)
+      ? 'Проверена ограниченная часть архива. Сузьте даты или другие параметры и повторите поиск.'
+      : 'Не все данные удалось проверить. Уточните параметры или повторите поиск позже.');
     if (storage.archive_as_of && storage.archive === 'ok') messages.push((context === 'history' ? 'История дополнена архивом от ' : 'Архив обновлён ') + dateLabel(storage.archive_as_of, true) + '.');
     return messages.join(' ');
   }
@@ -464,11 +470,13 @@
         const queued = Boolean(data.queued_spec) || state.queuedPax.has(compositionSpec(filters));
         const message = queued
           ? 'Запрос на этот состав сохранён. Предложения появятся, если следующий успешный сбор найдёт подходящие туры; точное время неизвестно.'
-          : data.storage?.partial ? 'Не все данные удалось проверить. Повторите поиск позже или уточните параметры.'
-          : known ? 'Для этих дат и фильтров предложений не нашлось. Попробуйте расширить даты, ночи или бюджет.'
+          : data.storage?.partial ? (archiveSearchLimited(data.storage)
+            ? 'Проверена ограниченная часть архива, поэтому отсутствие совпадений пока не подтверждено. Уточните параметры или запросите свежий сбор для этого состава.'
+            : 'Не все данные удалось проверить. Повторите поиск позже или уточните параметры.')
+          : known ? 'В собранных данных сейчас нет совпадений для этих дат и фильтров. Можно изменить параметры или запросить свежий сбор для этого состава.'
           : 'Для этого точного состава пока нет собранных предложений. Цены другого состава могут отличаться — мы не будем их подменять.';
         empty($('search-results'), queued ? 'Состав добавлен в сбор' : 'Попробуем другие параметры?', message, () => { collapseFilters(false); form.elements.date_from.focus(); }, 'Изменить поиск');
-        if (!known && !demoMode && state.user) appendCompositionRequest($('search-results').querySelector('.empty-state'), filters);
+        if (!demoMode && state.user) appendCompositionRequest($('search-results').querySelector('.empty-state'), filters, known);
       }
       if (window.matchMedia('(max-width: 699px)').matches) collapseFilters(true);
     } catch (error) {
@@ -505,15 +513,16 @@
       const trigger = panel.querySelector('button'); const note = panel.querySelector('p');
       const queued = state.queuedPax.has(spec); const pending = state.pendingPax.has(spec); const error = state.paxErrors.get(spec);
       trigger.disabled = queued || pending;
-      trigger.querySelector('span').textContent = queued ? 'Состав добавлен в сбор' : pending ? 'Сохраняем запрос…' : 'Собрать предложения для этого состава';
+      trigger.querySelector('span').textContent = queued ? 'Состав добавлен в сбор' : pending ? 'Сохраняем запрос…' : panel.dataset.paxRequestLabel;
       note.className = error ? 'form-error' : 'field-hint';
       note.setAttribute('role', error ? 'alert' : 'status');
       note.textContent = error || (queued ? 'Запрос сохранён. Предложения появятся, если следующий успешный сбор найдёт подходящие туры. Срок пока неизвестен.' : 'После отправки состав попадёт в очередной сбор источников.');
     }
   }
-  function appendCompositionRequest(target, filters) {
+  function appendCompositionRequest(target, filters, known = false) {
     const spec = compositionSpec(filters); const panel = el('div'); panel.dataset.paxRequest = spec;
-    const request = button('Собрать предложения для этого состава', 'button button-primary', () => requestComposition({...filters}));
+    panel.dataset.paxRequestLabel = known ? 'Запросить свежие предложения' : 'Собрать предложения для этого состава';
+    const request = button(panel.dataset.paxRequestLabel, 'button button-primary', () => requestComposition({...filters}));
     panel.append(request, el('p', 'field-hint')); target.append(panel); refreshCompositionRequests(spec);
   }
   async function requestComposition(filters) {

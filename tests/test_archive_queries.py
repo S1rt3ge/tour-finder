@@ -137,6 +137,9 @@ def test_empty_budget_search_keeps_known_cold_party_without_second_catalog_load(
         pax_adl=2, pax_chd=0, children_ages="", offers=1,
         live_offers=0, archived_offers=1)]
     assert archive.calls == ["catalog"]
+    assert result["storage"]["live"] == "empty" and result["storage"]["archive"] == "ok"
+    assert result["storage"]["partial"] is False
+    assert result["storage"]["partial_reasons"] == []
 
 
 def test_empty_search_known_party_counts_do_not_double_count_live_and_archive(stores):
@@ -148,6 +151,56 @@ def test_empty_search_known_party_counts_do_not_double_count_live_and_archive(st
     assert composition["offers"] is None
     assert composition["live_offers"] == composition["archived_offers"] == 1
     assert archive.calls == ["catalog"]
+    assert result["storage"]["partial"] is False
+    assert result["storage"]["partial_reasons"] == []
+
+
+@pytest.mark.parametrize("candidate_limit,partial", [(2, True), (3, False)])
+def test_empty_search_after_stale_live_identity_suppression_reports_only_real_truncation(stores, monkeypatch, candidate_limit, partial):
+    import tourfinder.archive_queries as module
+    live, cold, _archive, service, _trace = stores
+    for i in range(1, 4):
+        row = offer(i, pax_adl=1, room_placement="1AD", last_seen_at=OLD)
+        add(live, row, fetched_at=OLD)
+        add(cold, row, fetched_at=OLD)
+    monkeypatch.setattr(module, "CANDIDATE_LIMIT", candidate_limit)
+    result = service.search(group=False, **(FILTERS | {"adults": 1}))
+    assert result["count"] == 0 and result["results"] == []
+    assert result["storage"]["live"] == "empty" and result["storage"]["archive"] == "ok"
+    assert result["storage"]["partial"] is partial
+    assert result["storage"]["partial_reasons"] == (["archive_candidate_limit"] if partial else [])
+    assert result["available_compositions"][0]["pax_adl"] == 1
+
+
+@pytest.mark.parametrize("failing_source", ["live", "archive", "both"])
+def test_empty_search_composition_failure_has_safe_deduplicated_reason(stores, monkeypatch, failing_source):
+    import tourfinder.archive_queries as module
+    _live, _cold, _archive, service, _trace = stores
+    original = module.queries.available_compositions
+
+    def compositions(conn):
+        source = "live" if isinstance(conn, sqlite3.Connection) else "archive"
+        if failing_source in {source, "both"}:
+            raise RuntimeError("private connection details must never enter metadata")
+        return original(conn)
+
+    monkeypatch.setattr(module.queries, "available_compositions", compositions)
+    result = service.search(group=False, **FILTERS)
+    assert result["count"] == 0 and result["results"] == []
+    assert result["storage"]["live"] == "empty" and result["storage"]["archive"] == "ok"
+    assert result["storage"]["partial"] is True
+    assert result["storage"]["partial_reasons"] == ["composition_lookup_failed"]
+    assert "private connection" not in repr(result)
+
+
+def test_empty_search_without_configured_archive_is_not_partial(stores, monkeypatch):
+    _live, _cold, archive, service, _trace = stores
+    monkeypatch.setattr(archive, "configured", lambda: False)
+    result = service.search(group=False, **FILTERS)
+    assert result["count"] == 0 and result["results"] == []
+    assert result["storage"]["live"] == "empty" and result["storage"]["archive"] == "not_configured"
+    assert result["storage"]["partial"] is False
+    assert result["storage"]["partial_reasons"] == []
 
 
 def test_live_expensive_price_blocks_old_cheap_price_before_budget_filter(stores):
@@ -251,6 +304,7 @@ def test_down_database_falls_back_but_down_and_corrupt_is_explicit_failure(store
     service = ReadService(connect=broken, archive_store=archive)
     result = service.search(group=False, **FILTERS)
     assert result["storage"]["live"] == "unavailable" and result["storage"]["partial"]
+    assert result["storage"]["partial_reasons"] == []
     assert result["results"][0]["stale"]
     archive.broken = True
     with pytest.raises(ReadUnavailable) as error:
@@ -265,6 +319,8 @@ def test_corrupt_archive_does_not_hide_successful_live_results(stores):
     result = service.search(group=False, **FILTERS)
     assert result["count"] == 1 and result["storage"]["archive"] == "unavailable"
     assert result["storage"]["partial"]
+    assert result["storage"]["archive_error"] == "archive_read_failed"
+    assert result["storage"]["partial_reasons"] == []
 
 
 def test_missing_tables_are_unavailable_instead_of_fake_empty(tmp_path, stores):
@@ -287,6 +343,7 @@ def test_cold_candidate_limit_is_explicit_and_compositions_do_not_double_count(s
     monkeypatch.setattr(module, "CANDIDATE_LIMIT", 2)
     result = service.search(group=False, **FILTERS)
     assert result["storage"]["partial"] and result["count"] == 3
+    assert result["storage"]["partial_reasons"] == ["archive_candidate_limit"]
     composition = service.compositions()["compositions"][0]
     assert composition["offers"] is None
     assert composition["live_offers"] == 1 and composition["archived_offers"] == 3
