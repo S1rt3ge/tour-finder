@@ -19,4 +19,4 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - run: node --test tests/test_miniapp_empty_state.cjs
+      - run: node --test tests/test_miniapp_empty_state.cjs tests/test_miniapp_filters.cjs

@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from . import meals, queries, reviews
 from .archive_format import ArchiveError, normalize_offer_key, observation_key, offer_key
 from .archive_store import ArchiveStore
+from .coverage import get_search_coverage
 
 CANDIDATE_LIMIT = 2000
 HISTORY_DISPLAY_LIMIT = 2000
@@ -206,7 +207,9 @@ class ReadService:
         filters = _FILTER_DEFAULTS | filters
         limit = max(1, min(int(limit), 500))
         status, live_rows, cold_rows = _status(), [], []
-        cold_compositions = None
+        coverage = dict(state="unavailable", complete=False, last_complete_at=None,
+                        reasons=["coverage_read_failed"], sources=[], queue={"requested": False})
+        live_compositions = cold_compositions = None
         archive_configured = self._configured(status)
         with self._live(status) as conn:
             if conn is not None:
@@ -216,60 +219,68 @@ class ReadService:
                     status["live"] = "ok" if live_rows else "empty"
                 except Exception:
                     live_rows = []
-            # Full live pages need no network or cold catalog scan. Otherwise
-            # date-filtered cold candidates can fill missing live coverage.
-            if archive_configured:
-                if len(live_rows) >= limit:
-                    status["archive"] = "not_needed"
-                else:
-                    try:
-                        with self._archive.load_catalog() as catalog:
-                            candidates, clipped = _cold_candidates(catalog, filters, sort)
-                            status.update(archive="ok", archive_as_of=catalog.manifest["catalog"]["created_at"])
-                            if status["live"] in {"ok", "empty"}:
-                                # If this check fails, discard cold results:
-                                # never resurrect old cheap prices by accident.
-                                try:
-                                    blocked = _live_matches(conn, candidates)
-                                except Exception:
-                                    status.update(partial=True, archive="unavailable", archive_error="live_identity_check_failed")
-                                    candidates = []
-                                    blocked = {}
-                            else:
-                                blocked = {}
-                            cold_rows = [_label(row, archived=True, as_of=status["archive_as_of"],
-                                               dataset_id=catalog.manifest["dataset_id"])
-                                         for row in candidates if row["offer_key"] not in blocked]
-                            if clipped:
-                                _note_partial(status, "archive_candidate_limit")
-                            if not live_rows and not cold_rows:
-                                try:
-                                    cold_compositions = queries.available_compositions(catalog)
-                                except Exception:
-                                    _note_partial(status, "composition_lookup_failed")
-                    except Exception:
-                        self._archive_failure(status)
-            live_rows = [_label(row) for row in live_rows]
-            if archive_configured:
-                for row in live_rows:
-                    row.update({field: None for field in _STATS})
-                    row["history_scope"] = "load_history"
-            rows = live_rows + cold_rows
-            if group:
-                rows = _group(rows, sort)
-            rows = sorted(rows, key=lambda row: _sort_key(row, sort))[:limit]
-            compositions = None
-            if not rows:
-                live_compositions = None
-                if status["live"] in {"ok", "empty"}:
+                if not live_rows and status["live"] == "empty":
                     try:
                         live_compositions = queries.available_compositions(conn)
                     except Exception:
                         _note_partial(status, "composition_lookup_failed")
-                if live_compositions is not None or cold_compositions is not None:
-                    compositions = _merge_compositions(live_compositions or [], cold_compositions or [])
+                try:
+                    coverage = get_search_coverage(conn, filters)
+                except Exception:
+                    # Coverage is auxiliary evidence, never a reason to hide
+                    # readable offers. Close/rollback a failed read transaction.
+                    rollback = getattr(conn, "rollback", None)
+                    if rollback:
+                        rollback()
+        # Release the live connection before archive download/decryption or a
+        # cache-lock wait. A cold request must not occupy the PostgreSQL pool
+        # throughout network I/O. Reconnect only for the identity check.
+        if archive_configured:
+            if len(live_rows) >= limit:
+                status["archive"] = "not_needed"
+            else:
+                try:
+                    with self._archive.load_catalog() as catalog:
+                        candidates, clipped = _cold_candidates(catalog, filters, sort)
+                        status.update(archive="ok", archive_as_of=catalog.manifest["catalog"]["created_at"])
+                        blocked = {}
+                        if candidates and status["live"] in {"ok", "empty"}:
+                            # A failed reconnect is not proof that an identity
+                            # disappeared: never resurrect an old cheap price.
+                            try:
+                                with self._live(status) as identity_conn:
+                                    if identity_conn is None:
+                                        raise ReadUnavailable("live_identity_check_failed")
+                                    blocked = _live_matches(identity_conn, candidates)
+                            except Exception:
+                                status.update(partial=True, archive="unavailable", archive_error="live_identity_check_failed")
+                                candidates = []
+                        cold_rows = [_label(row, archived=True, as_of=status["archive_as_of"],
+                                           dataset_id=catalog.manifest["dataset_id"])
+                                     for row in candidates if row["offer_key"] not in blocked]
+                        if clipped:
+                            _note_partial(status, "archive_candidate_limit")
+                        if not live_rows and not cold_rows:
+                            try:
+                                cold_compositions = queries.available_compositions(catalog)
+                            except Exception:
+                                _note_partial(status, "composition_lookup_failed")
+                except Exception:
+                    self._archive_failure(status)
+        live_rows = [_label(row) for row in live_rows]
+        if archive_configured:
+            for row in live_rows:
+                row.update({field: None for field in _STATS})
+                row["history_scope"] = "load_history"
+        rows = live_rows + cold_rows
+        if group:
+            rows = _group(rows, sort)
+        rows = sorted(rows, key=lambda row: _sort_key(row, sort))[:limit]
+        compositions = None
+        if not rows and (live_compositions is not None or cold_compositions is not None):
+            compositions = _merge_compositions(live_compositions or [], cold_compositions or [])
         return dict(count=len(rows), results=rows, available_compositions=compositions,
-                    queued_spec=None, storage=_finish(status, rows))
+                    queued_spec=None, coverage=coverage, storage=_finish(status, rows))
 
     def _resolve(self, conn, identifier, status):
         """Return (public detail, raw live identity, stable key)."""
@@ -412,15 +423,15 @@ class ReadService:
                 except Exception:
                     pass
         if self._configured(status):
-            if live["countries"] and live["boards"]:
-                status["archive"] = "not_needed"
-            else:
-                try:
-                    with self._archive.load_catalog() as catalog:
-                        cold = read(catalog)
-                        status.update(archive="ok", archive_as_of=catalog.manifest["catalog"]["created_at"])
-                except Exception:
-                    self._archive_failure(status)
+            # A nonempty live dictionary can still omit countries or boards
+            # present only in retained history. Search and its choices must
+            # see the same stores; the archive reader caches verified data.
+            try:
+                with self._archive.load_catalog() as catalog:
+                    cold = read(catalog)
+                    status.update(archive="ok", archive_as_of=catalog.manifest["catalog"]["created_at"])
+            except Exception:
+                self._archive_failure(status)
         result = {}
         for name, identity, label in (("countries", "country_id", "country_name"), ("boards", "board_code", "board_name")):
             combined = {row[identity]: row for row in cold[name]}

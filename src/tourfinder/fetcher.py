@@ -178,8 +178,12 @@ def run_waavo_fetch(conn, client: waavo.WaavoClient,
     date_from = (date.today() + timedelta(days=days_from)).isoformat()
     date_till = (date.today() + timedelta(days=days_till)).isoformat()
 
+    duration_from, duration_till = 2, 21
     params = dict(source="waavo", dateFrom=date_from, dateTo=date_till,
-                  adults=adults, children_ages=children_ages, tier=tier)
+                  adults=adults, children_ages=children_ages, tier=tier,
+                  departureAirport=waavo.RIGA_AIRPORT,
+                  durationFrom=duration_from, durationTo=duration_till,
+                  max_pages=max_pages)
     run_id = _start_run(conn, "waavo", tier, pax_spec, params)
     writer = _BatchWriter(conn, run_id)
     errors: list[str] = []
@@ -188,6 +192,8 @@ def run_waavo_fetch(conn, client: waavo.WaavoClient,
         _check_deadline(deadline)
         for raw in client.search_pages(date_from, date_till, adults,
                                        children_ages=children_ages,
+                                       duration_from=duration_from,
+                                       duration_till=duration_till,
                                        max_pages=max_pages):
             _check_deadline(deadline)
             if waavo.should_skip(raw):

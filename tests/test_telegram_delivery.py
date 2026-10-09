@@ -154,9 +154,6 @@ def test_rolling_quota_expires_after_twenty_four_hours(conn):
 
 
 @pytest.mark.parametrize("kwargs,reason", [
-    ({"can_notify": 0}, "notifications_disabled"),
-    ({"enabled": 0}, "subscription_disabled"),
-    ({"owner": "789"}, "owner_not_allowed"),
     ({"currency": "USD"}, "unsupported_currency"),
     ({"stop_sale": "1"}, "stop_sale"),
     ({"observation_age": timedelta(hours=7)}, "offer_stale"),
@@ -167,8 +164,51 @@ def test_ineligible_offers_never_send(conn, kwargs, reason):
     bot = client()
     result = delivery.run_worker(conn, client=bot, now=NOW)
     assert result[reason] == 1
-    assert state(conn)["status"] == ("retry" if reason == "notifications_disabled" else "discarded")
+    assert state(conn)["status"] == "discarded"
     bot.call.assert_not_called()
+
+
+@pytest.mark.parametrize("kwargs", [{"can_notify": 0}, {"enabled": 0}, {"owner": "789"}])
+def test_ineligible_recipient_does_not_take_due_page_space_or_mutate_outbox(conn, kwargs):
+    pending(conn, **kwargs)
+    before = state(conn)
+    bot = client()
+    result = delivery.run_worker(conn, client=bot, now=NOW)
+    assert result["candidates"] == 0
+    assert state(conn) == before
+    bot.call.assert_not_called()
+
+
+@pytest.mark.parametrize("kwargs,reason", [
+    ({"can_notify": 0}, "notifications_disabled"),
+    ({"enabled": 0}, "subscription_disabled"),
+    ({"owner": "789"}, "owner_not_allowed"),
+])
+def test_claim_still_rechecks_recipient_after_due_page_selection(conn, kwargs, reason):
+    pending(conn, **kwargs)
+    row, rejected = delivery._claim(conn, 1, {"123", "456"}, NOW)
+    assert row is None and rejected == reason
+    assert state(conn)["status"] == ("retry" if reason == "notifications_disabled" else "discarded")
+    assert state(conn)["attempts"] == 0
+
+
+def test_hundred_paused_alerts_do_not_starve_ready_user_and_expire_normally(conn):
+    for number in range(1, 101):
+        pending(conn, number, can_notify=0, price=80000)
+    pending(conn, 101, owner="456", price=90000)
+    bot = client()
+    result = delivery.run_worker(conn, client=bot, now=NOW)
+    assert result["candidates"] == result["sent"] == 1
+    assert bot.call.call_args.kwargs["chat_id"] == "456"
+    assert all(state(conn, number)["status"] == "pending" and state(conn, number)["attempts"] == 0
+               for number in range(1, 101))
+    assert state(conn, 101)["status"] == "sent"
+    again = delivery.run_worker(conn, client=bot, now=NOW + timedelta(minutes=16))
+    assert again["candidates"] == 0 and bot.call.call_count == 1
+    expired = delivery.run_worker(conn, client=bot, now=NOW + timedelta(hours=24, seconds=1))
+    assert expired["expired"] == 100 and expired["candidates"] == 0
+    assert all(state(conn, number)["last_error"] == "alert_expired" for number in range(1, 101))
+    assert bot.call.call_count == 1
 
 
 def test_expired_alert_is_discarded_without_http(conn):
@@ -246,12 +286,12 @@ def test_pending_opt_in_is_retained_and_delivered_after_start(conn):
     pending(conn, can_notify=0)
     bot = client()
     first = delivery.run_worker(conn, client=bot, now=NOW)
-    assert first["notifications_disabled"] == 1
-    assert state(conn)["status"] == "retry"
+    assert first["candidates"] == 0
+    assert state(conn)["status"] == "pending"
     assert state(conn)["attempts"] == 0
     conn.execute("UPDATE telegram_users SET can_notify=1 WHERE user_id='123'")
     conn.commit()
-    second = delivery.run_worker(conn, client=bot, now=NOW + timedelta(minutes=16))
+    second = delivery.run_worker(conn, client=bot, now=NOW + timedelta(seconds=1))
     assert second["sent"] == 1
     assert bot.call.call_count == 1
 
@@ -313,7 +353,9 @@ def test_dry_run_connection_does_not_create_or_migrate_schema(conn, tmp_path, mo
     assert not missing.exists()
 
 
-def test_persisted_approval_enables_delivery_without_expanding_admin_environment(conn):
+@pytest.mark.parametrize("admins", ["123,456", ""])
+def test_persisted_approval_enables_delivery_without_expanding_admin_environment(conn, monkeypatch, admins):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", admins)
     pending(conn, owner="789")
     conn.execute("""INSERT INTO telegram_access_requests(user_id,status,first_name,requested_at)
         VALUES ('789','approved','Approved fixture',:now)""", {"now": delivery._iso(NOW)})
@@ -322,7 +364,17 @@ def test_persisted_approval_enables_delivery_without_expanding_admin_environment
     result = delivery.run_worker(conn, client=bot, now=NOW)
     assert result["sent"] == 1
     assert bot.call.call_args.kwargs["chat_id"] == "789"
-    assert delivery.allowed_user_ids() == {"123", "456"}
+    assert delivery.allowed_user_ids() == (set(admins.split(",")) if admins else set())
+
+
+def test_dry_run_with_no_approved_recipients_has_empty_due_page(conn, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "")
+    pending(conn)
+    before = state(conn)
+    bot = client()
+    result = delivery.run_worker(conn, client=bot, dry_run=True, now=NOW)
+    assert result["candidates"] == 0 and state(conn) == before
+    bot.call.assert_not_called()
 
 
 def test_claim_rechecks_revoked_access_even_when_worker_cached_approval(conn):

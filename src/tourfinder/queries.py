@@ -61,7 +61,9 @@ def _build_filters(*, date_from: str, date_till: str, adults: int,
              "o.pax_adl = :adults",
              "o.children_ages = :ages",
              "o.last_seen_at >= :fresh_cutoff"]
-    snapshot_where = []
+    # Search budgets and ordering are denominated in EUR in the Mini App.
+    # Check the latest snapshot's currency, never an older EUR observation.
+    snapshot_where = ["l.currency = 'EUR'"]
     params = {"date_from": date_from, "date_till": date_till,
               "nights_min": nights_min, "nights_max": nights_max,
               "adults": adults, "ages": _norm_ages(children_ages),
@@ -166,7 +168,7 @@ def search_offers(conn, *, date_from: str, date_till: str,
     """Offers whose latest snapshot matches every filter, cheapest first.
 
     History statistics and reviews are read only for the final result page.
-    budget_max is expressed in whole currency units.
+    budget_max is expressed in whole euros; results contain EUR prices only.
     """
     where, snapshot_where, params = _build_filters(
         date_from=date_from, date_till=date_till, adults=adults,
