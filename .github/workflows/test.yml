@@ -16,3 +16,7 @@ jobs:
           python-version: "3.12"
       - run: pip install -e '.[dev]'
       - run: python -m pytest -q
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: node --test tests/test_miniapp_empty_state.cjs
