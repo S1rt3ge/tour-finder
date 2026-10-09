@@ -602,3 +602,179 @@ def test_malformed_unfinished_lease_stays_protected(conn, malformed):
     with pytest.raises(RuntimeError, match="blocked by unfinished"):
         cli._prepare_collection(conn, NOW)
     assert conn.execute("SELECT finished_at FROM fetch_runs WHERE id=:id", {"id": run_id}).scalar() is None
+
+
+def timed_run(conn, task, seconds, *, started=NOW - timedelta(days=2), **kwargs):
+    run_id = add_run(conn, *task.key, started=started, **kwargs)
+    if kwargs.get("finished", True):
+        conn.execute("UPDATE fetch_runs SET finished_at=:finished WHERE id=:id",
+                     {"finished": (started + timedelta(seconds=seconds)).isoformat(), "id": run_id})
+        conn.commit()
+    return run_id
+
+
+def collect_task(source="joinup", tier="far", pax="2"):
+    _, first, last, hours = next(item for item in cli.TIERS if item[0] == tier)
+    return cli.CollectTask(source, tier, pax, first, last, hours)
+
+
+def fake_timed_collector(conn, monkeypatch, tasks, durations, *, failures=(), evaluation_seconds=0):
+    """Use the real due planner/run log with a clock, without network or sleeps."""
+    clock, attempts = [0.0], []
+
+    class ClockDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW + timedelta(seconds=clock[0])
+
+    monkeypatch.setattr(cli, "datetime", ClockDatetime)
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(cli, "_collect_tasks", lambda specs: tasks)
+    monkeypatch.setattr(db, "connect", lambda path: conn)
+    monkeypatch.setattr(conn, "close", Mock())
+
+    def fetch(source, connection, client, **kwargs):
+        task = next(task for task in tasks if task.key == (source, kwargs["tier"], kwargs["pax_spec"]))
+        attempts.append(task.key)
+        started = NOW + timedelta(seconds=clock[0])
+        elapsed = durations[task.key]
+        clock[0] += elapsed
+        errors = ["fixture incomplete"] if task.key in failures else []
+        run_id = timed_run(connection, task, elapsed, started=started, errors=errors)
+        return {"run_id": run_id, "offers_seen": 1, "requests_made": 1, "errors": errors}
+
+    monkeypatch.setattr(fetcher, "run_fetch", lambda *args, **kwargs: fetch("joinup", *args, **kwargs))
+    monkeypatch.setattr(fetcher, "run_waavo_fetch", lambda *args, **kwargs: fetch("waavo", *args, **kwargs))
+
+    def evaluate(*args, **kwargs):
+        clock[0] += evaluation_seconds
+        return 0
+
+    evaluated = Mock(side_effect=evaluate)
+    monkeypatch.setattr(subscriptions, "evaluate_all", evaluated)
+    return clock, attempts, evaluated
+
+
+def test_duration_estimate_prefers_latest_exact_over_faster_peers(conn):
+    task = collect_task()
+    timed_run(conn, task, 1800, started=NOW - timedelta(days=3))
+    timed_run(conn, task, 1200, started=NOW - timedelta(days=2))
+    timed_run(conn, collect_task(pax="3"), 60, started=NOW - timedelta(hours=2))
+    assert cli._duration_estimate(task, cli._run_history(conn), NOW) == 1470
+
+
+def test_duration_estimate_uses_only_three_latest_same_source_tier_peers(conn):
+    for age, seconds in [(5, 9999), (4, 100), (3, 300), (2, 200)]:
+        timed_run(conn, collect_task(pax="3"), seconds, started=NOW - timedelta(days=age))
+    timed_run(conn, collect_task("waavo", pax="3"), 9999)
+    timed_run(conn, collect_task(tier="near", pax="3"), 9999)
+    assert cli._duration_estimate(collect_task(), cli._run_history(conn), NOW) == 270
+
+
+@pytest.mark.parametrize("invalid", ["failed", "capped", "unfinished", "naive_start", "naive_finish",
+                                     "negative", "old", "future", "malformed_errors"])
+def test_unreliable_or_outdated_history_does_not_gate_unknown_task(conn, invalid):
+    task = collect_task()
+    kwargs = {"failed": {"errors": ["partial: budget"]},
+              "capped": {"extra_params": {"max_pages": 1}},
+              "unfinished": {"finished": False}}.get(invalid, {})
+    started = NOW - timedelta(days=8) if invalid == "old" else NOW - timedelta(days=2)
+    if invalid == "future":
+        started = NOW + timedelta(minutes=1)
+    run_id = timed_run(conn, task, -1 if invalid == "negative" else 600, started=started, **kwargs)
+    if invalid.startswith("naive_"):
+        column = "started_at" if invalid == "naive_start" else "finished_at"
+        conn.execute(f"UPDATE fetch_runs SET {column}=:value WHERE id=:id",
+                     {"value": started.replace(tzinfo=None).isoformat(), "id": run_id})
+    elif invalid == "malformed_errors":
+        conn.execute("UPDATE fetch_runs SET errors='{}' WHERE id=:id", {"id": run_id})
+    conn.commit()
+    assert cli._duration_estimate(task, cli._run_history(conn), NOW) is None
+
+
+def test_old_exact_duration_falls_back_to_recent_peer(conn):
+    task = collect_task()
+    timed_run(conn, task, 9999, started=NOW - timedelta(days=8))
+    timed_run(conn, collect_task(pax="3"), 100)
+    assert cli._duration_estimate(task, cli._run_history(conn), NOW) == 150
+
+
+def test_long_deferred_task_keeps_attempt_priority_and_runs_first_next_invocation(conn, monkeypatch, caplog):
+    first, long, short = collect_task(tier="near"), collect_task(), collect_task("waavo")
+    for task, age, seconds in [(first, 3, 100), (long, 2, 1200), (short, 1.1, 50)]:
+        timed_run(conn, task, seconds, started=NOW - timedelta(days=age))
+    before = cli._run_history(conn)[long.key]["attempted"]
+    clock, attempted, evaluated = fake_timed_collector(
+        conn, monkeypatch, [first, long, short], {first.key: 100, long.key: 1200, short.key: 50})
+    args = SimpleNamespace(db="unused", pax=["2"], delay=0, max_tasks=2, max_minutes=10)
+    with caplog.at_level("INFO", logger="tourfinder.collect"):
+        result = cli.cmd_collect(args)
+    assert result == {"completed": 2, "attempted": 2, "pending": 1}
+    assert attempted == [first.key, short.key]
+    assert evaluated.call_count == 2
+    assert "deferred joinup/far/2" in caplog.text and "deferred=1" in caplog.text
+    assert conn.execute("SELECT count(*) FROM fetch_runs").scalar() == 5
+    assert cli._run_history(conn)[long.key]["attempted"] == before
+    assert cli.plan_collection(conn, ["2"], NOW + timedelta(seconds=clock[0])) == [long]
+    # The next invocation has a fresh full budget: the deferred long task
+    # actually completes first instead of becoming another partial run.
+    args.max_tasks = 1
+    args.max_minutes = 50
+    assert cli.cmd_collect(args) == {"completed": 1, "attempted": 1, "pending": 0}
+    assert attempted == [first.key, short.key, long.key]
+
+
+def test_first_task_always_attempts_even_if_previous_duration_exceeds_budget(conn, monkeypatch):
+    task = collect_task()
+    timed_run(conn, task, 1800)
+    _, attempted, _ = fake_timed_collector(conn, monkeypatch, [task], {task.key: 30})
+    assert cli.cmd_collect(SimpleNamespace(db="unused", pax=["2"], delay=0, max_tasks=6, max_minutes=1)) == {
+        "completed": 1, "attempted": 1, "pending": 0}
+    assert attempted == [task.key]
+
+
+def test_all_remaining_estimates_too_long_ends_without_partial_attempt(conn, monkeypatch):
+    first, long = collect_task("waavo", "near"), collect_task()
+    timed_run(conn, long, 1200)
+    _, attempted, _ = fake_timed_collector(conn, monkeypatch, [first, long], {first.key: 100, long.key: 1200})
+    assert cli.cmd_collect(SimpleNamespace(db="unused", pax=["2"], delay=0, max_tasks=6, max_minutes=10)) == {
+        "completed": 1, "attempted": 1, "pending": 1}
+    assert attempted == [first.key]
+
+
+def test_no_admission_deferral_until_one_task_completed(conn, monkeypatch):
+    first, long = collect_task("waavo", "near"), collect_task()
+    timed_run(conn, long, 1200)
+    _, attempted, _ = fake_timed_collector(conn, monkeypatch, [first, long],
+                                          {first.key: 100, long.key: 100}, failures=[first.key])
+    with pytest.raises(RuntimeError, match="1 collection task"):
+        cli.cmd_collect(SimpleNamespace(db="unused", pax=["2"], delay=0, max_tasks=6, max_minutes=10))
+    assert attempted == [first.key, long.key]
+
+
+def test_unknown_durations_still_attempt_and_preserve_six_attempt_limit(conn, monkeypatch):
+    tasks = cli._collect_tasks(["2", "3"])
+    # Distinct source/tier for the first six, so none has an observed peer yet.
+    tasks.sort(key=lambda task: task.pax)
+    _, attempted, _ = fake_timed_collector(conn, monkeypatch, tasks, {task.key: 1 for task in tasks})
+    assert cli.cmd_collect(SimpleNamespace(db="unused", pax=["2", "3"], delay=0,
+                                           max_tasks=6, max_minutes=1)) == {
+        "completed": 6, "attempted": 6, "pending": 6}
+    assert attempted == [task.key for task in tasks[:6]]
+
+
+@pytest.mark.parametrize("evaluation_seconds,second_attempted", [(0, True), (15, False)])
+def test_current_fetch_updates_peer_estimate_excluding_subscription_time(conn, monkeypatch,
+                                                                       evaluation_seconds, second_attempted):
+    first, second = collect_task(pax="2"), collect_task(pax="3")
+    # No persisted timing history: 100s observed fetch => 150s admission estimate.
+    # With 270s budget it fits after 100s fetch + 15s evaluation, whereas an
+    # incorrectly combined 115s estimate (168s) would defer. A second 15s
+    # evaluation adjustment below narrows the remaining window to 140s.
+    _, attempted, _ = fake_timed_collector(conn, monkeypatch, [first, second],
+                                          {first.key: 100, second.key: 100},
+                                          evaluation_seconds=15 + evaluation_seconds)
+    result = cli.cmd_collect(SimpleNamespace(db="unused", pax=["2", "3"], delay=0,
+                                             max_tasks=6, max_minutes=4.5))
+    assert attempted == ([first.key, second.key] if second_attempted else [first.key])
+    assert result["attempted"] == (2 if second_attempted else 1)

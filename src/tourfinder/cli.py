@@ -1,10 +1,10 @@
 """CLI: python -m tourfinder.cli <command>
 
-  fetch   — one-off pull from Join Up, store price snapshots
-  collect — scheduler entry point: run whichever fetch tiers are due
-  reviews — enrich hotels with guest reviews from an external platform
-  serve   — run the local web UI
-  stats   — quick DB numbers
+  fetch   � one-off pull from Join Up, store price snapshots
+  collect � scheduler entry point: run whichever fetch tiers are due
+  reviews � enrich hotels with guest reviews from an external platform
+  serve   � run the local web UI
+  stats   � quick DB numbers
 """
 import argparse
 import json
@@ -14,11 +14,12 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from statistics import median
 
 from . import db
 
 # Snapshot cadence by departure proximity (SPEC: price movement lives in
-# the last week — poll near departures often, far ones daily).
+# the last week � poll near departures often, far ones daily).
 # (name, days_from, days_till, period_hours)
 TIERS = [
     ("near", 1, 7, 4),
@@ -164,7 +165,7 @@ def _run_history(conn):
         except (ValueError, TypeError, AttributeError):
             continue  # malformed metadata is never evidence of fresh coverage
         key = (source, row["tier"], pax)
-        item = history.setdefault(key, {"attempted": None, "succeeded": None})
+        item = history.setdefault(key, {"attempted": None, "succeeded": None, "durations": []})
         if item["attempted"] is None or started > item["attempted"]:
             item["attempted"] = started
         if row["finished_at"] and errors == [] and not params.get("max_pages"):
@@ -176,7 +177,36 @@ def _run_history(conn):
                 continue
             if item["succeeded"] is None or finished > item["succeeded"]:
                 item["succeeded"] = finished
+            if finished >= started:
+                item["durations"].append((finished, (finished - started).total_seconds()))
     return history
+
+
+def _duration_estimate(task, history, now):
+    """Recent full fetch time plus headroom; unknown work remains admissible.
+
+    Prefer the latest exact party. Otherwise use up to three recent successes
+    for the same source/tier, whose request volume is usually comparable.
+    Neither historic fetch_runs nor the current fetch timer include the
+    separate subscription evaluation.
+    """
+    cutoff = now - timedelta(days=7)
+
+    def recent(record):
+        return [sample for sample in record.get("durations", [])
+                if cutoff <= sample[0] <= now]
+
+    exact = recent(history.get(task.key, {}))
+    if exact:
+        observed = max(exact, key=lambda sample: sample[0])[1]
+    else:
+        peers = [sample for key, record in history.items()
+                 if key[:2] == task.key[:2] for sample in recent(record)]
+        if not peers:
+            return None
+        latest = sorted(peers, key=lambda sample: sample[0], reverse=True)[:3]
+        observed = median(sample[1] for sample in latest)
+    return observed * 1.2 + 30
 
 
 def _collect_tasks(pax_specs):
@@ -185,14 +215,15 @@ def _collect_tasks(pax_specs):
             for spec in dict.fromkeys(pax_specs) for source in SOURCES]
 
 
-def plan_collection(conn, pax_specs, now=None):
+def plan_collection(conn, pax_specs, now=None, *, history=None):
     """Rotate overdue work by last attempt so failures cannot starve other tiers.
 
     Only full successful runs refresh that exact source/tier/composition. Once
     all new tasks have had a turn, the oldest attempted overdue task goes first.
     """
     now = now or datetime.now(timezone.utc)
-    history = _run_history(conn)
+    if history is None:
+        history = _run_history(conn)
     epoch = datetime.min.replace(tzinfo=timezone.utc)
     due = []
     for task in _collect_tasks(pax_specs):
@@ -264,33 +295,47 @@ def cmd_collect(args):
         conn.close()
         raise ValueError("max-tasks and max-minutes must be positive")
     deadline = time.monotonic() + max_minutes * 60
-    completed, attempted, failures = 0, 0, 0
+    completed, attempted, failures, deferred = 0, 0, 0, 0
     try:
         recovered = _prepare_collection(conn, datetime.now(timezone.utc))
         if recovered:
             log.warning("marked %s abandoned run(s) incomplete", recovered)
         pax_specs = args.pax or active_pax_specs(conn)
-        tasks = plan_collection(conn, pax_specs)
+        history = _run_history(conn)
+        tasks = plan_collection(conn, pax_specs, history=history)
         log.info("%s source/tier/party tasks due; invocation budget: %s tasks, %s min",
                  len(tasks), max_tasks, max_minutes)
         from . import subscriptions
-        for task in tasks[:max_tasks]:
-            if time.monotonic() >= deadline:
+        for task in tasks:
+            remaining = deadline - time.monotonic()
+            if attempted >= max_tasks or remaining <= 0:
                 break
+            estimate = _duration_estimate(task, history, datetime.now(timezone.utc))
+            if completed and estimate is not None and estimate > remaining:
+                # Do not create a fetch_run: keeping its old attempt time lets
+                # this task move to the front of the next invocation.
+                deferred += 1
+                log.info("deferred %s/%s/%s: estimated_fetch_seconds=%.1f remaining_seconds=%.1f",
+                         *task.key, estimate, remaining)
+                continue
             attempted += 1
             adults, ages = parse_pax(task.pax)
             log.info("fetching %s/%s/%s days %s..%s", *task.key,
                      task.days_from, task.days_till)
             fetch, client_type = ((run_fetch, JoinUpClient) if task.source == "joinup"
                                   else (run_waavo_fetch, WaavoClient))
+            fetch_started = time.monotonic()
             result = fetch(conn, client_type(delay=args.delay),
                            days_from=task.days_from, days_till=task.days_till,
                            adults=adults, children_ages=ages,
                            tier=task.tier, pax_spec=task.pax, deadline=deadline)
+            elapsed = max(0.0, time.monotonic() - fetch_started)
             if result["errors"]:
                 failures += 1
             else:
                 completed += 1
+                history.setdefault(task.key, {"durations": []})["durations"].append(
+                    (datetime.now(timezone.utc), elapsed))
             log.info("%s/%s/%s run #%s: %s offers, %s requests, completed=%s",
                      *task.key, result["run_id"], result["offers_seen"],
                      result["requests_made"], not result["errors"])
@@ -302,8 +347,8 @@ def cmd_collect(args):
         if not attempted:
             subscriptions.evaluate_all(conn, deadline=deadline)
         pending = len(plan_collection(conn, pax_specs))
-        log.info("collection summary: completed=%s attempted=%s failed_or_partial=%s pending=%s",
-                 completed, attempted, failures, pending)
+        log.info("collection summary: completed=%s attempted=%s failed_or_partial=%s pending=%s deferred=%s",
+                 completed, attempted, failures, pending, deferred)
         if failures:
             raise RuntimeError(f"{failures} collection task(s) failed or incomplete; {pending} pending")
         return {"completed": completed, "attempted": attempted, "pending": pending}
@@ -344,7 +389,7 @@ def cmd_reviews(args):
     conn = db.connect(args.db)
     provider = get_provider(args.provider)
     if not provider.available():
-        print(f"provider '{args.provider}' has no credentials — set the API key "
+        print(f"provider '{args.provider}' has no credentials � set the API key "
               f"(GOOGLE_PLACES_API_KEY for google) and retry. Nothing fetched.")
         return
     result = reviews_mod.enrich(conn, provider, max_age_days=args.max_age_days,
@@ -430,7 +475,7 @@ def main():
 
     args = p.parse_args()
     if args.command == "collect":
-        # runs headless under pythonw from Task Scheduler — log to a file
+        # runs headless under pythonw from Task Scheduler � log to a file
         log_path = Path(args.db).parent / "collect.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         fh = logging.FileHandler(log_path, encoding="utf-8")
