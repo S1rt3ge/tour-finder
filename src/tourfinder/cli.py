@@ -274,6 +274,52 @@ def plan_collection(conn, pax_specs, now=None, *, history=None):
     return due
 
 
+def _plan_collection_work(conn, pax_specs, now=None, *, history=None, owned_filters=None):
+    """Keep explicit/bootstrap crawls; owned Waavo work uses exact discovery.
+
+    Each source/airport/party gets one turn before its next branch. Start with
+    one short discovery so a first unknown long direct crawl cannot consume
+    the invocation before any bounded work is tried.
+    """
+    from . import demand
+
+    now = now or datetime.now(timezone.utc)
+    history = _run_history(conn) if history is None else history
+    legacy = plan_collection(conn, pax_specs, now, history=history)
+    if not owned_filters:
+        return legacy
+    all_demand = demand.tasks_for(conn, owned_filters, now)
+    demand_history = demand.run_history(conn, now)
+    bounded = demand.due_tasks(all_demand, demand_history, now)
+    direct = [task for task in legacy if task.source == "joinup"]
+    if not bounded:
+        return direct
+    epoch = datetime.min.replace(tzinfo=timezone.utc)
+    groups, served = {}, {}
+    scope = lambda task: (task.source, task.origin, task.pax)
+    for task in bounded + direct:
+        groups.setdefault(scope(task), []).append(task)
+        served[scope(task)] = epoch
+    for task in all_demand + [task for task in _collect_tasks(pax_specs) if task.source == "joinup"]:
+        key = scope(task)
+        if key not in served:
+            continue
+        record = demand_history.get(task.query_key, {}) if isinstance(task, demand.DemandTask) else history.get(task.key, {})
+        served[key] = max(served[key], record.get("attempted") or epoch)
+    order = sorted(groups, key=lambda key: (served[key], key[0] != "waavo", key[1:]))
+    first_scope = scope(bounded[0])
+    result = [groups[first_scope].pop(0)]
+    first_round = [key for key in order if key != first_scope]
+    for key in first_round:
+        if groups[key]:
+            result.append(groups[key].pop(0))
+    while any(groups.values()):
+        for key in order:
+            if groups[key]:
+                result.append(groups[key].pop(0))
+    return result
+
+
 def _prepare_collection(conn, now):
     """Recover abandoned rows; a live/unknown owner produces a failed job.
 
@@ -322,9 +368,11 @@ def _prepare_collection(conn, now):
 
 
 def cmd_collect(args):
-    from .fetcher import run_fetch, run_waavo_fetch
+    from . import demand
+    from .fetcher import run_fetch, run_waavo_fetch, run_waavo_demand_fetch
     from .sources.joinup import JoinUpClient
     from .sources.waavo import WaavoClient
+    from .sources.waavo_discovery import WaavoDiscoveryClient
 
     log = logging.getLogger("tourfinder.collect")
     conn = db.connect(args.db)
@@ -333,23 +381,34 @@ def cmd_collect(args):
         conn.close()
         raise ValueError("max-tasks and max-minutes must be positive")
     deadline = time.monotonic() + max_minutes * 60
-    completed, attempted, failures, deferred = 0, 0, 0, 0
+    completed, attempted, failures, deferred, unsupported = 0, 0, 0, 0, 0
+    direct_attempted = 0
     try:
         recovered = _prepare_collection(conn, datetime.now(timezone.utc))
         if recovered:
             log.warning("marked %s abandoned run(s) incomplete", recovered)
         pax_specs = args.pax or active_collection_scopes(conn)
+        owned_filters = demand.active_filters(conn) if not args.pax else None
         history = _run_history(conn)
-        tasks = plan_collection(conn, pax_specs, history=history)
-        log.info("%s source/tier/party tasks due; invocation budget: %s tasks, %s min",
+        tasks = _plan_collection_work(conn, pax_specs, history=history, owned_filters=owned_filters)
+        log.info("%s collection/discovery tasks due; invocation budget: %s tasks, %s min",
                  len(tasks), max_tasks, max_minutes)
         from . import subscriptions
+        blocked_sources = set()
+        last_evaluation, evaluation_due = None, False
         for task in tasks:
+            if task.source in blocked_sources:
+                continue
             remaining = deadline - time.monotonic()
             if attempted >= max_tasks or remaining <= 0:
                 break
-            estimate = _duration_estimate(task, history, datetime.now(timezone.utc))
-            if completed and estimate is not None and estimate > remaining:
+            bounded = isinstance(task, demand.DemandTask)
+            estimate = None if bounded else _duration_estimate(task, history, datetime.now(timezone.utc))
+            # In owned mode the guaranteed short discovery goes first. Its
+            # success must not indefinitely exclude the first direct crawl
+            # whose conservative estimate exceeds the invocation budget.
+            may_defer = direct_attempted > 0 if owned_filters else completed > 0
+            if may_defer and estimate is not None and estimate > remaining:
                 # Do not create a fetch_run: keeping its old attempt time lets
                 # this task move to the front of the next invocation.
                 deferred += 1
@@ -357,18 +416,34 @@ def cmd_collect(args):
                          *task.key, estimate, remaining)
                 continue
             attempted += 1
-            adults, ages = parse_pax(task.pax)
-            log.info("fetching %s/%s/%s/%s days %s..%s", *task.key,
-                     task.days_from, task.days_till)
-            fetch, client_type = ((run_fetch, JoinUpClient) if task.source == "joinup"
-                                  else (run_waavo_fetch, WaavoClient))
             fetch_started = time.monotonic()
-            result = fetch(conn, client_type(delay=args.delay),
-                           days_from=task.days_from, days_till=task.days_till,
-                           adults=adults, children_ages=ages,
-                           tier=task.tier, pax_spec=task.pax, deadline=deadline, origin=task.origin)
+            if bounded:
+                part_deadline = min(deadline, fetch_started + task.max_seconds)
+                log.info("checking bounded discovery %s/%s/%s/%s", *task.key)
+                result = run_waavo_demand_fetch(conn, WaavoDiscoveryClient(delay=args.delay,
+                    deadline=part_deadline, max_requests=task.max_requests), filters=task.filters,
+                    query_key=task.query_key, pax_spec=task.pax, deadline=part_deadline,
+                    max_requests=task.max_requests, meal_group=task.meal_group,
+                    country_ids=task.country_ids, operator=task.operator,
+                    unsupported_reasons=task.unsupported_reasons)
+            else:
+                direct_attempted += 1
+                adults, ages = parse_pax(task.pax)
+                log.info("fetching %s/%s/%s/%s days %s..%s", *task.key,
+                         task.days_from, task.days_till)
+                fetch, client_type = ((run_fetch, JoinUpClient) if task.source == "joinup"
+                                      else (run_waavo_fetch, WaavoClient))
+                result = fetch(conn, client_type(delay=args.delay),
+                               days_from=task.days_from, days_till=task.days_till,
+                               adults=adults, children_ages=ages,
+                               tier=task.tier, pax_spec=task.pax, deadline=deadline, origin=task.origin)
+            if result.get("source_blocked") is True:
+                blocked_sources.add(task.source)
+                log.warning("source blocked; remaining %s tasks skipped for this invocation", task.source)
             elapsed = max(0.0, time.monotonic() - fetch_started)
-            if result["errors"]:
+            if bounded and task.unsupported_reasons:
+                unsupported += 1
+            elif result["errors"]:
                 failures += 1
             else:
                 completed += 1
@@ -381,16 +456,21 @@ def cmd_collect(args):
             log.info("%s/%s/%s/%s run #%s: %s offers, %s requests, completed=%s",
                      *task.key, result["run_id"], result["offers_seen"],
                      result["requests_made"], not result["errors"])
-            # A completed task must make notifications reachable even when the
-            # remaining backlog spans several scheduled invocations.
-            new_alerts = subscriptions.evaluate_all(conn, deadline=deadline)
-            if new_alerts:
-                log.info("subscriptions: %s new alert(s)", new_alerts)
-        if not attempted:
+            # Full crawls retain per-task evaluation. Tiny discovery branches
+            # share a cadence, avoiding a repeated full subscription scan for
+            # every quick operator/date part, and flush the remainder below.
+            evaluation_due = True
+            evaluation_time = time.monotonic()
+            if not bounded or last_evaluation is None or evaluation_time - last_evaluation >= 60:
+                new_alerts = subscriptions.evaluate_all(conn, deadline=deadline)
+                last_evaluation, evaluation_due = time.monotonic(), False
+                if new_alerts:
+                    log.info("subscriptions: %s new alert(s)", new_alerts)
+        if not attempted or evaluation_due and time.monotonic() < deadline:
             subscriptions.evaluate_all(conn, deadline=deadline)
-        pending = len(plan_collection(conn, pax_specs))
-        log.info("collection summary: completed=%s attempted=%s failed_or_partial=%s pending=%s deferred=%s",
-                 completed, attempted, failures, pending, deferred)
+        pending = len(_plan_collection_work(conn, pax_specs, owned_filters=owned_filters))
+        log.info("collection summary: completed=%s attempted=%s failed_or_partial=%s pending=%s deferred=%s unsupported=%s",
+                 completed, attempted, failures, pending, deferred, unsupported)
         if failures:
             raise RuntimeError(f"{failures} collection task(s) failed or incomplete; {pending} pending")
         return {"completed": completed, "attempted": attempted, "pending": pending}
@@ -408,18 +488,31 @@ def cmd_prune(args):
 
 
 def cmd_assert_fresh(args):
-    """All requested source/tier/party tasks need a recent successful run."""
+    """Check exact discovery branches separately from full source-tier runs."""
+    from . import demand
+
     conn = db.connect(args.db)
     try:
         cutoff = datetime.now(timezone.utc) - timedelta(hours=args.hours)
         history = _run_history(conn)
         tasks = _collect_tasks(args.pax or active_collection_scopes(conn))
+        owned_filters = demand.active_filters(conn) if not args.pax else None
+        bounded = demand.tasks_for(conn, owned_filters) if owned_filters else []
+        if owned_filters:
+            tasks = [task for task in tasks if task.source == "joinup"]
         stale = ["/".join(task.key) for task in tasks
                  if not history.get(task.key, {}).get("succeeded") or
                  history[task.key]["succeeded"] < cutoff]
+        discovery_history = demand.run_history(conn) if bounded else {}
+        stale += ["discovery/" + task.query_key for task in bounded
+                  if not discovery_history.get(task.query_key, {}).get("succeeded") or
+                  discovery_history[task.query_key]["succeeded"] < cutoff]
         if stale:
             raise RuntimeError("STALE or never completed: " + ", ".join(stale))
-        print(f"fresh: all {len(tasks)} source/tier/party tasks completed within {args.hours}h")
+        if bounded:
+            print(f"checked: {len(bounded)} exact discovery branches and {len(tasks)} direct-source tier runs within {args.hours}h; discovery is not full inventory")
+        else:
+            print(f"fresh: all {len(tasks)} source/tier/party tasks completed within {args.hours}h")
     finally:
         conn.close()
 

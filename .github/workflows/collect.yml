@@ -2,8 +2,8 @@ name: collect
 
 on:
   schedule:
-    # Every 2 hours. `collect` itself decides which tiers are due
-    # (near 4h / mid 12h / far 24h) and exits fast when nothing is.
+    # Every 2 hours. `collect` decides which direct tiers or exact discovery
+    # parts are due (4h / 12h / 24h) and exits fast when nothing is.
     - cron: "17 */2 * * *"
   workflow_dispatch: {}
 
@@ -27,10 +27,13 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           TELEGRAM_ALLOWED_USER_IDS: ${{ secrets.TELEGRAM_ALLOWED_USER_IDS }}
-        run: python -m tourfinder.cli collect --max-tasks 6 --max-minutes 50
+        # Exact demand parts are bounded to 8 requests / 3 minutes each.
+        # Allow more small parts without increasing the invocation time cap.
+        run: python -m tourfinder.cli collect --max-tasks 96 --max-minutes 50
       - name: assert data is fresh
         if: always()
-        # Check every source/tier/party, not merely one recent snapshot.
+        # Check direct tiers and exact discovery keys separately. Discovery
+        # completion is not proof of exhaustive source inventory.
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           TELEGRAM_ALLOWED_USER_IDS: ${{ secrets.TELEGRAM_ALLOWED_USER_IDS }}
