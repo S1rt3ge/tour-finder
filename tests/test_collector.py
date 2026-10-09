@@ -62,6 +62,23 @@ class WaavoFixture:
         yield from self.rows
 
 
+def test_waavo_run_records_exact_request_bounds_for_coverage(conn):
+    client = WaavoFixture([])
+    client.search_pages = Mock(return_value=iter([]))
+    result = fetcher.run_waavo_fetch(conn, client, adults=1, children_ages=[7],
+                                    days_from=8, days_till=14, tier="mid", pax_spec="1+1:7")
+    row = conn.execute("SELECT params FROM fetch_runs WHERE id=:id",
+                       {"id": result["run_id"]}).fetchone()
+    params = json.loads(row["params"])
+    args, kwargs = client.search_pages.call_args
+    assert params["departureAirport"] == "RIX"
+    assert (params["dateFrom"], params["dateTo"], params["adults"]) == args
+    assert params["children_ages"] == kwargs["children_ages"] == [7]
+    assert params["durationFrom"] == kwargs["duration_from"] == 2
+    assert params["durationTo"] == kwargs["duration_till"] == 21
+    assert params["max_pages"] == kwargs["max_pages"] is None
+
+
 class CollectorDialectProxy:
     """Exercise PG batch selection using the same portable SQL on local SQLite.
 

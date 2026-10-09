@@ -128,6 +128,42 @@ def test_full_live_page_avoids_cold_network_and_scan(stores):
     assert result["storage"]["archive"] == "not_needed" and not archive.calls
 
 
+def test_search_includes_coverage_for_exact_filters_without_scheduling(stores, monkeypatch):
+    import tourfinder.archive_queries as module
+    live, _cold, archive, service, trace = stores
+    add(live, offer())
+    received = []
+    evidence = {"state": "partial", "complete": False, "reasons": ["stays_not_recorded"]}
+
+    def coverage(conn, filters):
+        received.append(dict(filters))
+        return evidence
+
+    monkeypatch.setattr(module, "get_search_coverage", coverage)
+    result = service.search(**FILTERS, boards="AI", stars_min=4, limit=1)
+    assert result["coverage"] == evidence and result["count"] == 1
+    assert received[0]["adults"] == 2 and received[0]["boards"] == "AI"
+    assert received[0]["stars_min"] == 4 and received[0]["date_from"] == DAY
+    assert not archive.calls
+    assert not any(sql.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE")) for sql in trace)
+
+
+def test_coverage_failure_is_unknown_without_hiding_readable_offers(stores, monkeypatch):
+    import tourfinder.archive_queries as module
+    live, _cold, _archive, service, _trace = stores
+    add(live, offer())
+
+    def unavailable(conn, filters):
+        raise RuntimeError("private diagnostic")
+
+    monkeypatch.setattr(module, "get_search_coverage", unavailable)
+    result = service.search(**FILTERS, limit=1)
+    assert result["count"] == 1 and result["coverage"]["state"] == "unavailable"
+    assert result["coverage"]["complete"] is False
+    assert result["coverage"]["reasons"] == ["coverage_read_failed"]
+    assert result["storage"]["partial"] is False
+
+
 def test_empty_budget_search_keeps_known_cold_party_without_second_catalog_load(stores):
     _live, cold, archive, service, _trace = stores
     add(cold, offer(), price=150000)
@@ -349,7 +385,7 @@ def test_cold_candidate_limit_is_explicit_and_compositions_do_not_double_count(s
     assert composition["live_offers"] == 1 and composition["archived_offers"] == 3
 
 
-def test_options_empty_live_uses_archive_but_full_live_does_not_download(stores):
+def test_options_reads_all_configured_stores_even_when_live_is_nonempty(stores):
     live, cold, archive, service, _trace = stores
     add(cold, offer())
     result = service.options()
@@ -358,8 +394,98 @@ def test_options_empty_live_uses_archive_but_full_live_does_not_download(stores)
     assert result["storage"]["mode"] == "archive"
     archive.calls.clear()
     add(live, offer())
-    assert service.options()["storage"]["archive"] == "not_needed"
-    assert not archive.calls
+    assert service.options()["storage"]["archive"] == "ok"
+    assert archive.calls == ["catalog"]
+
+
+def test_options_exposes_archive_only_filters_and_live_labels_win(stores):
+    live, cold, _archive, service, _trace = stores
+    add(live, offer())
+    add(cold, offer(2, board_code="BB", board_name="Breakfast"))
+    cold.execute("UPDATE hotels SET country_id='EG',country_name='Egypt'")
+    cold.commit()
+    result = service.options()
+    assert {r["country_id"] for r in result["countries"]} == {"TR", "EG"}
+    assert {r["board_code"] for r in result["boards"]} == {"AI", "BB"}
+    assert service.search(**FILTERS, countries="EG", boards="BB")["count"] == 1
+
+
+def test_broken_archive_dictionary_keeps_live_choices_with_partial_status(stores):
+    live, _cold, archive, service, _trace = stores
+    add(live, offer())
+    archive.broken = True
+    result = service.options()
+    assert result["countries"] == [{"country_id": "TR", "country_name": "Turkey"}]
+    assert result["boards"][0]["board_code"] == "AI"
+    assert result["storage"]["archive"] == "unavailable"
+    assert result["storage"]["partial"]
+
+
+def test_archive_search_preserves_euro_contract_and_live_currency_precedence(stores):
+    live, cold, _archive, service, _trace = stores
+    add(live, offer(), price=100)
+    live.execute("UPDATE price_snapshots SET currency='USD'")
+    live.commit()
+    add(cold, offer(), price=100)
+    add(cold, offer(2), price=200)
+    cold.execute("UPDATE price_snapshots SET currency='USD' WHERE offer_id=2")
+    add(cold, offer(3), price=90000)
+    result = service.search(group=False, **FILTERS, budget_max=1000)
+    assert len(result["results"]) == 1
+    assert result["results"][0]["source_hotel_id"] == "hotel-3"
+    assert result["results"][0]["currency"] == "EUR"
+
+
+def test_search_releases_live_connection_before_archive_io(stores, monkeypatch):
+    _live, cold, archive, service, _trace = stores
+    add(cold, offer())
+    original_connect, original_catalog = service._connect, archive.load_catalog
+    active = []
+
+    class TrackedConnection:
+        def __init__(self):
+            self.conn = original_connect()
+            active.append(self)
+
+        def execute(self, *args):
+            return self.conn.execute(*args)
+
+        def close(self):
+            self.conn.close()
+            active.remove(self)
+
+    @contextmanager
+    def catalog_without_live_connection():
+        assert not active, "Archive I/O must not retain a live DB connection"
+        with original_catalog() as catalog:
+            yield catalog
+        assert not active
+
+    monkeypatch.setattr(service, "_connect", TrackedConnection)
+    monkeypatch.setattr(archive, "load_catalog", catalog_without_live_connection)
+    result = service.search(**FILTERS)
+    assert result["count"] == 1 and not active
+
+
+def test_failed_identity_reconnect_cannot_resurrect_old_archive_price(stores, monkeypatch):
+    live, cold, _archive, service, _trace = stores
+    add(live, offer(last_seen_at=OLD), price=150000)
+    add(cold, offer(last_seen_at=OLD), price=100)
+    original_connect = service._connect
+    calls = 0
+
+    def reconnect_fails():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return original_connect()
+        raise RuntimeError("fixture secret must not appear in API")
+
+    monkeypatch.setattr(service, "_connect", reconnect_fails)
+    result = service.search(**FILTERS, budget_max=1000)
+    assert result["count"] == 0 and calls == 2
+    assert result["storage"]["partial"]
+    assert result["storage"]["archive_error"] == "live_identity_check_failed"
 
 
 def test_options_live_labels_take_priority_when_cold_fills_missing_dictionary(stores):

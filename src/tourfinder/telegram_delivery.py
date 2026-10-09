@@ -294,13 +294,23 @@ def run_worker(conn, *, client=None, dry_run=False, now=None, limit=100):
               AND alert_id IN (SELECT id FROM alerts WHERE created_at<:cutoff)
         """, {"cutoff": _iso(current - MAX_ALERT_AGE)}).rowcount
         conn.commit()
-    ids = [row["alert_id"] for row in conn.execute("""
-        SELECT d.alert_id FROM telegram_deliveries d JOIN alerts a ON a.id=d.alert_id
+    # Paused/unapproved recipients must not repeatedly occupy the whole due
+    # page. Keep their rows until opt-in or expiry; claim rechecks every gate
+    # under the recipient lock before reserving a send.
+    owner_params = {f"owner{i}": owner for i, owner in enumerate(sorted(owners))}
+    owner_marks = ",".join(":" + key for key in owner_params) or "NULL"
+    ids = [row["alert_id"] for row in conn.execute(f"""
+        SELECT d.alert_id FROM telegram_deliveries d
+        JOIN alerts a ON a.id=d.alert_id
+        JOIN subscriptions s ON s.id=a.subscription_id
+        JOIN telegram_users u ON u.user_id=s.owner_id
         WHERE d.status IN ('pending','retry')
           AND (d.next_attempt_at IS NULL OR d.next_attempt_at<=:now)
+          AND s.enabled=1 AND u.can_notify=1 AND u.chat_id=s.owner_id
+          AND s.owner_id IN ({owner_marks})
         ORDER BY CASE WHEN a.reason='price_drop' THEN 0 ELSE 1 END,
                  a.price_cents,a.id LIMIT :limit
-    """, {"now": _iso(current), "limit": limit}).fetchall()]
+    """, {"now": _iso(current), "limit": limit, **owner_params}).fetchall()]
     if not dry_run:
         conn.commit()
     summary["candidates"] = len(ids)

@@ -9,6 +9,8 @@ from .telegram_bot import has_access
 
 _ALLOWED = {"date_from", "date_till", "adults", "children_ages", "nights_min",
             "nights_max", "budget_max", "boards", "board_categories", "countries", "only_hot", "stars_min"}
+_CURSOR_NAME = "subscription_evaluation_cursor_v1"
+_VERSION_NAME = "subscription_evaluation_version_v1"
 
 
 def evaluate(conn, sub) -> int:
@@ -71,11 +73,56 @@ def evaluate(conn, sub) -> int:
     return created
 
 
+def _evaluation_cursor(conn) -> tuple[int, int]:
+    # Separate reserved names leave the existing retained-ID counters alone.
+    conn.execute("""INSERT INTO id_counters(name,last_id)
+        VALUES (:cursor,0),(:version,0) ON CONFLICT(name) DO NOTHING""",
+        {"cursor": _CURSOR_NAME, "version": _VERSION_NAME})
+    values = {row["name"]: row["last_id"] for row in conn.execute(
+        "SELECT name,last_id FROM id_counters WHERE name IN (:cursor,:version)",
+        {"cursor": _CURSOR_NAME, "version": _VERSION_NAME})}
+    conn.commit()
+    return values[_CURSOR_NAME], values[_VERSION_NAME]
+
+
+def _advance_evaluation_cursor(conn, subscription_id: int, expected_version: int) -> int | None:
+    """Publish committed page progress unless another evaluator moved first."""
+    try:
+        version = conn.execute("""UPDATE id_counters SET last_id=last_id+1
+            WHERE name=:name AND last_id=:expected RETURNING last_id""",
+            {"name": _VERSION_NAME, "expected": expected_version}).fetchone()
+        if version is None:
+            conn.rollback()
+            return None
+        cursor = conn.execute("""UPDATE id_counters SET last_id=:id
+            WHERE name=:name RETURNING last_id""",
+            {"name": _CURSOR_NAME, "id": subscription_id}).fetchone()
+        if cursor is None:
+            raise RuntimeError("Subscription evaluation cursor is missing")
+        conn.commit()
+        return version["last_id"]
+    except Exception:
+        conn.rollback()
+        raise
+
+
 def evaluate_all(conn, *, deadline: float | None = None) -> int:
     rows = conn.execute("SELECT * FROM subscriptions WHERE enabled=1 AND owner_id IS NOT NULL ORDER BY id").fetchall()
+    conn.commit()
+    if not rows:
+        return 0
+    cursor, version = _evaluation_cursor(conn)
+    rows = sorted(rows, key=lambda sub: (sub["id"] <= cursor, sub["id"]))
     created = 0
     for sub in rows:
         if deadline is not None and time.monotonic() >= deadline:
             break
+        # evaluate commits its page (or explicit access/disabled skip) first.
+        # A crash before publishing the cursor can repeat a page, but existing
+        # alert deduplication remains authoritative and no page is lost.
         created += evaluate(conn, sub)
+        advanced = _advance_evaluation_cursor(conn, sub["id"], version)
+        if advanced is None:
+            break  # A concurrent collector/worker owns the newer progression.
+        version = advanced
     return created

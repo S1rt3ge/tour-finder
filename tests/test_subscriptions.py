@@ -203,6 +203,158 @@ class SubscriptionTests(unittest.TestCase):
         self.assertEqual(subscriptions.evaluate(self.conn, sub), 0)
         self.assertEqual(self.count("alerts"), 1)
 
+    def cursor_state(self):
+        values = {row["name"]: row["last_id"] for row in self.conn.execute(
+            "SELECT name,last_id FROM id_counters")}
+        self.conn.commit()
+        return values[subscriptions._CURSOR_NAME], values[subscriptions._VERSION_NAME]
+
+    def evaluate_one_page(self):
+        with patch.object(subscriptions.time, "monotonic", side_effect=[0, 2]):
+            return subscriptions.evaluate_all(self.conn, deadline=1)
+
+    def test_deadline_resumes_three_subscriptions_then_wraps_without_duplicate_alerts(self):
+        self.offer()
+        subs = [self.subscription() for _ in range(3)]
+        with patch("requests.post", side_effect=AssertionError("HTTP is forbidden during evaluation")):
+            for index, sub in enumerate(subs, 1):
+                self.assertEqual(self.evaluate_one_page(), 1)
+                self.assertEqual(self.cursor_state(), (sub["id"], index))
+            self.assertEqual(self.evaluate_one_page(), 0)
+        self.assertEqual(self.cursor_state(), (subs[0]["id"], 4))
+        self.assertEqual({row["subscription_id"] for row in self.conn.execute("SELECT subscription_id FROM alerts")},
+                         {sub["id"] for sub in subs})
+        self.assertEqual(self.count("alerts"), 3)
+        self.assertEqual(self.count("telegram_deliveries"), 3)
+        self.assertTrue(all(row["status"] == "pending" for row in self.conn.execute("SELECT status FROM telegram_deliveries")))
+
+    def test_cursor_wraps_past_deleted_and_revoked_subscriptions(self):
+        self.offer()
+        first = self.subscription()
+        deleted = self.subscription()
+        revoked = self.subscription(owner="789")
+        last = self.subscription()
+        self.conn.execute("""INSERT INTO telegram_access_requests(user_id,status,first_name,requested_at)
+            VALUES ('789','denied','Fixture','2026-10-08T00:00:00Z')""")
+        self.conn.commit()
+        self.assertEqual(self.evaluate_one_page(), 1)
+        self.conn.execute("DELETE FROM subscriptions WHERE id=:id", {"id": deleted["id"]})
+        self.conn.commit()
+        self.assertEqual(self.evaluate_one_page(), 0)  # Committed access skip advances too.
+        self.assertEqual(self.cursor_state(), (revoked["id"], 2))
+        self.assertEqual(self.evaluate_one_page(), 1)
+        self.assertEqual(self.cursor_state(), (last["id"], 3))
+        self.assertEqual(self.evaluate_one_page(), 0)
+        self.assertEqual(self.cursor_state(), (first["id"], 4))
+        self.assertEqual({row["subscription_id"] for row in self.conn.execute("SELECT subscription_id FROM alerts")},
+                         {first["id"], last["id"]})
+
+    def test_disabled_between_listing_and_evaluation_is_a_committed_cursor_skip(self):
+        first, second = self.subscription(), self.subscription()
+        original = subscriptions.evaluate
+
+        def disable_then_evaluate(conn, sub):
+            conn.execute("UPDATE subscriptions SET enabled=0 WHERE id=:id", {"id": sub["id"]})
+            conn.commit()
+            return original(conn, sub)
+
+        with patch.object(subscriptions, "evaluate", side_effect=disable_then_evaluate):
+            self.assertEqual(self.evaluate_one_page(), 0)
+        self.assertEqual(self.cursor_state(), (first["id"], 1))
+        self.assertEqual(self.evaluate_one_page(), 0)
+        self.assertEqual(self.cursor_state(), (second["id"], 2))
+
+    def test_cursor_cas_rejects_stale_peer_even_after_id_wraps_back(self):
+        self.assertEqual(subscriptions._evaluation_cursor(self.conn), (0, 0))
+        peer = db.DB(self.conn.engine)
+        try:
+            self.assertEqual(subscriptions._advance_evaluation_cursor(self.conn, 10, 0), 1)
+            self.assertEqual(subscriptions._evaluation_cursor(peer), (10, 1))
+            self.assertEqual(subscriptions._advance_evaluation_cursor(peer, 20, 1), 2)
+            self.assertEqual(subscriptions._advance_evaluation_cursor(peer, 10, 2), 3)
+            self.assertIsNone(subscriptions._advance_evaluation_cursor(self.conn, 99, 1))
+            self.assertEqual(self.cursor_state(), (10, 3))
+            self.assertFalse(self.conn._conn.in_transaction())
+            self.assertFalse(peer._conn.in_transaction())
+        finally:
+            peer.close()
+
+    def test_peer_cursor_progress_stops_stale_sweep_after_its_committed_page(self):
+        self.offer()
+        first, second, third = [self.subscription() for _ in range(3)]
+        original = subscriptions.evaluate
+        checked = []
+
+        def evaluate_with_peer(conn, sub):
+            checked.append(sub["id"])
+            created = original(conn, sub)
+            peer = db.DB(conn.engine)
+            try:
+                self.assertEqual(subscriptions._advance_evaluation_cursor(peer, third["id"], 0), 1)
+            finally:
+                peer.close()
+            return created
+
+        with patch.object(subscriptions, "evaluate", side_effect=evaluate_with_peer):
+            self.assertEqual(subscriptions.evaluate_all(self.conn), 1)
+        self.assertEqual(checked, [first["id"]])
+        self.assertEqual(self.cursor_state(), (third["id"], 1))
+        self.assertEqual(self.count("alerts"), 1)  # The successfully committed page is retained.
+
+    def test_failed_page_propagates_and_does_not_advance_cursor(self):
+        self.offer()
+        self.subscription()
+        with patch.object(subscriptions, "assess", side_effect=ValueError("fixture policy failure")):
+            with self.assertRaisesRegex(ValueError, "fixture policy failure"):
+                subscriptions.evaluate_all(self.conn)
+        self.conn.rollback()
+        self.assertEqual(self.cursor_state(), (0, 0))
+        self.assertEqual(self.count("alerts"), 0)
+        self.assertEqual(self.count("telegram_deliveries"), 0)
+
+    def test_cursor_publish_failure_replays_safely_after_committed_evaluation(self):
+        self.offer()
+        sub = self.subscription()
+        with patch.object(subscriptions, "_advance_evaluation_cursor", side_effect=RuntimeError("fixture cursor failure")):
+            with self.assertRaisesRegex(RuntimeError, "fixture cursor failure"):
+                subscriptions.evaluate_all(self.conn)
+        self.assertEqual(self.cursor_state(), (0, 0))
+        self.assertEqual(self.count("alerts"), 1)
+        self.assertEqual(self.count("telegram_deliveries"), 1)
+        self.assertEqual(subscriptions.evaluate_all(self.conn), 0)
+        self.assertEqual(self.cursor_state(), (sub["id"], 1))
+        self.assertEqual(self.count("alerts"), 1)
+
+    def test_cursor_and_revision_update_roll_back_together(self):
+        subscriptions._evaluation_cursor(self.conn)
+        self.conn.execute("""CREATE TRIGGER reject_cursor BEFORE UPDATE ON id_counters
+            WHEN NEW.name='subscription_evaluation_cursor_v1'
+            BEGIN SELECT RAISE(ABORT, 'fixture cursor write failure'); END""")
+        self.conn.commit()
+        with self.assertRaises(IntegrityError):
+            subscriptions._advance_evaluation_cursor(self.conn, 7, 0)
+        self.assertEqual(self.cursor_state(), (0, 0))
+
+    def test_cursor_initialization_is_idempotent_preserves_id_counters_and_releases_transactions(self):
+        self.conn.execute("INSERT INTO id_counters(name,last_id) VALUES ('alerts',600),('subscriptions',800)")
+        self.conn.commit()
+        self.assertEqual(subscriptions._evaluation_cursor(self.conn), (0, 0))
+        subscriptions._advance_evaluation_cursor(self.conn, 7, 0)
+        self.assertEqual(subscriptions._evaluation_cursor(self.conn), (7, 1))
+        self.assertFalse(self.conn._conn.in_transaction())
+        values = {row["name"]: row["last_id"] for row in self.conn.execute(
+            "SELECT name,last_id FROM id_counters WHERE name IN ('alerts','subscriptions')")}
+        self.assertEqual(values, {"alerts": 600, "subscriptions": 800})
+
+    def test_empty_or_already_exhausted_sweep_leaves_no_transaction_open(self):
+        self.assertEqual(subscriptions.evaluate_all(self.conn), 0)
+        self.assertFalse(self.conn._conn.in_transaction())
+        self.subscription()
+        with patch.object(subscriptions.time, "monotonic", return_value=2):
+            self.assertEqual(subscriptions.evaluate_all(self.conn, deadline=1), 0)
+        self.assertFalse(self.conn._conn.in_transaction())
+        self.assertEqual(self.cursor_state(), (0, 0))
+
 
 if __name__ == "__main__":
     unittest.main()

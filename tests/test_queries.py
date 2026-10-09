@@ -122,6 +122,21 @@ class QueryTests(unittest.TestCase):
         self.assertEqual(self.search(children_ages="7", budget_max=1000), [])
         self.assertEqual(self.search(children_ages="7", only_hot=True), [])
 
+    def test_euro_search_never_compares_foreign_prices_or_resurrects_old_euros(self):
+        foreign = self.offer(room_code="foreign")
+        self.snapshot(foreign, 70_000, currency="EUR")
+        self.snapshot(foreign, 100, currency="USD")
+        euro = self.offer(room_code="euro")
+        self.snapshot(euro, 90_000)
+        for sort in ("price", "price_per_night"):
+            for budget in (None, 1000):
+                with self.subTest(sort=sort, budget=budget):
+                    self.assertEqual([r["offer_id"] for r in self.search(
+                        sort=sort, budget_max=budget, limit=1)], [euro])
+                    grouped = self.grouped(sort=sort, budget_max=budget, limit=1)
+                    self.assertEqual(grouped[0]["offer_id"], euro)
+                    self.assertEqual(grouped[0]["variants"], 1)
+
     def test_verified_room_identity_reaches_search_grouping_detail_and_deal_assessment(self):
         self.hotel("h1", source="waavo")
         code = "wv2:" + "ab" * 32

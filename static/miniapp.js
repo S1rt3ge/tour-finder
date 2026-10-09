@@ -108,6 +108,40 @@
     const message = storageMessage(storage, context);
     if (message) { const note = el('p', 'storage-notice', message); note.setAttribute('role', 'status'); target.prepend(note); }
   }
+  function searchCoverageMessage(coverage, emptyResult = false) {
+    if (!coverage || !['fresh', 'running', 'queued', 'partial', 'stale', 'uncollected', 'unsupported', 'unavailable'].includes(coverage.state)) return '';
+    const reasons = Array.isArray(coverage.reasons) ? coverage.reasons : [];
+    const parts = [];
+    if (reasons.includes('dates_outside_horizon')) {
+      parts.push(coverage.state === 'unsupported' ? 'Выбранные даты сейчас не собираются.' : 'Часть выбранных дат сейчас не собирается.');
+      if (coverage.horizon?.date_from && coverage.horizon?.date_till) parts.push('Текущий диапазон вылетов: ' + dateLabel(coverage.horizon.date_from) + ' — ' + dateLabel(coverage.horizon.date_till) + '.');
+      parts.push('Заявка на состав не расширяет диапазон дат.');
+    }
+    if (reasons.includes('nights_outside_source_range')) {
+      for (const source of Array.isArray(coverage.sources) ? coverage.sources : []) {
+        if (!Array.isArray(source.reasons) || !source.reasons.includes('nights_outside_source_range')) continue;
+        const nights = source.supported_nights;
+        if (Number.isInteger(nights?.min) && Number.isInteger(nights?.max)) parts.push((source.source === 'waavo' ? 'Waavo' : source.source === 'joinup' ? 'Join Up' : 'Один из источников') + ': диапазон сбора по числу ночей — ' + nights.min + '–' + nights.max + '.');
+      }
+      parts.push('Заявка на состав не расширяет диапазон длительности у источников.');
+    }
+    if (reasons.includes('rooms_unsupported')) parts.push('Сбор выбранного размещения пока не поддерживается.');
+    if (coverage.state === 'unsupported') {
+      if (!parts.length) parts.push('Эти параметры сейчас вне поддерживаемого диапазона сбора.');
+      parts.push('Измените параметры, чтобы искать в текущем диапазоне.');
+    } else if (coverage.state === 'unavailable') {
+      parts.push('Не удалось проверить состояние сбора для выбранных параметров.');
+    } else if (!coverage.complete) {
+      parts.push('Для выбранного состава и параметров пока не подтверждён свежий полный сбор.');
+      if (coverage.state === 'running') parts.push('Последний сбор ещё не отмечен завершённым.');
+      if (coverage.state === 'queued' || coverage.queue?.requested === true) parts.push('Заявка на состав активна; срок завершения неизвестен.');
+      if (emptyResult) parts.push('Это не означает, что у продавцов нет подходящих туров.');
+    }
+    return parts.join(' ');
+  }
+  function searchCoverageRestricted(coverage) {
+    return Array.isArray(coverage?.reasons) && coverage.reasons.some(reason => ['dates_outside_horizon', 'nights_outside_source_range', 'rooms_unsupported'].includes(reason));
+  }
   function localDate(offset = 0) {
     const date = new Date(); date.setDate(date.getDate() + offset);
     return [date.getFullYear(), String(date.getMonth() + 1).padStart(2, '0'), String(date.getDate()).padStart(2, '0')].join('-');
@@ -281,9 +315,18 @@
     form.elements.only_hot.checked = Boolean(filters.only_hot);
     const ages = String(filters.children_ages || '').split(',').filter(Boolean);
     form.elements.children.value = ages.length; syncChildAges(ages);
-    for (const [name, key] of [['board', 'boards'], ['board_category', 'board_categories'], ['country', 'countries']]) {
-      const selected = new Set(String(filters[key] || '').split(','));
-      for (const input of form.querySelectorAll('[name=' + name + ']')) input.checked = selected.has(input.value);
+    for (const [name, key, target, label] of [
+      ['board', 'boards', $('board-options'), value => 'Сохранённое питание · ' + value],
+      ['board_category', 'board_categories', form.querySelector('.meal-chips'), value => BOARD_LABELS[value] || 'Сохранённая категория · ' + value],
+      ['country', 'countries', $('country-options'), value => 'Сохранённая страна · ' + value],
+    ]) {
+      const selected = new Set(String(filters[key] || '').split(',').filter(Boolean));
+      const present = new Set(Array.from(target.querySelectorAll('input')).map(input => input.value));
+      const missing = Array.from(selected).filter(value => !present.has(value)).map(value => ({value}));
+      // A delayed/failed dictionary must never broaden a saved search. Keep
+      // selected unknown values visible; a later options load can name them.
+      if (missing.length) mergeOptionChips(target, name, missing, 'value', row => label(row.value));
+      for (const input of target.querySelectorAll('input')) input.checked = selected.has(input.value);
     }
     if (filters.boards) { $('raw-meals').open = true; $('raw-meals').closest('.more-filters').open = true; }
     syncMealPresets(); collapseFilters(false);
@@ -458,7 +501,9 @@
       $('search-results').removeAttribute('aria-busy');
       $('search-results-title').textContent = data.results.length ? 'Варианты для вашего отпуска' : 'Пока без совпадений';
       $('search-results-caption').textContent = (data.results.length ? data.results.length + ' отелей · ' : '') + partyLabel(filters) + ' · цена за всех';
-      $('search-storage').textContent = storageMessage(data.storage);
+      const coverageNote = searchCoverageMessage(data.coverage, !data.results.length);
+      const unsupported = data.coverage?.state === 'unsupported';
+      $('search-storage').textContent = [storageMessage(data.storage), data.results.length ? coverageNote : ''].filter(Boolean).join(' ');
       $('search-storage').hidden = !$('search-storage').textContent;
       if (data.results.length) {
         $('search-results').replaceChildren(...data.results.map(row => hotelCard(row, filters)));
@@ -468,15 +513,15 @@
         const known = Array.isArray(data.available_compositions) && data.available_compositions.some(item => Number(item.pax_adl) === filters.adults && String(item.children_ages || '') === ages);
         if (data.queued_spec) { const spec = compositionSpec(filters); state.queuedPax.add(spec); state.paxErrors.delete(spec); }
         const queued = Boolean(data.queued_spec) || state.queuedPax.has(compositionSpec(filters));
-        const message = queued
+        const message = coverageNote || (queued
           ? 'Запрос на этот состав сохранён. Предложения появятся, если следующий успешный сбор найдёт подходящие туры; точное время неизвестно.'
           : data.storage?.partial ? (archiveSearchLimited(data.storage)
             ? 'Проверена ограниченная часть архива, поэтому отсутствие совпадений пока не подтверждено. Уточните параметры или запросите свежий сбор для этого состава.'
             : 'Не все данные удалось проверить. Повторите поиск позже или уточните параметры.')
           : known ? 'В собранных данных сейчас нет совпадений для этих дат и фильтров. Можно изменить параметры или запросить свежий сбор для этого состава.'
-          : 'Для этого точного состава пока нет собранных предложений. Цены другого состава могут отличаться — мы не будем их подменять.';
-        empty($('search-results'), queued ? 'Состав добавлен в сбор' : 'Попробуем другие параметры?', message, () => { collapseFilters(false); form.elements.date_from.focus(); }, 'Изменить поиск');
-        if (!demoMode && state.user) appendCompositionRequest($('search-results').querySelector('.empty-state'), filters, known);
+          : 'Для этого точного состава пока нет собранных предложений. Цены другого состава могут отличаться — мы не будем их подменять.');
+        empty($('search-results'), unsupported ? 'За пределами текущего сбора' : queued ? 'Состав добавлен в сбор' : 'Попробуем другие параметры?', message, () => { collapseFilters(false); form.elements.date_from.focus(); }, 'Изменить поиск');
+        if (!unsupported && !demoMode && state.user) appendCompositionRequest($('search-results').querySelector('.empty-state'), filters, known, data.coverage);
       }
       if (window.matchMedia('(max-width: 699px)').matches) collapseFilters(true);
     } catch (error) {
@@ -516,12 +561,15 @@
       trigger.querySelector('span').textContent = queued ? 'Состав добавлен в сбор' : pending ? 'Сохраняем запрос…' : panel.dataset.paxRequestLabel;
       note.className = error ? 'form-error' : 'field-hint';
       note.setAttribute('role', error ? 'alert' : 'status');
-      note.textContent = error || (queued ? 'Запрос сохранён. Предложения появятся, если следующий успешный сбор найдёт подходящие туры. Срок пока неизвестен.' : 'После отправки состав попадёт в очередной сбор источников.');
+      note.textContent = error || (panel.dataset.paxRequestRestricted === 'true'
+        ? (queued ? 'Запрос на состав сохранён. ' : 'Заявка относится к составу туристов. ') + 'Она не расширяет диапазон дат и длительности сбора; срок неизвестен.'
+        : queued ? 'Запрос сохранён. Предложения появятся, если следующий успешный сбор найдёт подходящие туры. Срок пока неизвестен.' : 'После отправки состав попадёт в очередной сбор источников.');
     }
   }
-  function appendCompositionRequest(target, filters, known = false) {
+  function appendCompositionRequest(target, filters, known = false, coverage = null) {
     const spec = compositionSpec(filters); const panel = el('div'); panel.dataset.paxRequest = spec;
     panel.dataset.paxRequestLabel = known ? 'Запросить свежие предложения' : 'Собрать предложения для этого состава';
+    panel.dataset.paxRequestRestricted = String(searchCoverageRestricted(coverage));
     const request = button(panel.dataset.paxRequestLabel, 'button button-primary', () => requestComposition({...filters}));
     panel.append(request, el('p', 'field-hint')); target.append(panel); refreshCompositionRequests(spec);
   }
@@ -887,6 +935,19 @@
       else empty($('alerts-list'), 'Пока тихо', 'Здесь появятся непрочитанные совпадения ваших поисков. Их наличие зависит от свежего сбора предложений.', null, '', 'bell');
     } else empty($('alerts-list'), 'Сигналы не загрузились', alerts.reason?.message || 'Попробуйте позже.', loadSaved, 'Повторить', 'bell');
   }
+  function openSavedSearch(sub) {
+    const filters = {...(sub.filters || {})};
+    const today = localDate();
+    if (filters.date_till && filters.date_till < today) {
+      toast('Даты этого поиска уже прошли. Создайте новый поиск с будущими датами.');
+      return;
+    }
+    const excludedPastDates = filters.date_from && filters.date_from < today;
+    if (excludedPastDates) filters.date_from = today;
+    applyFilters(filters); navigate('search');
+    if (excludedPastDates) toast('Ищем с сегодняшнего дня: прошедшие даты исключены.');
+    return runSearch();
+  }
   function subscriptionCard(sub) {
     const card = el('article', 'subscription-card' + (sub.enabled ? '' : ' paused'));
     const top = el('div', 'subscription-top'); top.append(el('h3', '', sub.name || 'Мой поиск'), el('span', 'badge ' + (sub.enabled ? 'badge-deal' : 'badge-warm'), sub.enabled ? 'Следим' : 'Пауза')); card.append(top);
@@ -896,7 +957,7 @@
     if (mode !== 'deal') criteria.push('Новые совпадения в бюджете');
     card.append(el('div', 'subscription-criteria', criteria.join(' · ')));
     const actions = el('div', 'subscription-actions');
-    actions.append(button('Посмотреть', 'text-button', () => { applyFilters(sub.filters || {}); navigate('search'); runSearch(); }));
+    actions.append(button('Посмотреть', 'text-button', () => openSavedSearch(sub)));
     const toggle = button(sub.enabled ? 'Пауза' : 'Включить', 'text-button', async () => {
       toggle.disabled = true;
       try { await api('/api/subscriptions/' + encodeURIComponent(sub.id), {method: 'PATCH', body: {enabled: !sub.enabled}}); await loadSaved(); }
