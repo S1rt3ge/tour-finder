@@ -10,6 +10,7 @@ import time
 from decimal import Decimal, InvalidOperation
 
 import requests
+from urllib3.util import Timeout
 
 log = logging.getLogger(__name__)
 
@@ -55,40 +56,71 @@ class JoinUpBlockedError(JoinUpError):
     """Source refused us (403). Abort the run, do not retry."""
 
 
+class JoinUpDeadlineError(JoinUpError):
+    """The caller's collection budget is exhausted. Keep partial results."""
+
+
 class JoinUpClient:
     def __init__(self, lang: str = "lv", currency: str = "EUR",
-                 delay: float = 1.2, session: requests.Session | None = None):
+                 delay: float = 1.2, session: requests.Session | None = None,
+                 deadline: float | None = None):
         self.lang = lang
         self.currency = currency
         self.delay = delay
+        self.deadline = deadline
         self.requests_made = 0
         self.session = session or requests.Session()
         self.session.headers["User-Agent"] = USER_AGENT
         self.session.headers["Accept"] = "application/json"
+
+    def _remaining(self) -> float | None:
+        if self.deadline is None:
+            return None
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise JoinUpDeadlineError("partial: collection time budget exhausted")
+        return remaining
+
+    def _pause(self, seconds: float) -> None:
+        remaining = self._remaining()
+        if remaining is not None and seconds >= remaining:
+            raise JoinUpDeadlineError("partial: collection time budget exhausted")
+        if seconds > 0:
+            time.sleep(seconds)
+        self._remaining()  # The scheduler may resume us later than requested.
 
     def _get(self, path: str, **params) -> dict:
         params.setdefault("lang", self.lang)
         params.setdefault("currency", self.currency)
         url = f"{BASE_URL}/{path}"
         for attempt in range(5):
-            time.sleep(self.delay + random.uniform(0, 0.6))
+            self._pause(self.delay + random.uniform(0, 0.6))
+            remaining = self._remaining()
+            # A shared connect/read budget; Requests still cannot enforce a
+            # hard wall-clock deadline for DNS or a trickling response body.
+            timeout = (60 if remaining is None else Timeout(
+                total=remaining, connect=min(60, remaining), read=min(60, remaining)))
             try:
-                resp = self.session.get(url, params=params, timeout=60)
+                resp = self.session.get(url, params=params, timeout=timeout)
             except (requests.Timeout, requests.ConnectionError) as exc:
                 self.requests_made += 1
+                if attempt == 4:
+                    break
                 # Heavy queries can take 15s+ server-side; when the API starts
                 # dropping connections it needs a real pause, not seconds.
                 wait = 20 * (attempt + 1)
                 log.warning("%s -> %s, retry in %ss", path, type(exc).__name__, wait)
-                time.sleep(wait)
+                self._pause(wait)
                 continue
             self.requests_made += 1
             if resp.status_code == 403:
                 raise JoinUpBlockedError(f"{path}: 403 from source")
             if resp.status_code in (429, 500, 502, 503, 504):
+                if attempt == 4:
+                    break
                 wait = 5 * (attempt + 1)
                 log.warning("%s -> HTTP %s, retry in %ss", path, resp.status_code, wait)
-                time.sleep(wait)
+                self._pause(wait)
                 continue
             resp.raise_for_status()
             data = resp.json()

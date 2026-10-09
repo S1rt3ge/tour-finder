@@ -18,6 +18,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 
 import requests
+from urllib3.util import Timeout
 
 log = logging.getLogger(__name__)
 
@@ -43,9 +44,15 @@ class WaavoBlockedError(WaavoError):
     """Source refused us (403). Abort the run, do not retry."""
 
 
+class WaavoDeadlineError(WaavoError):
+    """The caller's collection budget is exhausted. Keep partial results."""
+
+
 class WaavoClient:
-    def __init__(self, delay: float = 1.2, session: requests.Session | None = None):
+    def __init__(self, delay: float = 1.2, session: requests.Session | None = None,
+                 deadline: float | None = None):
         self.delay = delay
+        self.deadline = deadline
         self.requests_made = 0
         self.session = session or requests.Session()
         self.session.headers.update({
@@ -54,24 +61,49 @@ class WaavoClient:
             "Referer": "https://joinastra.waavo.com/",
         })
 
+    def _remaining(self) -> float | None:
+        if self.deadline is None:
+            return None
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise WaavoDeadlineError("partial: collection time budget exhausted")
+        return remaining
+
+    def _pause(self, seconds: float) -> None:
+        remaining = self._remaining()
+        if remaining is not None and seconds >= remaining:
+            raise WaavoDeadlineError("partial: collection time budget exhausted")
+        if seconds > 0:
+            time.sleep(seconds)
+        self._remaining()  # The scheduler may resume us later than requested.
+
     def _get(self, **params) -> dict:
         for attempt in range(4):
-            time.sleep(self.delay + random.uniform(0, 0.6))
+            self._pause(self.delay + random.uniform(0, 0.6))
+            remaining = self._remaining()
+            # A shared connect/read budget; Requests still cannot enforce a
+            # hard wall-clock deadline for DNS or a trickling response body.
+            timeout = (60 if remaining is None else Timeout(
+                total=remaining, connect=min(60, remaining), read=min(60, remaining)))
             try:
-                resp = self.session.get(BASE_URL, params=params, timeout=60)
+                resp = self.session.get(BASE_URL, params=params, timeout=timeout)
             except (requests.Timeout, requests.ConnectionError) as exc:
                 self.requests_made += 1
+                if attempt == 3:
+                    break
                 wait = 5 * (attempt + 1)
                 log.warning("waavo -> %s, retry in %ss", type(exc).__name__, wait)
-                time.sleep(wait)
+                self._pause(wait)
                 continue
             self.requests_made += 1
             if resp.status_code == 403:
                 raise WaavoBlockedError("403 from waavo")
             if resp.status_code in (429, 500, 502, 503, 504):
+                if attempt == 3:
+                    break
                 wait = 5 * (attempt + 1)
                 log.warning("waavo -> HTTP %s, retry in %ss", resp.status_code, wait)
-                time.sleep(wait)
+                self._pause(wait)
                 continue
             resp.raise_for_status()
             return resp.json()

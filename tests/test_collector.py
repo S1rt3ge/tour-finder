@@ -62,6 +62,183 @@ class WaavoFixture:
         yield from self.rows
 
 
+class CollectorDialectProxy:
+    """Exercise PG batch selection using the same portable SQL on local SQLite.
+
+    This verifies contents/transactions/command counts, not PostgreSQL latency.
+    """
+    def __init__(self, connection, dialect="postgresql", *, fail_snapshot_batch=None):
+        self.connection, self.dialect = connection, dialect
+        self.commands = []
+        self.commits = self.rollbacks = self.snapshot_batches = 0
+        self.fail_snapshot_batch = fail_snapshot_batch
+
+    def execute(self, statement, params=None):
+        self.commands.append((statement, len(params or {})))
+        if statement.startswith("INSERT INTO price_snapshots"):
+            self.snapshot_batches += 1
+            if self.snapshot_batches == self.fail_snapshot_batch:
+                raise RuntimeError("fixture private diagnostic must not be logged")
+        return self.connection.execute(statement, params)
+
+    def commit(self):
+        self.connection.commit()
+        self.commits += 1
+
+    def rollback(self):
+        self.connection.rollback()
+        self.rollbacks += 1
+
+
+@pytest.mark.parametrize("dialect,size,batches", [("sqlite", 40, 25), ("postgresql", 200, 5)])
+def test_dialect_batch_size_reduces_commands_with_identical_complete_observations(conn, caplog, dialect, size, batches):
+    proxy = CollectorDialectProxy(conn, dialect)
+    with caplog.at_level("INFO", logger="tourfinder.fetcher"):
+        result = fetcher.run_waavo_fetch(proxy, WaavoFixture(
+            [raw_waavo(index, reviews=True) for index in range(1000)]), tier="near", pax_spec="2")
+    assert result["completed"] and result["offers_seen"] == 1000
+    assert len(proxy.commands) == 2 + batches * 5  # start/end + five SQL statements per full Waavo batch
+    assert proxy.commits == batches + 2 and proxy.rollbacks == 0
+    assert max(count for _, count in proxy.commands) == size * 19
+    assert conn.execute("SELECT count(*) FROM hotels").scalar() == 1000
+    assert conn.execute("SELECT count(*) FROM offers").scalar() == 1000
+    assert conn.execute("SELECT count(*) FROM hotel_reviews").scalar() == 1000
+    assert conn.execute("SELECT count(*) FROM price_snapshots").scalar() == 1000
+    assert conn.execute("SELECT count(DISTINCT offer_id) FROM price_snapshots").scalar() == 1000
+    assert conn.execute("SELECT count(*) FROM price_snapshots WHERE price_cents<>10000").scalar() == 0
+    metrics = [record for record in caplog.records if "write batches:" in record.msg]
+    assert len(metrics) == 1
+    assert metrics[0].args[:4] == (result["run_id"], size, batches, batches)
+    assert metrics[0].args[4] >= 0
+    assert "Fixture hotel" not in metrics[0].getMessage() and "example.invalid" not in metrics[0].getMessage()
+
+
+def test_pg_batch_boundary_preserves_first_price_last_link_and_repeated_observations(conn):
+    proxy = CollectorDialectProxy(conn)
+    rows = [raw_waavo(index, 100) for index in range(201)] + [
+        raw_waavo(0, 80, link="https://example.invalid/updated")]
+    first = fetcher.run_waavo_fetch(proxy, WaavoFixture(rows))
+    assert first["completed"] and first["offers_seen"] == 201
+    matching = conn.execute("""SELECT o.id,o.link,p.price_cents FROM offers o
+        JOIN price_snapshots p ON p.offer_id=o.id WHERE source_hotel_id='teztour:0'""").fetchone()
+    assert matching["price_cents"] == 10000 and matching["link"] == "https://example.invalid/updated"
+    second = fetcher.run_waavo_fetch(proxy, WaavoFixture([raw_waavo(index, 100) for index in range(201)]))
+    assert second["completed"] and second["offers_seen"] == 201
+    assert conn.execute("SELECT count(*) FROM offers").scalar() == 201
+    assert conn.execute("SELECT count(*) FROM price_snapshots").scalar() == 402
+    assert [row["n"] for row in conn.execute(
+        "SELECT count(*) AS n FROM price_snapshots GROUP BY run_id ORDER BY run_id")] == [201, 201]
+    assert conn.execute("""SELECT count(*) FROM
+        (SELECT run_id,offer_id FROM price_snapshots GROUP BY run_id,offer_id HAVING count(*)<>1) duplicates""").scalar() == 0
+
+
+def test_pg_hot_pass_crosses_batch_boundary_without_replacing_price(conn):
+    class JoinUpFixture:
+        lang = "lv"
+        requests_made = 0
+
+        def destinations(self, origin):
+            return [{"id": "country"}]
+
+        def stays(self, *args):
+            return [7]
+
+        def search_pages(self, *args, **kwargs):
+            self.requests_made += 1
+            price = 80 if kwargs.get("tour_types") else 100
+            for index in range(205):
+                yield {"hotel": {"id": str(index), "name": f"Fixture {index}"}, "offers": [{
+                    "from": {"id": "3164"}, "date_start": "2026-10-20",
+                    "stay": {"stay": 7}, "board": {"board_type": "AI"},
+                    "price": {"total_price": {"price": price}}}]}
+
+    result = fetcher.run_fetch(CollectorDialectProxy(conn), JoinUpFixture())
+    assert result["completed"] and result["offers_seen"] == 205
+    assert conn.execute("SELECT count(*) FROM offers").scalar() == 205
+    assert conn.execute("SELECT count(*) FROM price_snapshots").scalar() == 205
+    assert conn.execute("SELECT count(*) FROM price_snapshots WHERE price_cents=10000 AND is_hot=1").scalar() == 205
+
+
+def test_pg_second_batch_failure_preserves_first_and_rolls_back_every_current_table(conn, caplog):
+    proxy = CollectorDialectProxy(conn, fail_snapshot_batch=2)
+    with caplog.at_level("INFO", logger="tourfinder.fetcher"):
+        result = fetcher.run_waavo_fetch(proxy, WaavoFixture(
+            [raw_waavo(index, reviews=True) for index in range(450)]), tier="near", pax_spec="2")
+    assert not result["completed"] and result["offers_seen"] == 200
+    for table in ("hotels", "offers", "hotel_reviews", "price_snapshots"):
+        assert conn.execute(f"SELECT count(*) FROM {table}").scalar() == 200
+    assert proxy.rollbacks >= 1 and proxy.commits == 3  # start, first batch, incomplete end
+    persisted = conn.execute("SELECT finished_at,errors FROM fetch_runs").fetchone()
+    assert persisted["finished_at"] and json.loads(persisted["errors"]) == ["RuntimeError"]
+    assert cli._run_history(conn)[("waavo", "near", "2")]["succeeded"] is None
+    metric = next(record for record in caplog.records if "write batches:" in record.msg)
+    assert metric.args[:4] == (result["run_id"], 200, 2, 1)
+    assert "private diagnostic" not in caplog.text
+
+
+def test_flush_metrics_include_commit_and_rollback_time_only(conn, monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(fetcher.time, "monotonic", lambda: clock[0])
+    writer = fetcher._BatchWriter(CollectorDialectProxy(conn), 123)
+    store = Mock(side_effect=[7, RuntimeError("fixture")])
+    def timed_store(*args):
+        clock[0] += 2
+        return store(*args)
+    def commit():
+        clock[0] += 0.5
+    def rollback():
+        clock[0] += 0.25
+    monkeypatch.setattr(fetcher, "_store_batch", timed_store)
+    monkeypatch.setattr(writer.conn, "commit", commit)
+    monkeypatch.setattr(writer.conn, "rollback", rollback)
+    writer.entries = ["local fixture"]
+    clock[0] = 100  # Time outside a flush must not enter write timing.
+    writer.flush()
+    clock[0] += 100
+    writer.entries = ["local fixture"]
+    with pytest.raises(RuntimeError):
+        writer.flush()
+    writer.flush()  # Empty flush adds neither time nor a commit.
+    assert writer.flush_count == 2 and writer.flush_committed == 1
+    assert writer.flush_seconds == 4.75 and writer.offers_seen == 7
+
+
+@pytest.mark.parametrize("source", ["joinup", "waavo"])
+def test_source_deadline_aborts_task_and_flushes_acquired_rows(conn, monkeypatch, source):
+    monkeypatch.setattr(fetcher.time, "monotonic", lambda: 0)
+    called = []
+    class DeadlineFixture:
+        lang = "lv"
+        requests_made = 0
+
+        def destinations(self, origin):
+            assert self.deadline == 123
+            return [{"id": "first"}, {"id": "must-not-be-requested"}]
+
+        def stays(self, origin, destination, dates):
+            called.append(destination)
+            return [7]
+
+        def search_pages(self, *args, **kwargs):
+            assert self.deadline == 123
+            self.requests_made += 1
+            if source == "waavo":
+                yield raw_waavo(1)
+                raise fetcher.waavo.WaavoDeadlineError("partial: collection time budget exhausted")
+            yield {"hotel": {"id": "1", "name": "Fixture"}, "offers": [{
+                "from": {"id": "3164"}, "date_start": "2026-10-20", "stay": {"stay": 7},
+                "board": {"board_type": "AI"}, "price": {"total_price": {"price": 100}}}]}
+            raise fetcher.joinup.JoinUpDeadlineError("partial: collection time budget exhausted")
+
+    fetch = fetcher.run_fetch if source == "joinup" else fetcher.run_waavo_fetch
+    result = fetch(CollectorDialectProxy(conn), DeadlineFixture(), deadline=123, tier="near", pax_spec="2")
+    assert not result["completed"] and result["offers_seen"] == 1
+    assert result["errors"] == ["partial: collection time budget exhausted"]
+    assert conn.execute("SELECT count(*) FROM price_snapshots").scalar() == 1
+    assert cli._run_history(conn)[(source, "near", "2")]["succeeded"] is None
+    assert called == (["first"] if source == "joinup" else [])
+
+
 def test_freshness_is_per_source_tier_and_party_and_success_only(conn):
     add_run(conn, "joinup")
     add_run(conn, "waavo", errors=["HTTP 403"])
