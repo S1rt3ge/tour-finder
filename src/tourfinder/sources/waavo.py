@@ -20,6 +20,8 @@ from decimal import Decimal, InvalidOperation
 import requests
 from urllib3.util import Timeout
 
+from ..origins import normalize_source_origin, source_origin
+
 log = logging.getLogger(__name__)
 
 SOURCE_NAME = "waavo"
@@ -112,13 +114,14 @@ class WaavoClient:
     def search_pages(self, date_from: str, date_till: str, adults: int,
                      children_ages: list[int] | None = None,
                      duration_from: int = 2, duration_till: int = 21,
-                     max_pages: int | None = None):
+                     max_pages: int | None = None, origin: str = RIGA_AIRPORT):
         """Yield raw offers across offset pages. Operator filtering isn't
         honored server-side, so callers drop excluded operators."""
+        departure = source_origin("waavo", origin)
         offset = 0
         page = 0
         while True:
-            params = dict(departureAirport=RIGA_AIRPORT, dateFrom=date_from,
+            params = dict(departureAirport=departure, dateFrom=date_from,
                           dateTo=date_till, adults=adults,
                           durationFrom=duration_from, durationTo=duration_till,
                           limit=PAGE_SIZE, offset=offset)
@@ -255,12 +258,21 @@ def _room_identity(offer: dict, adults: int, children_ages: list[int],
     return ("wv2:" if reliable else "wu2:") + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def normalize(offer: dict, adults: int, children_ages: list[int] | None = None):
+def normalize(offer: dict, adults: int, children_ages: list[int] | None = None,
+              *, origin: str = RIGA_AIRPORT):
     """Waavo offer -> (hotel row, offer row + snapshot fields, review row).
 
     Returns (hotel, offer, review) where review may be None. The requested pax
     is accepted only when any explicit source echoes agree with it.
     """
+    requested_origin = source_origin("waavo", origin)
+    if offer.get("departureAirport") is not None and not isinstance(offer["departureAirport"], dict):
+        raise ValueError("waavo_origin_echo_mismatch")
+    departure = _mapping(offer.get("departureAirport"))
+    echoed = departure.get("code")
+    actual_origin = requested_origin if echoed in (None, "") else normalize_source_origin("waavo", echoed)
+    if actual_origin != requested_origin:
+        raise ValueError("waavo_origin_echo_mismatch")
     if children_ages is not None and not isinstance(children_ages, (list, tuple)):
         raise ValueError("waavo_invalid_party")
     children_ages = list(children_ages or [])
@@ -304,7 +316,7 @@ def normalize(offer: dict, adults: int, children_ages: list[int] | None = None):
     offer_row = {
         "source": SOURCE_NAME,
         "source_hotel_id": hotel["source_hotel_id"],
-        "origin_id": dep.get("code") or RIGA_AIRPORT,
+        "origin_id": actual_origin,
         "origin_name": dep.get("name"),
         "date_start": offer.get("date"),
         "date_end": None,

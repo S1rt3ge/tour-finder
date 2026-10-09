@@ -9,7 +9,8 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-from . import meals, queries, reviews
+from . import countries, meals, queries, reviews
+from .origins import normalize_source_origin
 from .archive_format import ArchiveError, normalize_offer_key, observation_key, offer_key
 from .archive_store import ArchiveStore
 from .coverage import get_search_coverage
@@ -19,7 +20,7 @@ HISTORY_DISPLAY_LIMIT = 2000
 HISTORY_READ_LIMIT = 10000
 _IDENTITY = ("source", "source_hotel_id", "origin_id", "date_start", "nights",
              "board_code", "room_code", "room_placement", "pax_adl", "pax_chd", "children_ages")
-_FILTER_DEFAULTS = dict(adults=2, children_ages=None, nights_min=1, nights_max=30,
+_FILTER_DEFAULTS = dict(adults=2, children_ages=None, origins="RIX", nights_min=1, nights_max=30,
                         budget_max=None, boards=None, board_categories=None,
                         countries=None, only_hot=False, stars_min=None,
                         hotel_id=None, source=None)
@@ -70,6 +71,7 @@ def _finish(status, rows):
 
 def _label(row, *, archived=False, as_of=None, dataset_id=None):
     row = dict(row)
+    row["origin_code"] = normalize_source_origin(row.get("source"), row.get("origin_id"))
     row.update(data_source="archive" if archived else "live", archived=archived,
                archive_as_of=as_of, dataset_id=dataset_id)
     cutoff = queries._fresh_cutoff()
@@ -203,7 +205,7 @@ class ReadService:
     def _archive_failure(self, status):
         status.update(archive="unavailable", archive_error="archive_read_failed", partial=True)
 
-    def search(self, *, group=True, sort="price", limit=100, **filters):
+    def search(self, *, group=True, sort="price", limit=100, owner_id=None, **filters):
         filters = _FILTER_DEFAULTS | filters
         limit = max(1, min(int(limit), 500))
         status, live_rows, cold_rows = _status(), [], []
@@ -225,7 +227,15 @@ class ReadService:
                     except Exception:
                         _note_partial(status, "composition_lookup_failed")
                 try:
-                    coverage = get_search_coverage(conn, filters)
+                    if owner_id is not None:
+                        from .collection_requests import matching_request
+                        requested = matching_request(conn, owner_id, filters)
+                        queue = {"requested": bool(requested), "scope": "exact_search",
+                                 "request_id": requested["id"] if requested else None,
+                                 "requested_at": requested["updated_at"] if requested else None}
+                        coverage = get_search_coverage(conn, filters, queue_override=queue)
+                    else:
+                        coverage = get_search_coverage(conn, filters)
                 except Exception:
                     # Coverage is auxiliary evidence, never a reason to hide
                     # readable offers. Close/rollback a failed read transaction.
@@ -409,7 +419,7 @@ class ReadService:
 
         def read(conn):
             return {
-                "countries": [dict(row) for row in conn.execute("""SELECT DISTINCT country_id,country_name
+                "countries": [dict(row) for row in conn.execute("""SELECT DISTINCT source,country_id,country_name
                     FROM hotels WHERE country_id IS NOT NULL ORDER BY country_name""")],
                 "boards": [dict(row) for row in conn.execute("""SELECT board_code,max(board_name) AS board_name
                     FROM offers GROUP BY board_code ORDER BY board_code""")],
@@ -434,6 +444,9 @@ class ReadService:
                 self._archive_failure(status)
         result = {}
         for name, identity, label in (("countries", "country_id", "country_name"), ("boards", "board_code", "board_name")):
+            if name == "countries":
+                result[name] = countries.canonical_options(live[name] + cold[name])
+                continue
             combined = {row[identity]: row for row in cold[name]}
             combined.update({row[identity]: row for row in live[name]})
             result[name] = sorted(combined.values(), key=lambda row: (str(row.get(label) or ""), str(row[identity])))

@@ -105,6 +105,91 @@ class QueryTests(unittest.TestCase):
         args = dict(since="2026-10-05T12:00:00Z", today="2026-10-08")
         return queries.price_drops(self.conn, **(args | changes))
 
+    def test_departure_filter_precedes_limit_and_preserves_exact_offer_history(self):
+        identifiers = {}
+        for code, raw, price in (("RIX", "3164", 90_000), ("VNO", "2151", 60_000), ("TLL", "2552", 70_000)):
+            identifier = self.offer(origin_id=raw, origin_name=code)
+            self.snapshot(identifier, 100_000, "2026-10-07T00:00:00Z")
+            self.snapshot(identifier, price)
+            identifiers[code] = identifier
+        for legacy_default in (None, "", " RIX "):
+            for query in (self.search, self.grouped):
+                row = query(origins=legacy_default, limit=1)[0]
+                self.assertEqual((row["offer_id"], row["origin_id"], row["origin_code"], row["price_cents"]),
+                                 (identifiers["RIX"], "3164", "RIX", 90_000))
+        for code in identifiers:
+            row = self.search(origins=code, limit=1)[0]
+            detail = queries.offer_detail(self.conn, identifiers[code])
+            self.assertEqual(row["offer_id"], identifiers[code])
+            self.assertEqual(detail["origin_id"], row["origin_id"])
+            self.assertEqual(detail["origin_code"], code)
+            self.assertEqual(detail["snapshots_count"], 2)
+            self.assertEqual(detail["min_seen_cents"], row["price_cents"])
+            self.assertEqual(detail["max_seen_cents"], 100_000)
+            drop = self.drops(origins=code, limit=1)[0]
+            self.assertEqual((drop["offer_id"], drop["origin_code"], drop["prev_price_cents"]),
+                             (identifiers[code], code, 100_000))
+        self.assertEqual([row["offer_id"] for row in self.drops()], [identifiers["RIX"]])
+        multi = self.search(origins="TLL,RIX,VNO,VNO")
+        self.assertEqual([row["origin_code"] for row in multi], ["VNO", "TLL", "RIX"])
+        grouped = self.grouped(origins="RIX,VNO,TLL")[0]
+        self.assertEqual((grouped["origin_code"], grouped["variants"], grouped["variants_min_cents"],
+                          grouped["variants_max_cents"]), ("VNO", 3, 60_000, 90_000))
+
+    def test_legacy_iata_origins_work_but_numeric_aliases_are_provider_scoped(self):
+        legacy = self.offer(origin_id="RIX")
+        self.snapshot(legacy, 90_000)
+        self.hotel("h1", source="waavo")
+        vilnius = self.offer(source="waavo", origin_id="VNO")
+        self.snapshot(vilnius, 80_000)
+        not_riga = self.offer(source="waavo", origin_id="3164")
+        self.snapshot(not_riga, 100)
+        unknown = self.offer(origin_id="LON")
+        self.snapshot(unknown, 200)
+        self.assertEqual([row["offer_id"] for row in self.search()], [legacy])
+        self.assertEqual([row["offer_id"] for row in self.search(origins="VNO")], [vilnius])
+        self.assertEqual({row["offer_id"] for row in self.search(origins="RIX,VNO,TLL")}, {legacy, vilnius})
+        self.assertIsNone(queries.offer_detail(self.conn, not_riga)["origin_code"])
+        self.assertEqual(queries.offer_detail(self.conn, not_riga)["origin_id"], "3164")
+
+    def test_unsupported_departure_never_broadens_search_group_or_drops(self):
+        self.snapshot(self.offer(), 80_000)
+        for query in (self.search, self.grouped, self.drops):
+            for value in ("LON", "RIX,LON", "3164", "RIX' OR 1=1 --"):
+                with self.subTest(query=query.__name__, value=value):
+                    with self.assertRaises(ValueError):
+                        query(origins=value)
+
+    def test_canonical_country_filters_unite_sources_before_limit_but_raw_ids_stay_exact(self):
+        joinup_turkey = self.offer()
+        self.snapshot(joinup_turkey, 100_000)
+        waavo_turkey = []
+        for hotel, country, price in (("turkey-15", "15", 80_000), ("turkey-18", "18", 90_000)):
+            self.hotel(hotel, source="waavo", country=country)
+            identifier = self.offer(source="waavo", source_hotel_id=hotel)
+            self.snapshot(identifier, price)
+            waavo_turkey.append(identifier)
+        self.hotel("greece-15", source="other", country="15")
+        self.sqlite.execute("UPDATE hotels SET country_name='Greece' WHERE source='other'")
+        other_country = self.offer(source="other", source_hotel_id="greece-15")
+        self.snapshot(other_country, 100)
+        for query in (self.search, self.grouped):
+            self.assertEqual([row["offer_id"] for row in query(countries="country:TR", limit=2)], waavo_turkey)
+            self.assertEqual({row["offer_id"] for row in query(countries="country:TR")},
+                             {joinup_turkey, *waavo_turkey})
+            self.assertEqual([row["offer_id"] for row in query(countries="c_8")], [joinup_turkey])
+            self.assertEqual({row["offer_id"] for row in query(countries="15")}, {other_country, waavo_turkey[0]})
+            self.assertEqual([row["offer_id"] for row in query(countries="country:GR")], [other_country])
+            self.assertEqual({row["offer_id"] for row in query(countries="country:GR,c_8")},
+                             {other_country, joinup_turkey})
+
+    def test_unknown_raw_country_is_still_filterable_without_name_guessing(self):
+        self.sqlite.execute("UPDATE hotels SET country_id='opaque',country_name='Turkey Bay'")
+        identifier = self.offer()
+        self.snapshot(identifier, 80_000)
+        self.assertEqual([row["offer_id"] for row in self.search(countries="opaque")], [identifier])
+        self.assertEqual(self.search(countries="country:TR"), [])
+
     def test_latest_orders_by_timestamp_then_id_before_price_and_hot_filters(self):
         offer = self.offer(pax_chd=1, children_ages="7")
         self.snapshot(offer, 80_000, hot=1)

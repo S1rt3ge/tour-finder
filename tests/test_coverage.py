@@ -170,7 +170,7 @@ def test_local_search_filters_do_not_create_or_relax_source_coverage(conn):
 
 
 @pytest.mark.parametrize("scope,state", [({"date_from": "2026-11-24", "date_till": "2026-11-25"}, "unsupported"),
-    ({"date_till": "2026-11-24"}, "partial"), ({"origin_id": "VNO"}, "unsupported"),
+    ({"date_till": "2026-11-24"}, "partial"),
     ({"room_count": 2}, "unsupported")])
 def test_unsupported_scope_is_explicit_even_with_active_party_request(conn, scope, state):
     conn.execute("INSERT INTO pax_requests VALUES (?,?)", ("1", NOW.isoformat()))
@@ -250,3 +250,74 @@ def test_actual_sql_failure_propagates_for_caller_rollback(conn):
     conn.execute("DROP TABLE fetch_runs")
     with pytest.raises(sqlite3.OperationalError):
         read(conn)
+
+
+def test_riga_evidence_and_legacy_queue_do_not_cover_all_baltic_origins(conn):
+    add_run(conn)
+    conn.execute("INSERT INTO pax_requests VALUES (?,?)", ("1", NOW.isoformat()))
+    result = read(conn, origins="RIX,VNO,TLL")
+    assert not result["complete"] and result["state"] == "partial"
+    assert not result["queue"]["requested"]
+    assert {item["origin_code"]: item["complete"] for item in result["sources"]} == {"RIX": True, "TLL": False, "VNO": False}
+
+
+@pytest.mark.parametrize("origin,identifier", [("RIX", "3164"), ("VNO", "2151"), ("TLL", "2552")])
+def test_joinup_numeric_origins_match_only_exact_requested_airport(conn, origin, identifier):
+    add_run(conn, "joinup", params={"origin": identifier})
+    assert read(conn, source="joinup", origins=origin)["complete"]
+    others = ",".join(code for code in ("RIX", "VNO", "TLL") if code != origin)
+    assert not read(conn, source="joinup", origins=others)["complete"]
+
+
+def test_all_airports_require_independent_source_evidence(conn):
+    for origin in ("RIX", "VNO", "TLL"):
+        add_run(conn, params={"departureAirport": origin})
+    result = read(conn, origins="TLL,RIX,VNO")
+    assert result["complete"] and len(result["sources"]) == 3
+
+
+def test_unknown_airport_is_not_silently_replaced_with_riga(conn):
+    add_run(conn)
+    result = read(conn, origins="JFK")
+    assert result["state"] == "unsupported" and result["reasons"] == ["origin_unsupported"]
+
+
+def test_personal_false_override_suppresses_foreign_legacy_queue_before_states(conn):
+    conn.execute("INSERT INTO pax_requests VALUES (?,?)", ("1", NOW.isoformat()))
+    statements = []
+    conn.set_trace_callback(statements.append)
+    result = coverage.get_search_coverage(conn, filters(), now=NOW,
+        queue_override={"requested": False, "scope": "exact_search"})
+    assert result["state"] == "uncollected" and not result["complete"]
+    assert not result["queue"]["requested"]
+    assert "active_composition_request" not in result["reasons"]
+    assert all(source["state"] != "queued" for source in result["sources"])
+    assert not any("pax_requests" in statement for statement in statements)
+
+
+@pytest.mark.parametrize("origins", ["RIX", "VNO", "RIX,TLL,VNO"])
+def test_exact_owner_request_sets_all_applicable_states_without_proving_coverage(conn, origins):
+    result = coverage.get_search_coverage(conn, filters(origins=origins), now=NOW,
+        queue_override={"requested": True, "scope": "exact_search", "request_id": 123,
+                        "requested_at": NOW.isoformat(), "owner_id": "private-owner", "filters": "private-content"})
+    assert result["state"] == "queued" and not result["complete"]
+    assert all(source["state"] == "queued" and not source["complete"] for source in result["sources"])
+    assert result["queue"] == {"requested": True, "scope": "exact_search", "request_id": 123,
+                               "requested_at": "2026-10-09T12:00:00Z"}
+    assert "private" not in json.dumps(result)
+
+
+def test_queue_override_does_not_downgrade_fresh_evidence_or_extend_horizon(conn):
+    add_run(conn)
+    override = {"requested": True, "scope": "exact_search"}
+    fresh = coverage.get_search_coverage(conn, filters(), now=NOW, queue_override=override)
+    assert fresh["state"] == "fresh" and fresh["complete"]
+    unsupported = coverage.get_search_coverage(conn,
+        filters(date_from="2026-12-01", date_till="2026-12-10"), now=NOW, queue_override=override)
+    assert unsupported["state"] == "unsupported" and not unsupported["complete"]
+
+
+def test_none_override_preserves_legacy_behavior(conn):
+    conn.execute("INSERT INTO pax_requests VALUES (?,?)", ("1", NOW.isoformat()))
+    result = coverage.get_search_coverage(conn, filters(), now=NOW, queue_override=None)
+    assert result["state"] == "queued" and result["queue"]["requested"]

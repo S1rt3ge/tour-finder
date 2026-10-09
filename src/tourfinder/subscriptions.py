@@ -8,7 +8,7 @@ from .queries import search_offers
 from .telegram_bot import has_access
 
 _ALLOWED = {"date_from", "date_till", "adults", "children_ages", "nights_min",
-            "nights_max", "budget_max", "boards", "board_categories", "countries", "only_hot", "stars_min"}
+            "nights_max", "budget_max", "boards", "board_categories", "countries", "only_hot", "stars_min", "origins"}
 _CURSOR_NAME = "subscription_evaluation_cursor_v1"
 _VERSION_NAME = "subscription_evaluation_version_v1"
 

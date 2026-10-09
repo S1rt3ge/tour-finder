@@ -25,10 +25,10 @@ def conn(tmp_path):
     engine.dispose()
 
 
-def add_run(conn, source="joinup", tier="near", pax="2", *, started=None,
+def add_run(conn, source="joinup", tier="near", pax="2", origin="RIX", *, started=None,
             finished=True, errors=None, owner=None, extra_params=None):
     started = started or NOW - timedelta(minutes=10)
-    params = {"source": source, **(extra_params or {})}
+    params = {"source": source, ("origin" if source == "joinup" else "departureAirport"): origin, **(extra_params or {})}
     if owner is not None:
         params["collector_owner"] = owner
     run_id = conn.execute(
@@ -77,6 +77,118 @@ def test_waavo_run_records_exact_request_bounds_for_coverage(conn):
     assert params["durationFrom"] == kwargs["duration_from"] == 2
     assert params["durationTo"] == kwargs["duration_till"] == 21
     assert params["max_pages"] == kwargs["max_pages"] is None
+
+
+@pytest.mark.parametrize("origin", ["VNO", "TLL"])
+def test_waavo_airport_propagates_to_request_metadata_and_stored_identity(conn, origin):
+    client = WaavoFixture([raw_waavo(1)])  # Missing echo must use requested origin.
+    original = client.search_pages
+    client.search_pages = Mock(side_effect=original)
+    result = fetcher.run_waavo_fetch(conn, client, origin=origin, tier="near", pax_spec="2")
+    assert result["completed"] and client.search_pages.call_args.kwargs["origin"] == origin
+    assert conn.execute("SELECT origin_id FROM offers").scalar() == origin
+    params = json.loads(conn.execute("SELECT params FROM fetch_runs").scalar())
+    assert params["departureAirport"] == origin
+    assert ("waavo", "near", "2", origin) in cli._run_history(conn)
+
+
+def test_same_offer_terms_from_different_airports_never_collapse(conn):
+    for origin in ("RIX", "VNO", "TLL"):
+        result = fetcher.run_waavo_fetch(conn, WaavoFixture([raw_waavo(1)]), origin=origin)
+        assert result["completed"]
+    assert conn.execute("SELECT count(*) FROM offers").scalar() == 3
+    assert conn.execute("SELECT count(*) FROM price_snapshots").scalar() == 3
+
+
+@pytest.mark.parametrize("origin,identifier", [("VNO", "2151"), ("TLL", "2552")])
+def test_joinup_fetch_maps_requests_echoes_and_deeplink_to_same_airport(conn, origin, identifier):
+    class DirectFixture:
+        lang = "lv"
+        requests_made = 0
+
+        def destinations(self, requested):
+            assert requested == identifier
+            return [{"id": "c_9"}]
+
+        def stays(self, requested, destination, dates):
+            assert requested == identifier
+            return [7]
+
+        def search_pages(self, requested, *args, **kwargs):
+            assert requested == identifier
+            if kwargs.get("tour_types"):
+                return
+            yield {"hotel": {"id": "fixture", "name": "Fixture"}, "offers": [{
+                "from": {}, "date_start": "2026-10-20", "stay": {"stay": 7},
+                "board": {"board_type": "AI"}, "price": {"total_price": {"price": 100}}}]}
+    result = fetcher.run_fetch(conn, DirectFixture(), origin=origin, tier="near", pax_spec="2")
+    assert result["completed"]
+    row = conn.execute("SELECT origin_id,link FROM offers").fetchone()
+    assert row["origin_id"] == identifier and f"origin={identifier}" in row["link"]
+    assert ("joinup", "near", "2", origin) in cli._run_history(conn)
+
+
+def test_mismatching_airport_never_writes_the_mislabelled_offer(conn):
+    raw = raw_waavo(1)
+    raw["departureAirport"] = {"code": "RIX"}
+    result = fetcher.run_waavo_fetch(conn, WaavoFixture([raw]), origin="VNO")
+    assert not result["completed"]
+    assert conn.execute("SELECT count(*) FROM offers").scalar() == 0
+
+
+def test_legacy_riga_success_cannot_refresh_vilnius_or_tallinn(conn):
+    run = add_run(conn, "waavo", "near", "2")
+    conn.execute("UPDATE fetch_runs SET params=:params WHERE id=:id",
+                 {"params": json.dumps({"source": "waavo"}), "id": run})
+    conn.commit()
+    scopes = [(origin, "2") for origin in ("RIX", "VNO", "TLL")]
+    due = {task.key for task in cli.plan_collection(conn, scopes, NOW)}
+    assert ("waavo", "near", "2", "RIX") not in due
+    assert ("waavo", "near", "2", "VNO") in due and ("waavo", "near", "2", "TLL") in due
+
+
+def test_duration_estimate_does_not_borrow_another_airports_timing(conn):
+    timed_run(conn, collect_task(origin="RIX"), 200)
+    assert cli._duration_estimate(collect_task(origin="VNO"), cli._run_history(conn), NOW) is None
+
+
+def test_active_airport_party_scopes_preserve_each_users_request_and_subscription(conn, monkeypatch):
+    from tourfinder import collection_requests
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "100")
+    monkeypatch.setattr(collection_requests, "active_scopes", lambda conn, now=None: [
+        {"origins": "VNO", "adults": 1, "date_from": "2026-10-09", "date_till": "2026-10-29"},
+        {"origins": "TLL", "adults": 4, "children_ages": "8,6", "date_from": "2026-10-09", "date_till": "2026-10-29"}])
+    saved_party(conn, "100", 5, changes={"origins": "VNO,TLL"})
+    saved_party(conn, "denied", 6, changes={"origins": "TLL"})
+    request_party(conn, "6")  # Legacy global requests retain Riga semantics.
+    active = set(cli.active_collection_scopes(conn, NOW))
+    assert {("VNO", "1"), ("TLL", "4+2:6,8"), ("VNO", "5"), ("TLL", "5"), ("RIX", "6")} <= active
+    assert not {("TLL", "1"), ("VNO", "4+2:6,8"), ("RIX", "1"), ("RIX", "5"), ("TLL", "6")} & active
+    assert {("RIX", spec) for spec in cli.DEFAULT_PAX} <= active
+
+
+def test_entirely_outside_horizon_subscriptions_do_not_activate_airports(conn, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "100")
+    for origin in ("RIX", "VNO", "TLL"):
+        saved_party(conn, "100", 5, changes={"origins": origin, "date_from": "2026-12-01", "date_till": "2026-12-20"})
+    assert cli.active_collection_scopes(conn, NOW) == [("RIX", spec) for spec in cli.DEFAULT_PAX]
+
+
+def test_real_durable_request_reader_only_activates_approved_nonexpired_exact_pairs(conn, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "100")
+    for owner, origin, adult, expiry in [("100", "VNO", 1, NOW+timedelta(days=1)),
+        ("100", "TLL", 4, NOW+timedelta(days=1)), ("denied", "TLL", 6, NOW+timedelta(days=1)),
+        ("100", "VNO", 5, NOW-timedelta(seconds=1))]:
+        scope = {"origins": origin, "adults": adult, "children_ages": "", "date_from": "2026-10-09", "date_till": "2026-10-20"}
+        conn.execute("""INSERT INTO collection_requests(owner_id,request_key,filters,created_at,updated_at,expires_at)
+            VALUES (:owner,:key,:filters,:now,:now,:expiry)""", {"owner": owner, "key": f"{owner}-{origin}-{adult}",
+            "filters": json.dumps(scope), "now": NOW.strftime("%Y-%m-%dT%H:%M:%SZ"), "expiry": expiry.strftime("%Y-%m-%dT%H:%M:%SZ")})
+    conn.commit()
+    scopes = set(cli.active_collection_scopes(conn, NOW))
+    assert scopes == {("RIX", spec) for spec in cli.DEFAULT_PAX} | {("VNO", "1"), ("TLL", "4")}
+    keys = {task.key for task in cli._collect_tasks(scopes)}
+    assert ("waavo", "near", "1", "VNO") in keys and ("joinup", "far", "4", "TLL") in keys
+    assert ("waavo", "near", "1", "TLL") not in keys and ("joinup", "far", "4", "VNO") not in keys
 
 
 class CollectorDialectProxy:
@@ -187,7 +299,7 @@ def test_pg_second_batch_failure_preserves_first_and_rolls_back_every_current_ta
     assert proxy.rollbacks >= 1 and proxy.commits == 3  # start, first batch, incomplete end
     persisted = conn.execute("SELECT finished_at,errors FROM fetch_runs").fetchone()
     assert persisted["finished_at"] and json.loads(persisted["errors"]) == ["RuntimeError"]
-    assert cli._run_history(conn)[("waavo", "near", "2")]["succeeded"] is None
+    assert cli._run_history(conn)[("waavo", "near", "2", "RIX")]["succeeded"] is None
     metric = next(record for record in caplog.records if "write batches:" in record.msg)
     assert metric.args[:4] == (result["run_id"], 200, 2, 1)
     assert "private diagnostic" not in caplog.text
@@ -252,7 +364,7 @@ def test_source_deadline_aborts_task_and_flushes_acquired_rows(conn, monkeypatch
     assert not result["completed"] and result["offers_seen"] == 1
     assert result["errors"] == ["partial: collection time budget exhausted"]
     assert conn.execute("SELECT count(*) FROM price_snapshots").scalar() == 1
-    assert cli._run_history(conn)[(source, "near", "2")]["succeeded"] is None
+    assert cli._run_history(conn)[(source, "near", "2", "RIX")]["succeeded"] is None
     assert called == (["first"] if source == "joinup" else [])
 
 
@@ -261,12 +373,12 @@ def test_freshness_is_per_source_tier_and_party_and_success_only(conn):
     add_run(conn, "waavo", errors=["HTTP 403"])
     add_run(conn, "waavo", "mid", pax="3")
     due = {task.key for task in cli.plan_collection(conn, ["2"], NOW)}
-    assert ("joinup", "near", "2") not in due
-    assert ("waavo", "near", "2") in due
-    assert ("waavo", "mid", "2") in due
+    assert ("joinup", "near", "2", "RIX") not in due
+    assert ("waavo", "near", "2", "RIX") in due
+    assert ("waavo", "mid", "2", "RIX") in due
     # A later failed task must not erase an earlier still-fresh success.
     add_run(conn, "joinup", started=NOW, errors=["partial: budget"])
-    assert ("joinup", "near", "2") not in {
+    assert ("joinup", "near", "2", "RIX") not in {
         task.key for task in cli.plan_collection(conn, ["2"], NOW)}
 
 
@@ -287,9 +399,9 @@ def test_freshness_uses_completion_and_rejects_capped_or_abandoned_runs(conn):
     add_run(conn, "waavo", extra_params={"max_pages": 1})
     add_run(conn, "joinup", "mid", errors=["abandoned: no completion record"])
     due = {task.key for task in cli.plan_collection(conn, ["2"], NOW)}
-    assert ("joinup", "near", "2") not in due
-    assert ("waavo", "near", "2") in due
-    assert ("joinup", "mid", "2") in due
+    assert ("joinup", "near", "2", "RIX") not in due
+    assert ("waavo", "near", "2", "RIX") in due
+    assert ("joinup", "mid", "2", "RIX") in due
 
 
 def test_unfinished_lease_does_not_return_false_success(conn):
@@ -309,7 +421,7 @@ def test_previous_github_job_is_recovered_even_when_recent(conn, monkeypatch):
                        {"i": run_id}).fetchone()
     assert row["finished_at"]
     assert "abandoned" in row["errors"]
-    assert ("joinup", "near", "2") in {
+    assert ("joinup", "near", "2", "RIX") in {
         task.key for task in cli.plan_collection(conn, ["2"], NOW)}
 
 
@@ -466,7 +578,7 @@ def test_watchdog_checks_every_source_not_just_latest_snapshot(conn, monkeypatch
     current = datetime.now(timezone.utc) - timedelta(minutes=1)
     for task in cli._collect_tasks(["2"]):
         add_run(conn, *task.key, started=current,
-                errors=["upstream error"] if task.key == ("waavo", "far", "2") else None)
+                errors=["upstream error"] if task.key == ("waavo", "far", "2", "RIX") else None)
     monkeypatch.setattr(db, "connect", lambda path: conn)
     monkeypatch.setattr(conn, "close", Mock())
     with pytest.raises(RuntimeError, match="waavo/far/2"):
@@ -560,8 +672,8 @@ def test_many_requested_parties_rotate_through_all_tasks_despite_failures(conn, 
 def test_freshness_recognizes_canonical_legacy_child_order(conn):
     add_run(conn, pax="2+2:8,6")
     due = {task.key for task in cli.plan_collection(conn, ["2+2:6,8"], NOW)}
-    assert ("joinup", "near", "2+2:6,8") not in due
-    assert ("waavo", "near", "2+2:6,8") in due
+    assert ("joinup", "near", "2+2:6,8", "RIX") not in due
+    assert ("waavo", "near", "2+2:6,8", "RIX") in due
 
 
 def test_many_parties_still_obey_invocation_time_budget(conn, monkeypatch):
@@ -630,9 +742,9 @@ def timed_run(conn, task, seconds, *, started=NOW - timedelta(days=2), **kwargs)
     return run_id
 
 
-def collect_task(source="joinup", tier="far", pax="2"):
+def collect_task(source="joinup", tier="far", pax="2", origin="RIX"):
     _, first, last, hours = next(item for item in cli.TIERS if item[0] == tier)
-    return cli.CollectTask(source, tier, pax, first, last, hours)
+    return cli.CollectTask(source, tier, pax, first, last, hours, origin)
 
 
 def fake_timed_collector(conn, monkeypatch, tasks, durations, *, failures=(), evaluation_seconds=0):
@@ -651,7 +763,7 @@ def fake_timed_collector(conn, monkeypatch, tasks, durations, *, failures=(), ev
     monkeypatch.setattr(conn, "close", Mock())
 
     def fetch(source, connection, client, **kwargs):
-        task = next(task for task in tasks if task.key == (source, kwargs["tier"], kwargs["pax_spec"]))
+        task = next(task for task in tasks if task.key == (source, kwargs["tier"], kwargs["pax_spec"], kwargs["origin"]))
         attempts.append(task.key)
         started = NOW + timedelta(seconds=clock[0])
         elapsed = durations[task.key]

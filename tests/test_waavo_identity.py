@@ -81,7 +81,8 @@ def test_real_shape_double_and_triple_room_do_not_collapse(raw_offer):
 def test_changed_terms_split_even_if_provider_key_is_reused(raw_offer, path, value):
     altered = deepcopy(raw_offer)
     replace_path(altered, path, value)
-    assert row(raw_offer)["room_code"] != row(altered)["room_code"]
+    requested = value if path == ("departureAirport", "code") else "RIX"
+    assert row(raw_offer)["room_code"] != waavo.normalize(altered, 2, origin=requested)[1]["room_code"]
 
 
 def test_prices_links_age_reviews_and_dict_order_do_not_change_identity(raw_offer):

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#f5f6f8">
-  <meta name="description" content="Туры из Риги: поиск без обязательного направления, история цены и личные уведомления в Telegram.">
+  <meta name="description" content="Туры из Риги, Вильнюса и Таллина: поиск, история цены и личные уведомления в Telegram.">
   <title>Tour Finder · Ваш следующий отпуск</title>
   <link rel="stylesheet" href="/static/miniapp.css">
   <script src="https://telegram.org/js/telegram-web-app.js" defer></script>
@@ -46,7 +46,7 @@
     <main id="main-content" hidden>
       <section id="view-search" class="view" aria-labelledby="search-title">
         <div class="hero">
-          <div class="eyebrow"><span class="live-dot"></span> ВЫЛЕТ ИЗ РИГИ</div>
+          <div class="eyebrow"><span class="live-dot"></span> РИГА · ВИЛЬНЮС · ТАЛЛИН</div>
           <h1 id="search-title">Отпуск ближе,<br><span>чем кажется.</span></h1>
           <p>Страну можно выбрать потом.<br class="mobile-break"> Начните с дат и хорошей цены.</p>
           <div class="hero-orbit" aria-hidden="true"><svg class="icon"><use href="#i-sun"/></svg></div>
@@ -56,9 +56,14 @@
         <div id="owner-note" class="connection-note owner-note" hidden></div>
 
         <form id="search-form" class="search-panel">
-          <div class="panel-heading"><div><div class="eyebrow muted">ВАШ МАРШРУТ</div><h2>Рига <span class="route-arrow">→</span> куда угодно</h2></div><button id="filters-toggle" class="icon-button" type="button" aria-expanded="true" aria-controls="filter-fields" aria-label="Свернуть параметры поиска"><svg class="icon"><use href="#i-tune"/></svg></button></div>
+          <div class="panel-heading"><div><div class="eyebrow muted">ВАШ МАРШРУТ</div><h2><span id="route-origin">Три аэропорта</span> <span class="route-arrow">→</span> отпуск</h2></div><button id="filters-toggle" class="icon-button" type="button" aria-expanded="true" aria-controls="filter-fields" aria-label="Свернуть параметры поиска"><svg class="icon"><use href="#i-tune"/></svg></button></div>
           <p id="filter-summary" class="filter-summary" hidden></p>
           <div id="filter-fields">
+            <fieldset class="chip-field airport-field"><legend>Откуда летим <span>выберите один или несколько</span></legend>
+              <div class="meal-presets"><button id="origins-any" type="button" class="text-button" aria-pressed="true">Любой из трёх</button></div>
+              <div id="origin-options" class="filter-chips airport-chips">{% for code, label in [('RIX', 'Рига'), ('VNO', 'Вильнюс'), ('TLL', 'Таллин')] %}<label class="filter-chip"><input type="checkbox" name="origin" value="{{ code }}" checked><span>{{ label }} <small>{{ code }}</small></span></label>{% endfor %}</div>
+              <p class="field-hint">Рига, Вильнюс и Таллин. Наличие собранных предложений зависит от аэропорта и дат.</p>
+            </fieldset>
             <div class="field-grid">
               <label class="field">Вылет с<input name="date_from" type="date" required></label>
               <label class="field">Вылет до<input name="date_till" type="date" required></label>
@@ -97,7 +102,7 @@
 
       <section id="view-deals" class="view" aria-labelledby="deals-title" hidden>
         <div class="page-heading"><div class="eyebrow">ПО НАШИМ НАБЛЮДЕНИЯМ</div><h1 id="deals-title">Цена пошла<br><span>вниз.</span></h1><p>Цена снизилась относительно предыдущего уровня в нашей истории. Без сравнения с рекламной «старой ценой».</p></div>
-        <div class="context-panel"><div><strong id="deals-party">2 взрослых</strong><p>Здесь учитывается только состав туристов. Даты, бюджет и другие фильтры поиска не применяются.</p></div><button id="change-party" class="text-button" type="button">Изменить</button></div>
+        <div class="context-panel"><div><strong id="deals-party">2 взрослых · три аэропорта</strong><p>Здесь учитываются состав туристов и аэропорты вылета. Даты, бюджет и другие фильтры поиска не применяются.</p></div><button id="change-party" class="text-button" type="button">Изменить</button></div>
         <div class="results-heading"><div><h2>Наблюдения за 72 часа</h2><p id="deals-caption" class="muted">Сравниваем с предыдущим уровнем цены</p></div><button id="refresh-deals" class="icon-button" type="button" aria-label="Обновить падения цен"><svg class="icon"><use href="#i-search"/></svg></button></div>
         <div id="deals-results" class="results-grid" aria-live="polite"></div>
       </section>
@@ -108,7 +113,7 @@
         <div id="watchlist-content" hidden><div class="results-heading"><div><h2>Мои поиски</h2><p id="saved-caption" class="muted"></p></div><button id="new-watchlist" class="button button-small" type="button">+ Сохранить поиск</button></div><div id="subscriptions-list" class="saved-list" aria-live="polite"></div><div class="results-heading"><div><h2>Новые совпадения</h2><p class="muted">Непрочитанные сигналы</p></div><button id="refresh-saved" class="text-button" type="button">Обновить</button></div><div id="alerts-list" class="saved-list" aria-live="polite"></div></div>
       </section>
     </main>
-    <footer id="app-footer" class="app-footer" hidden>Рига — только отправная точка.<span>Наличие и итоговую стоимость подтвердит продавец.</span></footer>
+    <footer id="app-footer" class="app-footer" hidden>Отпуск начинается с удобного вылета.<span>Наличие и итоговую стоимость подтвердит продавец.</span></footer>
   </div>
 
   <nav id="app-nav" class="bottom-nav" aria-label="Основная навигация" hidden><div class="nav-inner"><button class="nav-button active" type="button" data-view="search" aria-current="page"><svg class="icon"><use href="#i-search"/></svg><span>Поиск</span></button><button class="nav-button" type="button" data-view="deals"><svg class="icon"><use href="#i-trend"/></svg><span>Падения</span></button><button class="nav-button" type="button" data-view="saved"><svg class="icon"><use href="#i-bookmark"/></svg><span>Мои поиски</span><span id="saved-nav-count" class="nav-count" hidden></span></button></div></nav>

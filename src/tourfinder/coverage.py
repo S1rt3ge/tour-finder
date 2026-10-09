@@ -18,6 +18,8 @@ from datetime import date, datetime, timedelta, timezone
 import json
 import re
 
+from .origins import normalize_origins, normalize_source_origin
+
 SOURCES = ("joinup", "waavo")
 # Current collector policy; kept local to avoid importing the CLI into web reads.
 TIERS = (("near", 1, 7, 4), ("mid", 8, 14, 12), ("far", 15, 45, 24))
@@ -85,10 +87,6 @@ def _object(value):
     return result
 
 
-def _origin(value):
-    return "RIX" if str(value).upper() in {"RIX", "3164"} else None
-
-
 def _intervals(days):
     result = []
     for day in sorted(set(days)):
@@ -127,13 +125,17 @@ def _run_nights(params, source):
     return {_number(value, 1, 30) for value in stays}
 
 
-def get_search_coverage(conn, filters, now=None):
+def get_search_coverage(conn, filters, now=None, queue_override=None):
     """Return additive JSON collection evidence; execute SELECTs only.
 
     Read at most 2001 run records. A truncated history cannot create coverage;
     sufficiently recent positive evidence can still prove the requested scope.
     SQL failures deliberately propagate so the caller can roll back its read
     connection and return coverage unavailable without hiding search results.
+    queue_override is already owner-authorized exact-search evidence supplied
+    by the caller. None retains legacy Riga composition requests; an explicit
+    false override suppresses them. Only the four public request-reference
+    fields are retained, never owner IDs or unrelated private row contents.
     """
     now = now or datetime.now(timezone.utc)
     if now.utcoffset() is None:
@@ -145,6 +147,18 @@ def get_search_coverage(conn, filters, now=None):
     result = {"state": "uncollected", "complete": False, "last_complete_at": None,
               "horizon": {"date_from": horizon_first.isoformat(), "date_till": horizon_last.isoformat()},
               "queue": {"requested": False, "requested_at": None}, "sources": [], "reasons": []}
+    if queue_override is not None:
+        if not isinstance(queue_override, dict) or type(queue_override.get("requested")) is not bool:
+            raise ValueError("invalid queue override")
+        result["queue"]["requested"] = queue_override["requested"]
+        if queue_override.get("scope") == "exact_search":
+            result["queue"]["scope"] = "exact_search"
+        if queue_override["requested"]:
+            if queue_override.get("requested_at") is not None:
+                result["queue"]["requested_at"] = _iso(_time(queue_override["requested_at"]))
+            request_id = queue_override.get("request_id")
+            if type(request_id) is int and request_id > 0:
+                result["queue"]["request_id"] = request_id
     try:
         first, last = _day(filters["date_from"]), _day(filters["date_till"])
         if first > last or (last - first).days > 90:
@@ -161,21 +175,33 @@ def get_search_coverage(conn, filters, now=None):
         result.update(state="unsupported", reasons=["invalid_search_scope"])
         return result
     selected_sources = [source_filter] if source_filter else list(SOURCES)
+    try:
+        origin_filter = filters.get("origins")
+        if origin_filter is None and ("origin_id" in filters or "origin" in filters):
+            origin_filter = normalize_source_origin("joinup", filters.get("origin_id", filters.get("origin")))
+            if origin_filter is None:
+                raise ValueError("origin")
+        selected_origins = normalize_origins(origin_filter).split(",")
+    except (ValueError, TypeError):
+        result.update(state="unsupported", reasons=["origin_unsupported"])
+        return result
     days = {first + timedelta(days=offset) for offset in range((last - first).days + 1)}
     supported_days = {day for day in days if horizon_first <= day <= horizon_last}
     nights = set(range(night_first, night_last + 1))
     global_reasons = []
     if supported_days != days:
         global_reasons.append("dates_outside_horizon")
-    if _origin(filters.get("origin_id", filters.get("origin", "RIX"))) is None:
-        global_reasons.append("origin_unsupported")
     if (filters.get("room_count", 1) != 1 or filters.get("rooms")
             or filters.get("room_placement") or filters.get("room_code")):
         global_reasons.append("rooms_unsupported")
 
     # Queue writes canonicalize ages; use the unique composition key, not an
     # inventory-wide scan. A malformed legacy alias cannot establish a request.
-    for row in conn.execute("SELECT spec,created_at FROM pax_requests WHERE spec=:spec", {"spec": party}).fetchall():
+    # Legacy anonymous composition requests scheduled Riga only. The authenticated
+    # caller can instead supply owner-scoped evidence before states are computed.
+    queue_rows = (conn.execute("SELECT spec,created_at FROM pax_requests WHERE spec=:spec", {"spec": party}).fetchall()
+                  if queue_override is None and selected_origins == ["RIX"] else [])
+    for row in queue_rows:
         try:
             requested = _time(row["created_at"])
             if _spec(row["spec"]) == party and timedelta(0) <= now - requested <= REQUEST_MAX_AGE:
@@ -203,7 +229,7 @@ def get_search_coverage(conn, filters, now=None):
         except (ValueError, TypeError, KeyError, AttributeError):
             continue
 
-    for source in selected_sources:
+    for source, origin_code in ((source, origin) for source in selected_sources for origin in selected_origins):
         reasons = list(global_reasons)
         allowed_nights = set(range(2, 22)) if source == "waavo" else set(range(1, 31))
         if not nights <= allowed_nights:
@@ -221,7 +247,7 @@ def get_search_coverage(conn, filters, now=None):
                 if origin is None:
                     reasons.append("missing_run_metadata")
                     continue
-                if _origin(origin) != "RIX":
+                if normalize_source_origin(source, origin) != origin_code:
                     continue
                 if source == "joinup":
                     bounds = params["dates"].split(":")
@@ -306,7 +332,7 @@ def get_search_coverage(conn, filters, now=None):
                 reasons.append("run_history_limit")
         else:
             reasons = []  # Older failures do not invalidate later complete evidence.
-        result["sources"].append({"source": source, "state": state, "complete": complete,
+        result["sources"].append({"source": source, "origin_code": origin_code, "state": state, "complete": complete,
             "last_complete_at": _iso(completed_at), "covered_intervals": _intervals(covered_days),
             "missing_intervals": _intervals(days - covered_days),
             "supported_nights": {"min": 2, "max": 21} if source == "waavo" else None,

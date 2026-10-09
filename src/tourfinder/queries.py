@@ -5,7 +5,7 @@ PostgreSQL 12+ or SQLite 3.35+, supported by the application's runtimes.
 """
 from datetime import datetime, timedelta, timezone
 
-from . import meals
+from . import countries as country_catalog, meals, origins as origin_catalog
 
 
 FRESH_HOURS = 48
@@ -49,6 +49,7 @@ def _build_filters(*, date_from: str, date_till: str, adults: int,
                    board_categories: str | None = None,
                    hotel_id: str | None = None,
                    source: str | None = None,
+                   origins: str | None = None,
                    limit: int = 100) -> tuple[list[str], list[str], dict]:
     """Separate offer/hotel filters from filters on the latest snapshot.
 
@@ -68,6 +69,7 @@ def _build_filters(*, date_from: str, date_till: str, adults: int,
               "nights_min": nights_min, "nights_max": nights_max,
               "adults": adults, "ages": _norm_ages(children_ages),
               "limit": max(0, min(limit, 500)), "fresh_cutoff": _fresh_cutoff()}
+    where.append(origin_catalog.filter_sql(origins, params))
     if budget_max:
         snapshot_where.append("l.price_cents <= :budget_cents")
         params["budget_cents"] = budget_max * 100
@@ -83,12 +85,9 @@ def _build_filters(*, date_from: str, date_till: str, adults: int,
         marks = ",".join(f":meal{i}" for i in range(len(codes)))
         params.update({f"meal{i}": value for i, value in enumerate(codes)})
         where.append(f"({meals.category_sql()}) IN ({marks})")
-    if countries:
-        ids = [c.strip() for c in countries.split(",") if c.strip()]
-        if ids:
-            marks = ",".join(f":c{i}" for i in range(len(ids)))
-            params.update({f"c{i}": c for i, c in enumerate(ids)})
-            where.append(f"h.country_id IN ({marks})")
+    country_filter = country_catalog.filter_sql(countries, params)
+    if country_filter:
+        where.append(country_filter)
     if only_hot:
         snapshot_where.append("l.is_hot = 1")
     if stars_min:
@@ -123,7 +122,8 @@ def _matched_sql(snapshot_where: list[str], sort_expr: str) -> str:
         SELECT o.id AS offer_id, o.source, o.source_hotel_id, o.date_start,
                o.date_end, o.nights, o.board_code, o.board_name, o.board_category,
                o.room_code, o.room_name, o.room_placement, o.last_seen_at,
-               o.link, o.origin_name, o.pax_adl, o.pax_chd, o.children_ages,
+               o.link, o.origin_id, o.origin_name, {origin_catalog.origin_code_sql()} AS origin_code,
+               o.pax_adl, o.pax_chd, o.children_ages,
                o.operator, o.hotel_name, o.category, o.country_name,
                o.city_name, o.photo_url,
                l.price_cents, l.currency, l.is_hot, l.fetched_at,
@@ -163,6 +163,7 @@ def search_offers(conn, *, date_from: str, date_till: str,
                   countries: str | None = None, only_hot: bool = False,
                   stars_min: int | None = None, hotel_id: str | None = None,
                   source: str | None = None,
+                  origins: str | None = None,
                   sort: str = "price", limit: int = 100,
                   offset: int = 0) -> list[dict]:
     """Offers whose latest snapshot matches every filter, cheapest first.
@@ -175,7 +176,7 @@ def search_offers(conn, *, date_from: str, date_till: str,
         children_ages=children_ages, nights_min=nights_min,
         nights_max=nights_max, budget_max=budget_max, boards=boards, board_categories=board_categories,
         countries=countries, only_hot=only_hot, stars_min=stars_min,
-        hotel_id=hotel_id, source=source, limit=limit)
+        hotel_id=hotel_id, source=source, origins=origins, limit=limit)
     sort_expr = SORTS.get(sort, SORTS["price"])
     params["offset"] = max(0, offset)
     query = f"""
@@ -262,6 +263,7 @@ def offer_detail(conn, offer_id: int) -> dict | None:
 def price_drops(conn, *, adults: int = 2, children_ages: str | None = None,
                 since: str | None = None, today: str | None = None,
                 source: str | None = None,
+                origins: str | None = None,
                 limit: int = 100) -> list[dict]:
     """Latest downward change of the same offer, despite repeated equal polls.
 
@@ -273,6 +275,7 @@ def price_drops(conn, *, adults: int = 2, children_ages: str | None = None,
               "limit": max(0, min(limit, 300)), "fresh_cutoff": _fresh_cutoff()}
     where = ["o.pax_adl = :adults", "o.children_ages = :ages",
              "o.last_seen_at >= :fresh_cutoff"]
+    where.append(origin_catalog.filter_sql(origins, params))
     recent = []
     observed = []
     if since:
@@ -299,6 +302,7 @@ def price_drops(conn, *, adults: int = 2, children_ages: str | None = None,
         ),
         selected AS MATERIALIZED (
             SELECT o.id AS offer_id, o.source, o.source_hotel_id,
+                   o.origin_id, o.origin_name, {origin_catalog.origin_code_sql()} AS origin_code,
                    o.date_start, o.date_end, o.nights, o.board_code,
                    o.board_name, o.board_category, o.room_name, o.link, o.pax_adl, o.pax_chd,
                    o.children_ages, o.hotel_name, o.category, o.country_name,

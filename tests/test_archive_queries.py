@@ -389,7 +389,7 @@ def test_options_reads_all_configured_stores_even_when_live_is_nonempty(stores):
     live, cold, archive, service, _trace = stores
     add(cold, offer())
     result = service.options()
-    assert result["countries"] == [{"country_id": "TR", "country_name": "Turkey"}]
+    assert result["countries"] == [{"country_id": "country:TR", "country_name": "Турция"}]
     assert result["boards"] == [{"board_code": "AI", "board_name": "All inclusive"}]
     assert result["storage"]["mode"] == "archive"
     archive.calls.clear()
@@ -405,9 +405,10 @@ def test_options_exposes_archive_only_filters_and_live_labels_win(stores):
     cold.execute("UPDATE hotels SET country_id='EG',country_name='Egypt'")
     cold.commit()
     result = service.options()
-    assert {r["country_id"] for r in result["countries"]} == {"TR", "EG"}
+    assert {r["country_id"] for r in result["countries"]} == {"country:TR", "country:EG"}
     assert {r["board_code"] for r in result["boards"]} == {"AI", "BB"}
     assert service.search(**FILTERS, countries="EG", boards="BB")["count"] == 1
+    assert service.search(**FILTERS, countries="country:EG", boards="BB")["count"] == 1
 
 
 def test_broken_archive_dictionary_keeps_live_choices_with_partial_status(stores):
@@ -415,7 +416,7 @@ def test_broken_archive_dictionary_keeps_live_choices_with_partial_status(stores
     add(live, offer())
     archive.broken = True
     result = service.options()
-    assert result["countries"] == [{"country_id": "TR", "country_name": "Turkey"}]
+    assert result["countries"] == [{"country_id": "country:TR", "country_name": "Турция"}]
     assert result["boards"][0]["board_code"] == "AI"
     assert result["storage"]["archive"] == "unavailable"
     assert result["storage"]["partial"]

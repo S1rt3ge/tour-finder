@@ -62,7 +62,7 @@ def _load_candidate(conn, alert_id):
                u.chat_id, u.can_notify,
                o.source, o.source_hotel_id, o.date_start, o.nights,
                o.board_name, o.board_code, o.pax_adl, o.pax_chd, o.children_ages,
-               o.link, o.last_seen_at,
+               o.link, o.last_seen_at, o.origin_id, o.origin_name,
                h.name AS hotel_name, h.country_name, h.city_name
         FROM telegram_deliveries d
         JOIN alerts a ON a.id=d.alert_id
@@ -231,6 +231,7 @@ def _plain(value, limit=160):
 
 
 def _message(row, app_url):
+    from .origins import normalize_source_origin
     evidence = row["parsed_evidence"]
     price = row["alert_price_cents"] / 100
     title = "Тур подешевел" if evidence["kind"] == "deal" else "Тур подходит по бюджету"
@@ -238,9 +239,12 @@ def _message(row, app_url):
     party = f"{row['pax_adl']} взр."
     if row["pax_chd"]:
         party += f" + {row['pax_chd']} реб. ({_plain(row['children_ages'], 40)} лет)"
+    origin = normalize_source_origin(row.get("source"), row.get("origin_id"))
+    departure = {"RIX": "из Риги (RIX)", "VNO": "из Вильнюса (VNO)", "TLL": "из Таллина (TLL)"}.get(
+        origin, "из " + _plain(row.get("origin_name") or row.get("origin_id") or "указанного аэропорта", 80))
     lines = [title, _plain(row["hotel_name"]), place,
              f"{price:,.2f} € за весь состав · {row['nights']} ночей",
-             f"Вылет {row['date_start']} из Риги · {party}",
+             f"Вылет {row['date_start']} {departure} · {party}",
              _plain(row["board_name"] or row["board_code"], 100)]
     if evidence["kind"] == "deal":
         lines.append(f"Ранее наблюдалось {evidence['baseline_cents'] / 100:,.2f} €; "
