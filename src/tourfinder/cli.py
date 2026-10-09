@@ -174,6 +174,8 @@ class CollectTask:
 
 def _run_history(conn):
     """Read the small run log once; legacy Join Up params lack source."""
+    from .coverage import WAAVO_INVENTORY_CONTRACT, WAAVO_SCOPE_VALIDATION
+
     history = {}
     for row in conn.execute(
             "SELECT id, tier, pax_spec, started_at, finished_at, errors, params "
@@ -197,6 +199,12 @@ def _run_history(conn):
         item = history.setdefault(key, {"attempted": None, "succeeded": None, "durations": []})
         if item["attempted"] is None or started > item["attempted"]:
             item["attempted"] = started
+        # Older Waavo runs could repeat an unfiltered catalogue while recording
+        # requested dates. Keep their fair-rotation attempt, but neither their
+        # success nor duration is evidence about the corrected bounded request.
+        if source == "waavo" and (params.get("scope_validation") != WAAVO_SCOPE_VALIDATION
+                                   or params.get("inventory_contract") != WAAVO_INVENTORY_CONTRACT):
+            continue
         if row["finished_at"] and errors == [] and not params.get("max_pages"):
             try:
                 finished = datetime.fromisoformat(row["finished_at"].replace("Z", "+00:00"))
@@ -364,8 +372,12 @@ def cmd_collect(args):
                 failures += 1
             else:
                 completed += 1
-                history.setdefault(task.key, {"durations": []})["durations"].append(
-                    (datetime.now(timezone.utc), elapsed))
+                # The current Waavo GET is a catalogue response, not a
+                # verified bounded-inventory contract. A successful transport
+                # alone must not teach the planner a full-crawl duration.
+                if task.source != "waavo" or result.get("inventory_verified") is True:
+                    history.setdefault(task.key, {"durations": []})["durations"].append(
+                        (datetime.now(timezone.utc), elapsed))
             log.info("%s/%s/%s/%s run #%s: %s offers, %s requests, completed=%s",
                      *task.key, result["run_id"], result["offers_seen"],
                      result["requests_made"], not result["errors"])

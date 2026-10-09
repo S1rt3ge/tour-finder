@@ -33,7 +33,8 @@ def add_run(conn, source="waavo", *, params=None, remove=(), start=None, finish=
     metadata = {"source": source, "adults": 1, "children_ages": [], "max_pages": None}
     if source == "waavo":
         metadata.update(departureAirport="RIX", dateFrom="2026-10-10", dateTo="2026-10-12",
-                        durationFrom=2, durationTo=21)
+                        durationFrom=2, durationTo=21, scope_validation="response_date_nights_v1",
+                        inventory_contract="bounded_inventory_v1")
     else:
         metadata.update(origin="3164", dates="2026-10-10:2026-10-12", stays=[7], destinations=None)
     metadata.update(params or {})
@@ -76,6 +77,114 @@ def test_both_sources_need_independent_complete_evidence(conn):
     add_run(conn, "joinup")
     result = read(conn, source=None)
     assert result["state"] == "fresh" and result["complete"]
+
+
+@pytest.mark.parametrize("marker", [None, "", "response_date_nights_v0", "response_date_nights_v2",
+                                    "RESPONSE_DATE_NIGHTS_V1", "response_date_nights_v1 ", True, 1,
+                                    ["response_date_nights_v1"], {"version": "response_date_nights_v1"}])
+def test_waavo_success_without_exact_response_validation_version_cannot_prove_coverage(conn, marker):
+    add_run(conn, params={"scope_validation": marker})
+    result = read(conn)
+    assert result["state"] == "partial" and not result["complete"]
+    assert "response_scope_unverified" in result["reasons"]
+    assert result["last_complete_at"] is None
+    assert result["sources"][0]["covered_intervals"] == []
+    assert result["sources"][0]["missing_intervals"] == [{"date_from": "2026-10-10", "date_till": "2026-10-12"}]
+
+
+def test_legacy_waavo_success_cannot_complete_otherwise_fresh_multi_source_search(conn):
+    add_run(conn, remove=("scope_validation",))
+    add_run(conn, "joinup")
+    result = read(conn, source=None)
+    assert result["state"] == "partial" and not result["complete"]
+    sources = {item["source"]: item for item in result["sources"]}
+    assert sources["joinup"]["complete"]
+    assert not sources["waavo"]["complete"] and sources["waavo"]["last_complete_at"] is None
+    assert "response_scope_unverified" in sources["waavo"]["reasons"]
+
+
+def test_unverified_waavo_run_cannot_fill_gap_in_validated_coverage(conn):
+    add_run(conn, remove=("scope_validation",))
+    add_run(conn, params={"dateTo": "2026-10-10"})
+    result = read(conn)
+    assert not result["complete"]
+    assert result["sources"][0]["covered_intervals"] == [{"date_from": "2026-10-10", "date_till": "2026-10-10"}]
+    assert result["sources"][0]["missing_intervals"] == [{"date_from": "2026-10-11", "date_till": "2026-10-12"}]
+    assert "response_scope_unverified" in result["reasons"]
+    add_run(conn)
+    fresh = read(conn)
+    assert fresh["complete"] and fresh["state"] == "fresh" and fresh["reasons"] == []
+
+
+def test_unverified_waavo_history_is_not_even_stale_complete_evidence(conn):
+    add_run(conn, remove=("scope_validation",), start=NOW-timedelta(hours=6), finish=NOW-timedelta(hours=5))
+    result = read(conn)
+    assert result["state"] == "partial" and not result["complete"]
+    assert result["last_complete_at"] is None and "expired_run" not in result["reasons"]
+    assert "response_scope_unverified" in result["reasons"]
+
+
+@pytest.mark.parametrize("contract", [None, "", "unverified_legacy_catalog", "bounded_inventory_v0",
+                                      "bounded_inventory_v2", "BOUNDED_INVENTORY_V1", "bounded_inventory_v1 ",
+                                      True, 1, ["bounded_inventory_v1"], {"version": "bounded_inventory_v1"}])
+def test_response_validation_without_exact_inventory_contract_never_proves_coverage(conn, contract):
+    add_run(conn, params={"inventory_contract": contract})
+    result = read(conn)
+    assert result["state"] == "partial" and not result["complete"]
+    assert result["last_complete_at"] is None
+    assert result["sources"][0]["covered_intervals"] == []
+    assert "inventory_contract_unverified" in result["reasons"]
+
+
+def test_uncontracted_catalogue_cannot_fill_a_verified_inventory_gap(conn):
+    add_run(conn, remove=("inventory_contract",))
+    add_run(conn, params={"dateTo": "2026-10-10"})
+    partial = read(conn)
+    assert not partial["complete"] and "inventory_contract_unverified" in partial["reasons"]
+    assert partial["sources"][0]["missing_intervals"] == [{"date_from": "2026-10-11", "date_till": "2026-10-12"}]
+    add_run(conn)
+    result = read(conn)
+    assert result["complete"] and result["state"] == "fresh" and result["reasons"] == []
+
+
+def test_actual_current_waavo_fetcher_empty_success_cannot_prove_inventory_coverage(tmp_path, monkeypatch):
+    from sqlalchemy import create_engine
+    from tourfinder import db, fetcher
+    from tourfinder.sources.waavo import WaavoClient
+
+    class FixedDate(coverage.date):
+        @classmethod
+        def today(cls):
+            return NOW.date()
+
+    monkeypatch.setattr(fetcher, "date", FixedDate)
+    monkeypatch.setattr(fetcher, "utcnow", lambda: "2026-10-09T11:50:00Z")
+    monkeypatch.setattr(fetcher, "collector_owner", lambda: {})
+    engine = create_engine(f"sqlite:///{(tmp_path / 'empty-catalogue.sqlite').as_posix()}")
+    db.metadata.create_all(engine)
+    connection = db.DB(engine)
+    client = WaavoClient(delay=0)
+
+    def empty_catalogue(**_params):
+        client.requests_made += 1
+        return {"data": {"offers": []}}
+
+    monkeypatch.setattr(client, "_get", empty_catalogue)
+    try:
+        fetched = fetcher.run_waavo_fetch(connection, client, days_from=1, days_till=3,
+                                         adults=1, tier="near", pax_spec="1")
+        assert fetched["completed"] and fetched["errors"] == [] and fetched["offers_seen"] == 0
+        metadata = json.loads(connection.execute("SELECT params FROM fetch_runs").scalar())
+        assert metadata["scope_validation"] == "response_date_nights_v1"
+        assert "inventory_contract" not in metadata
+        result = coverage.get_search_coverage(connection, filters(), now=NOW)
+        assert not result["complete"] and result["state"] == "partial"
+        assert result["last_complete_at"] is None
+        assert result["sources"][0]["covered_intervals"] == []
+        assert "inventory_contract_unverified" in result["reasons"]
+    finally:
+        connection.close()
+        engine.dispose()
 
 
 def test_joinup_legacy_unknown_stays_cannot_prove_empty_search(conn):

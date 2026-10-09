@@ -28,7 +28,10 @@ def conn(tmp_path):
 def add_run(conn, source="joinup", tier="near", pax="2", origin="RIX", *, started=None,
             finished=True, errors=None, owner=None, extra_params=None):
     started = started or NOW - timedelta(minutes=10)
-    params = {"source": source, ("origin" if source == "joinup" else "departureAirport"): origin, **(extra_params or {})}
+    validation = {"scope_validation": "response_date_nights_v1",
+                  "inventory_contract": "bounded_inventory_v1"} if source == "waavo" else {}
+    params = {"source": source, ("origin" if source == "joinup" else "departureAirport"): origin,
+              **validation, **(extra_params or {})}
     if owner is not None:
         params["collector_owner"] = owner
     run_id = conn.execute(
@@ -143,8 +146,42 @@ def test_legacy_riga_success_cannot_refresh_vilnius_or_tallinn(conn):
     conn.commit()
     scopes = [(origin, "2") for origin in ("RIX", "VNO", "TLL")]
     due = {task.key for task in cli.plan_collection(conn, scopes, NOW)}
-    assert ("waavo", "near", "2", "RIX") not in due
+    assert ("waavo", "near", "2", "RIX") in due
     assert ("waavo", "near", "2", "VNO") in due and ("waavo", "near", "2", "TLL") in due
+
+
+@pytest.mark.parametrize("marker", [None, True, {}, "response_date_nights_v0"])
+def test_unverified_waavo_success_cannot_delay_corrected_collection(conn, marker):
+    run = add_run(conn, "waavo", started=NOW - timedelta(minutes=20),
+                  extra_params={"scope_validation": marker})
+    conn.execute("UPDATE fetch_runs SET finished_at=:finish WHERE id=:id",
+                 {"finish": NOW.isoformat(), "id": run})
+    conn.commit()
+    key = ("waavo", "near", "2", "RIX")
+    history = cli._run_history(conn)
+    assert history[key]["attempted"] == NOW - timedelta(minutes=20)
+    assert history[key]["succeeded"] is None
+    assert history[key]["durations"] == []
+    assert key in {task.key for task in cli.plan_collection(conn, ["2"], NOW)}
+    assert cli._duration_estimate(collect_task(source="waavo", tier="near"), history, NOW) is None
+
+
+def test_verified_waavo_success_refreshes_after_legacy_attempt(conn):
+    add_run(conn, "waavo", extra_params={"scope_validation": None})
+    add_run(conn, "waavo", started=NOW - timedelta(minutes=5))
+    key = ("waavo", "near", "2", "RIX")
+    assert cli._run_history(conn)[key]["succeeded"] == NOW - timedelta(minutes=5)
+    assert key not in {task.key for task in cli.plan_collection(conn, ["2"], NOW)}
+
+
+@pytest.mark.parametrize("contract", [None, True, {}, "bounded_inventory_v0"])
+def test_validated_responses_without_inventory_contract_are_not_full_crawls(conn, contract):
+    add_run(conn, "waavo", extra_params={"inventory_contract": contract})
+    key = ("waavo", "near", "2", "RIX")
+    history = cli._run_history(conn)
+    assert history[key]["succeeded"] is None
+    assert history[key]["durations"] == []
+    assert key in {task.key for task in cli.plan_collection(conn, ["2"], NOW)}
 
 
 def test_duration_estimate_does_not_borrow_another_airports_timing(conn):
