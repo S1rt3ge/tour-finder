@@ -1,10 +1,10 @@
 """CLI: python -m tourfinder.cli <command>
 
-  fetch   � one-off pull from Join Up, store price snapshots
-  collect � scheduler entry point: run whichever fetch tiers are due
-  reviews � enrich hotels with guest reviews from an external platform
-  serve   � run the local web UI
-  stats   � quick DB numbers
+  fetch   — one-off pull from Join Up, store price snapshots
+  collect — scheduler entry point: run whichever fetch tiers are due
+  reviews — enrich hotels with guest reviews from an external platform
+  serve   — run the local web UI
+  stats   — quick DB numbers
 """
 import argparse
 import json
@@ -19,7 +19,7 @@ from statistics import median
 from . import db
 
 # Snapshot cadence by departure proximity (SPEC: price movement lives in
-# the last week � poll near departures often, far ones daily).
+# the last week — poll near departures often, far ones daily).
 # (name, days_from, days_till, period_hours)
 TIERS = [
     ("near", 1, 7, 4),
@@ -389,7 +389,7 @@ def cmd_reviews(args):
     conn = db.connect(args.db)
     provider = get_provider(args.provider)
     if not provider.available():
-        print(f"provider '{args.provider}' has no credentials � set the API key "
+        print(f"provider '{args.provider}' has no credentials — set the API key "
               f"(GOOGLE_PLACES_API_KEY for google) and retry. Nothing fetched.")
         return
     result = reviews_mod.enrich(conn, provider, max_age_days=args.max_age_days,
@@ -475,7 +475,7 @@ def main():
 
     args = p.parse_args()
     if args.command == "collect":
-        # runs headless under pythonw from Task Scheduler � log to a file
+        # runs headless under pythonw from Task Scheduler — log to a file
         log_path = Path(args.db).parent / "collect.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         fh = logging.FileHandler(log_path, encoding="utf-8")
