@@ -1,5 +1,5 @@
 """Bounded, owner-scoped demand. A saved request is never proof of collection."""
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 import re
@@ -67,8 +67,8 @@ def active_scopes(conn, now=None):
             continue
         try:
             filters = canonical_filters(json.loads(row["filters"]))
-            if (filters["date_till"] > current.date().isoformat()
-                    and filters["date_from"] <= (current.date() + timedelta(days=45)).isoformat()):
+            _party_scopes(filters)
+            if _collectable(filters, current):
                 result.append(filters)
         except (ValueError, TypeError, KeyError, AttributeError):
             continue
@@ -76,8 +76,58 @@ def active_scopes(conn, now=None):
 
 
 def _party_scopes(filters):
-    ages = filters.get("children_ages") or ""
-    return {(int(filters.get("adults", 2)), ages, origin) for origin in normalize_origins(filters.get("origins")).split(",")}
+    """Match the collector's persisted party validation, without lossy casts."""
+    def number(value, low, high):
+        if type(value) is not int and not (isinstance(value, str) and re.fullmatch(r"[0-9]{1,2}", value.strip())):
+            raise ValueError("invalid party")
+        value = int(value)
+        if not low <= value <= high:
+            raise ValueError("invalid party")
+        return value
+
+    adults = number(filters["adults"], 1, 6)
+    ages = filters.get("children_ages")
+    if ages is None or ages == "":
+        ages = []
+    elif isinstance(ages, str):
+        ages = ages.split(",")
+    if not isinstance(ages, (list, tuple)) or len(ages) > 4:
+        raise ValueError("invalid party")
+    ages = ",".join(map(str, sorted(number(age, 0, 17) for age in ages)))
+    return {(adults, ages, origin) for origin in normalize_origins(filters.get("origins")).split(",")}
+
+
+def _date_range(filters):
+    first, last = date.fromisoformat(filters["date_from"]), date.fromisoformat(filters["date_till"])
+    if first > last:
+        raise ValueError("invalid dates")
+    return first, last
+
+
+def _collectable(filters, current):
+    first, last = _date_range(filters)
+    return (last >= current.date() + timedelta(days=1)
+            and first <= current.date() + timedelta(days=45))
+
+
+def _bootstrap_scopes(conn, current):
+    scopes = {(2, "", "RIX"), (3, "", "RIX"), (2, "7", "RIX")}
+    for row in conn.execute("SELECT spec FROM pax_requests WHERE created_at>=:cutoff AND created_at<=:now",
+                            {"cutoff": _iso(current - REQUEST_TTL), "now": _iso(current)}):
+        spec = row["spec"]
+        if (not isinstance(spec, str) or len(spec) > 128
+                or not re.fullmatch(r"[0-9]{1,2}(?:\+[0-4]:(?:[0-9]{1,2}(?: *, *[0-9]{1,2})*)?)?", spec.strip())):
+            continue
+        adult, _, children = spec.strip().partition("+")
+        count, _, values = children.partition(":")
+        ages = values.split(",") if values else []
+        if children and int(count) != len(ages):
+            continue
+        try:
+            scopes.update(_party_scopes({"adults": adult, "children_ages": ages, "origins": "RIX"}))
+        except ValueError:
+            continue
+    return scopes
 
 
 def admit_scope(conn, owner, filters, now=None):
@@ -85,6 +135,8 @@ def admit_scope(conn, owner, filters, now=None):
 
     Hold this short global lock until the caller commits its request or saved
     search. Future reservations do not claim that collection has been queued.
+    Bootstrap scopes apply only without current owned demand; a proposed
+    collectable request also replaces bootstrap during its own admission.
     """
     current = _now(now)
     filters = canonical_filters(filters)
@@ -95,31 +147,26 @@ def admit_scope(conn, owner, filters, now=None):
     conn.execute("UPDATE id_counters SET last_id=last_id WHERE name='collection_request_admission_v1'")
     if not has_access(conn, owner):
         raise RequestLimit("Доступ к сбору не одобрен.")
-    scopes = {(2, "", "RIX"), (3, "", "RIX"), (2, "7", "RIX")}
-    for row in conn.execute("SELECT spec FROM pax_requests WHERE created_at>=:cutoff AND created_at<=:now",
-                            {"cutoff": _iso(current - REQUEST_TTL), "now": _iso(current)}):
-        spec = row["spec"]
-        if not isinstance(spec, str) or not re.fullmatch(r"[1-6](?:\+[1-4]:[0-9]{1,2}(?:,[0-9]{1,2}){0,3})?", spec):
-            continue
-        adult, _, children = spec.partition("+")
-        count, _, values = children.partition(":")
-        ages = sorted(map(int, values.split(","))) if values else []
-        if (children and int(count) != len(ages)) or any(age > 17 for age in ages):
-            continue
-        scopes.add((int(adult), ",".join(map(str, ages)), "RIX"))
+    scopes = set()
+    owned_collectable = _collectable(filters, current)
     for active in active_scopes(conn, current):
         scopes.update(_party_scopes(active))
+        owned_collectable = True
     approved = approved_user_ids(conn)
     for row in conn.execute("SELECT owner_id,filters FROM subscriptions WHERE enabled=1 AND owner_id IS NOT NULL"):
         if row["owner_id"] not in approved:
             continue
         try:
-            active = canonical_filters(json.loads(row["filters"]))
-            if active["date_till"] >= current.date().isoformat():
-                scopes.update(_party_scopes(active))
+            active = json.loads(row["filters"])
+            active_party = _party_scopes(active)
+            if _date_range(active)[1] >= current.date():
+                scopes.update(active_party)
+                owned_collectable = owned_collectable or _collectable(active, current)
         except (ValueError, TypeError, KeyError, AttributeError):
             continue
     requested = _party_scopes(filters)
+    if not owned_collectable:
+        scopes.update(_bootstrap_scopes(conn, current))
     if requested - scopes and len(scopes | requested) > MAX_ACTIVE_ORIGIN_PARTIES:
         raise RequestLimit("Очередь новых составов и аэропортов заполнена. Поиск по собранным данным доступен; сбор можно запросить позже.")
 
